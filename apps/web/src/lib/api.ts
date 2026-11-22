@@ -8,6 +8,7 @@ import {
 
 export type LivenessResult =
   | { kind: 'online'; data: LivenessData; meta: ResponseMeta }
+  | { kind: 'unavailable'; status: number; error: string }
   | { kind: 'offline'; error: string }
   | { kind: 'timeout'; error: string }
   | { kind: 'invalid'; error: string }
@@ -16,6 +17,7 @@ export type LivenessResult =
 export type ReadinessResult =
   | { kind: 'ready'; data: ReadinessData; meta: ResponseMeta }
   | { kind: 'not_ready'; data: ReadinessData; meta: ResponseMeta }
+  | { kind: 'unavailable'; status: number; error: string }
   | { kind: 'offline'; error: string }
   | { kind: 'timeout'; error: string }
   | { kind: 'invalid'; error: string }
@@ -28,16 +30,21 @@ export interface HealthCheckOptions {
 
 export const DEFAULT_TIMEOUT_MS = 5000;
 
-interface FetchResult {
-  response?: Response;
-  errorKind?: 'offline' | 'timeout' | 'aborted';
-  errorMessage?: string;
+interface FetchDeadlineResult {
+  kind: 'success' | 'json_error' | 'offline' | 'timeout' | 'aborted';
+  status?: number;
+  json?: unknown;
+  error?: string;
 }
 
-async function fetchWithTimeout(
+/**
+ * Executes a GET request with an end-to-end deadline covering both
+ * header retrieval and complete body consumption.
+ */
+async function fetchJsonWithDeadline(
   url: string,
   options?: HealthCheckOptions,
-): Promise<FetchResult> {
+): Promise<FetchDeadlineResult> {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
   let timedOut = false;
@@ -54,7 +61,7 @@ async function fetchWithTimeout(
   if (options?.signal) {
     if (options.signal.aborted) {
       clearTimeout(timer);
-      return { errorKind: 'aborted' };
+      return { kind: 'aborted' };
     }
     options.signal.addEventListener('abort', onExternalAbort, { once: true });
   }
@@ -67,22 +74,42 @@ async function fetchWithTimeout(
       },
       signal: controller.signal,
     });
-    return { response };
+
+    let rawJson: unknown;
+    try {
+      rawJson = await response.json();
+    } catch (parseErr: unknown) {
+      // If abort or timeout occurred while reading/parsing the body, propagate to outer catch
+      if (controller.signal.aborted) {
+        throw parseErr;
+      }
+      return {
+        kind: 'json_error',
+        status: response.status,
+        error: 'Failed to parse JSON response body',
+      };
+    }
+
+    return {
+      kind: 'success',
+      status: response.status,
+      json: rawJson,
+    };
   } catch (err: unknown) {
     if (timedOut) {
       return {
-        errorKind: 'timeout',
-        errorMessage: `Request timed out after ${timeoutMs}ms`,
+        kind: 'timeout',
+        error: `Request timed out after ${timeoutMs}ms`,
       };
     }
     if (options?.signal?.aborted) {
-      return { errorKind: 'aborted' };
+      return { kind: 'aborted' };
     }
     const message =
       err instanceof Error ? err.message : 'Network error or backend unreachable';
     return {
-      errorKind: 'offline',
-      errorMessage: message,
+      kind: 'offline',
+      error: message,
     };
   } finally {
     clearTimeout(timer);
@@ -95,94 +122,107 @@ async function fetchWithTimeout(
 export async function fetchLiveness(
   options?: HealthCheckOptions,
 ): Promise<LivenessResult> {
-  const { response, errorKind, errorMessage } = await fetchWithTimeout(
-    '/api/v1/health/live',
-    options,
-  );
+  const result = await fetchJsonWithDeadline('/api/v1/health/live', options);
 
-  if (errorKind) {
-    if (errorKind === 'aborted') return { kind: 'aborted' };
-    if (errorKind === 'timeout') {
-      return { kind: 'timeout', error: errorMessage ?? 'Request timed out' };
-    }
+  if (result.kind === 'aborted') {
+    return { kind: 'aborted' };
+  }
+  if (result.kind === 'timeout') {
+    return { kind: 'timeout', error: result.error ?? 'Request timed out' };
+  }
+  if (result.kind === 'offline') {
     return {
       kind: 'offline',
-      error: errorMessage ?? 'Backend offline or unreachable',
+      error: result.error ?? 'Backend offline or unreachable',
     };
   }
 
-  if (!response) {
-    return { kind: 'offline', error: 'No response received' };
+  const status = result.status ?? 0;
+
+  // Controlled unavailable state for non-200 responses (e.g. 500, 502, 504, 404)
+  if (status !== 200) {
+    return {
+      kind: 'unavailable',
+      status,
+      error: `Liveness endpoint returned HTTP ${status}`,
+    };
   }
 
-  if (response.status !== 200) {
+  if (result.kind === 'json_error') {
     return {
       kind: 'invalid',
-      error: `Liveness returned unexpected HTTP ${response.status}`,
+      error: 'Malformed JSON response from liveness endpoint',
     };
   }
 
-  try {
-    const rawJson: unknown = await response.json();
-    const parsed = LivenessResponseSchema.safeParse(rawJson);
-    if (!parsed.success) {
-      return {
-        kind: 'invalid',
-        error: 'Invalid API response schema for liveness',
-      };
-    }
+  const parsed = LivenessResponseSchema.safeParse(result.json);
+  if (!parsed.success) {
     return {
-      kind: 'online',
-      data: parsed.data.data,
-      meta: parsed.data.meta,
+      kind: 'invalid',
+      error: 'Invalid API response schema for liveness',
     };
-  } catch {
-    return { kind: 'invalid', error: 'Failed to parse JSON response' };
   }
+
+  return {
+    kind: 'online',
+    data: parsed.data.data,
+    meta: parsed.data.meta,
+  };
 }
 
 export async function fetchReadiness(
   options?: HealthCheckOptions,
 ): Promise<ReadinessResult> {
-  const { response, errorKind, errorMessage } = await fetchWithTimeout(
-    '/api/v1/health/ready',
-    options,
-  );
+  const result = await fetchJsonWithDeadline('/api/v1/health/ready', options);
 
-  if (errorKind) {
-    if (errorKind === 'aborted') return { kind: 'aborted' };
-    if (errorKind === 'timeout') {
-      return { kind: 'timeout', error: errorMessage ?? 'Request timed out' };
-    }
+  if (result.kind === 'aborted') {
+    return { kind: 'aborted' };
+  }
+  if (result.kind === 'timeout') {
+    return { kind: 'timeout', error: result.error ?? 'Request timed out' };
+  }
+  if (result.kind === 'offline') {
     return {
       kind: 'offline',
-      error: errorMessage ?? 'Backend offline or unreachable',
+      error: result.error ?? 'Backend offline or unreachable',
     };
   }
 
-  if (!response) {
-    return { kind: 'offline', error: 'No response received' };
+  const status = result.status ?? 0;
+
+  // Controlled unavailable state for non-200/503 responses (e.g. 500, 502, 504, 404)
+  if (status !== 200 && status !== 503) {
+    return {
+      kind: 'unavailable',
+      status,
+      error: `Readiness endpoint returned HTTP ${status}`,
+    };
   }
 
-  // HTTP 200 (ready: true or ready: false) and HTTP 503 (ready: false) are valid readiness statuses
-  if (response.status !== 200 && response.status !== 503) {
+  if (result.kind === 'json_error') {
     return {
       kind: 'invalid',
-      error: `Readiness returned unexpected HTTP ${response.status}`,
+      error: 'Malformed JSON response from readiness endpoint',
     };
   }
 
-  try {
-    const rawJson: unknown = await response.json();
-    const parsed = ReadinessResponseSchema.safeParse(rawJson);
-    if (!parsed.success) {
-      return {
-        kind: 'invalid',
-        error: 'Invalid API response schema for readiness',
-      };
-    }
+  const parsed = ReadinessResponseSchema.safeParse(result.json);
+  if (!parsed.success) {
+    return {
+      kind: 'invalid',
+      error: 'Invalid API response schema for readiness',
+    };
+  }
 
-    if (parsed.data.data.ready) {
+  const isReady = parsed.data.data.ready;
+
+  // Strict Matrix Enforcement:
+  // HTTP 200 + ready: true  -> ready
+  // HTTP 503 + ready: false -> not_ready
+  // HTTP 200 + ready: false -> invalid (contradictory)
+  // HTTP 503 + ready: true  -> invalid (contradictory)
+  if (status === 200) {
+    if (isReady) {
       return {
         kind: 'ready',
         data: parsed.data.data,
@@ -190,13 +230,24 @@ export async function fetchReadiness(
       };
     } else {
       return {
+        kind: 'invalid',
+        error: 'Contradictory readiness response: HTTP 200 returned ready: false',
+      };
+    }
+  } else {
+    // status === 503
+    if (!isReady) {
+      return {
         kind: 'not_ready',
         data: parsed.data.data,
         meta: parsed.data.meta,
       };
+    } else {
+      return {
+        kind: 'invalid',
+        error: 'Contradictory readiness response: HTTP 503 returned ready: true',
+      };
     }
-  } catch {
-    return { kind: 'invalid', error: 'Failed to parse JSON response' };
   }
 }
 

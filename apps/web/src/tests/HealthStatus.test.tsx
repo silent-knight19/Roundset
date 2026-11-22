@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, cleanup, act } from '@testing-library/react';
 import { HealthStatus } from '../components/HealthStatus';
 
 describe('HealthStatus Component', () => {
@@ -12,11 +12,11 @@ describe('HealthStatus Component', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     globalThis.fetch = originalFetch;
   });
 
   it('shows checking state initially', () => {
-    // Hang fetch so checking state is displayed
     globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {}));
 
     render(<HealthStatus />);
@@ -113,6 +113,124 @@ describe('HealthStatus Component', () => {
     });
   });
 
+  it('rejects contradictory readiness (HTTP 200 with ready: false) and displays invalid state', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/v1/health/live')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { status: 'ok', version: '0.1.0' },
+              meta: { requestId: 'req_live_ok' },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+        );
+      }
+      if (url.includes('/api/v1/health/ready')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { ready: false },
+              meta: { requestId: 'req_contradictory_200' },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+        );
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    });
+
+    render(<HealthStatus />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Backend online')).toBeTruthy();
+      expect(screen.getByText('Invalid API response')).toBeTruthy();
+      expect(
+        screen.getByText(/Contradictory readiness response: HTTP 200 returned ready: false/i),
+      ).toBeTruthy();
+    });
+  });
+
+  it('rejects contradictory readiness (HTTP 503 with ready: true) and displays invalid state', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/v1/health/live')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { status: 'ok', version: '0.1.0' },
+              meta: { requestId: 'req_live_ok' },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+        );
+      }
+      if (url.includes('/api/v1/health/ready')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { ready: true },
+              meta: { requestId: 'req_contradictory_503' },
+            }),
+            { status: 503, headers: { 'Content-Type': 'application/json' } },
+          ),
+        );
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    });
+
+    render(<HealthStatus />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Backend online')).toBeTruthy();
+      expect(screen.getByText('Invalid API response')).toBeTruthy();
+      expect(
+        screen.getByText(/Contradictory readiness response: HTTP 503 returned ready: true/i),
+      ).toBeTruthy();
+    });
+  });
+
+  it('shows backend unavailable on health endpoint HTTP 500 error', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(() => {
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+    });
+
+    render(<HealthStatus />);
+
+    await waitFor(() => {
+      const unavailableBadges = screen.getAllByText('Backend unavailable');
+      expect(unavailableBadges.length).toBeGreaterThan(0);
+      const http500Elements = screen.getAllByText(/HTTP 500/i);
+      expect(http500Elements.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('shows backend unavailable on Vite proxy HTTP 502 error', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(() => {
+      return Promise.resolve(
+        new Response('', {
+          status: 502,
+          headers: { 'Content-Type': 'text/plain' },
+        }),
+      );
+    });
+
+    render(<HealthStatus />);
+
+    await waitFor(() => {
+      const unavailableBadges = screen.getAllByText('Backend unavailable');
+      expect(unavailableBadges.length).toBeGreaterThan(0);
+      const http502Elements = screen.getAllByText(/HTTP 502/i);
+      expect(http502Elements.length).toBeGreaterThan(0);
+    });
+  });
+
   it('shows backend offline when network fetch rejects', async () => {
     globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
@@ -153,9 +271,17 @@ describe('HealthStatus Component', () => {
     });
   });
 
-  it('handles slow/timed out requests without crashing and cleans up on unmount', async () => {
+  it('asserts five-second deadline expiry displays Request timeout using fake timers', async () => {
+    vi.useFakeTimers();
+
     globalThis.fetch = vi.fn().mockImplementation((_url, init?: RequestInit) => {
       return new Promise((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          const err = new Error('REQUEST_TIMEOUT');
+          err.name = 'AbortError';
+          reject(err);
+          return;
+        }
         if (init?.signal) {
           init.signal.addEventListener('abort', () => {
             const err = new Error('REQUEST_TIMEOUT');
@@ -166,9 +292,17 @@ describe('HealthStatus Component', () => {
       });
     });
 
-    const { unmount } = render(<HealthStatus />);
+    render(<HealthStatus />);
 
-    expect(() => unmount()).not.toThrow();
+    // Fast-forward past the 5-second deadline
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5100);
+    });
+
+    const timeoutBadges = screen.getAllByText('Request timeout');
+    expect(timeoutBadges.length).toBeGreaterThan(0);
+
+    vi.useRealTimers();
   });
 
   it('triggers a fresh check when Refresh Status button is clicked', async () => {
@@ -190,6 +324,7 @@ describe('HealthStatus Component', () => {
 
     await waitFor(() => {
       expect(callCount).toBeGreaterThanOrEqual(2); // live + ready
+      expect(screen.getByRole('button', { name: /Refresh Status/i })).toBeTruthy();
     });
 
     const initialCalls = callCount;
@@ -199,5 +334,12 @@ describe('HealthStatus Component', () => {
     await waitFor(() => {
       expect(callCount).toBeGreaterThan(initialCalls);
     });
+  });
+
+  it('cleans up on unmount without producing stale updates', () => {
+    globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {}));
+
+    const { unmount } = render(<HealthStatus />);
+    expect(() => unmount()).not.toThrow();
   });
 });

@@ -37,7 +37,10 @@ export function HealthStatus() {
         }
 
         // Ignore if cancelled
-        if (result.liveness.kind === 'aborted' || result.readiness.kind === 'aborted') {
+        if (
+          result.liveness.kind === 'aborted' ||
+          result.readiness.kind === 'aborted'
+        ) {
           return;
         }
 
@@ -82,7 +85,13 @@ export function HealthStatus() {
     const hasInvalid =
       liveness?.kind === 'invalid' || readiness?.kind === 'invalid';
     if (hasInvalid) {
-      return 'Invalid API response: health response failed contract schema validation.';
+      return 'Invalid API response: health response failed contract schema validation or contained contradictory data.';
+    }
+
+    const hasUnavailable =
+      liveness?.kind === 'unavailable' || readiness?.kind === 'unavailable';
+    if (hasUnavailable) {
+      return 'Backend service unavailable: health endpoint or proxy returned an unexpected HTTP error.';
     }
 
     const isOffline =
@@ -96,7 +105,7 @@ export function HealthStatus() {
         return 'Backend online and backend ready: all services operational.';
       }
       if (readiness?.kind === 'not_ready') {
-        return 'Backend online but backend not ready: dependencies are initializing.';
+        return 'Backend online but backend not ready: dependencies are initializing (HTTP 503).';
       }
       return 'Backend online: readiness check offline or unreachable.';
     }
@@ -174,6 +183,20 @@ export function HealthStatus() {
                   <p>Version: <span className="font-mono">{liveness.data.version}</span></p>
                   <p>Request ID: <span className="font-mono">{liveness.meta.requestId}</span></p>
                 </div>
+              </div>
+            )}
+
+            {!isChecking && liveness?.kind === 'unavailable' && (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-500" />
+                  <span className="text-sm font-semibold text-amber-800">
+                    Backend unavailable
+                  </span>
+                </div>
+                <p className="text-xs text-amber-700 pl-4">
+                  {liveness.error}
+                </p>
               </div>
             )}
 
@@ -267,6 +290,20 @@ export function HealthStatus() {
                   <p>HTTP 503 received: Server is running but required dependencies (e.g. MongoDB) are not ready.</p>
                   <p>Request ID: <span className="font-mono">{readiness.meta.requestId}</span></p>
                 </div>
+              </div>
+            )}
+
+            {!isChecking && readiness?.kind === 'unavailable' && (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-500" />
+                  <span className="text-sm font-semibold text-amber-800">
+                    Backend unavailable
+                  </span>
+                </div>
+                <p className="text-xs text-amber-700 pl-4">
+                  {readiness.error}
+                </p>
               </div>
             )}
 
