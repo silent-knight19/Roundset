@@ -8,6 +8,13 @@ import { createLogger } from './core/logging.js';
 import { MongoManager } from './integrations/mongodb.js';
 import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.js';
 
+export const ALLOWLISTED_ERROR_CODES = new Set([
+  'EADDRINUSE',
+  'EACCES',
+  'EADDRNOTAVAIL',
+  'EINVAL',
+]);
+
 export interface StartServerOptions {
   env?: AppConfig;
   logger?: Logger;
@@ -15,6 +22,7 @@ export interface StartServerOptions {
     connect(uri: string): Promise<boolean>;
     disconnect(): Promise<void>;
     getReadinessProvider(): ReadinessProvider;
+    removeConnectionListeners?(): void;
   };
   readinessProvider?: ReadinessProvider;
   port?: number;
@@ -91,10 +99,23 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 
     const onError = (err: Error) => {
       s.removeListener('listening', onListening);
+
+      // R3-02: Release manager-owned connection listeners when HTTP startup fails
+      if (
+        mongoManager &&
+        'removeConnectionListeners' in mongoManager &&
+        typeof mongoManager.removeConnectionListeners === 'function'
+      ) {
+        mongoManager.removeConnectionListeners();
+      }
+
+      const rawCode = (err as NodeJS.ErrnoException).code;
+      const code = rawCode && ALLOWLISTED_ERROR_CODES.has(rawCode) ? rawCode : undefined;
+
       logger.error(
         {
           category: 'SERVER_STARTUP_ERROR',
-          code: (err as NodeJS.ErrnoException).code,
+          ...(code ? { code } : {}),
         },
         'HTTP server startup failed'
       );
@@ -126,7 +147,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
   const actualPort = typeof address === 'object' && address ? address.port : listenPort;
 
   // 5. Initiate bounded MongoDB connection attempt without blocking HTTP startup
-  // (Only executed if HTTP listener succeeded)
+  // (Only executed if HTTP listener succeeded; skipped on listen error)
   if (mongoManager && config.MONGODB_URI) {
     mongoManager.connect(config.MONGODB_URI).catch(() => {
       // Handled internally in mongoManager without throwing
@@ -236,12 +257,19 @@ if (isDirectEntry(import.meta.url)) {
       process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     })
     .catch((err) => {
+      // R3-01: Log safe fixed category and allowlisted error code, never raw error messages or secrets
+      const rawCode =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code: unknown }).code)
+          : undefined;
+      const code = rawCode && ALLOWLISTED_ERROR_CODES.has(rawCode) ? rawCode : undefined;
+
       logger.fatal(
         {
           category: 'FATAL_BOOTSTRAP_ERROR',
-          errorMessage: err instanceof Error ? err.message : 'Unknown bootstrap error',
+          ...(code ? { code } : {}),
         },
-        'Fatal bootstrap error'
+        'Fatal bootstrap error occurred'
       );
       process.exit(1);
     });

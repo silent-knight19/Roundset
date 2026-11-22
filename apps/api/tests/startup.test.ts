@@ -1,11 +1,13 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import net from 'node:net';
+import mongoose from 'mongoose';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startServer, type RunningServer } from '../src/server.js';
 import { loadEnv } from '../src/config/env.js';
+import { MongoManager } from '../src/integrations/mongodb.js';
 import type { ReadinessProvider } from '../src/core/readiness.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,8 +93,8 @@ describe('Server Startup & Lifecycle Hardening (R1-02, R2-01, R2-02, R2-03)', ()
     expect(output).not.toContain('API service listening on port');
   });
 
-  it('R2-02: Rejects startup cleanly when port is occupied (EADDRINUSE) without crashing process', async () => {
-    // Occupy an ephemeral port with a raw net server
+  it('R2-02 & R3-02: Rejects startup cleanly on EADDRINUSE, cleans up manager-owned listeners, preserves external listeners, and skips database connection', async () => {
+    // 1. Occupy an ephemeral port with a raw net server
     const blockerServer = net.createServer();
     const occupiedPort = await new Promise<number>((resolve) => {
       blockerServer.listen(0, () => {
@@ -101,17 +103,51 @@ describe('Server Startup & Lifecycle Hardening (R1-02, R2-01, R2-02, R2-03)', ()
       });
     });
 
+    // 2. Register an unrelated external listener on mongoose.connection to verify isolation
+    const externalListener = () => {};
+    mongoose.connection.on('disconnected', externalListener);
+    const baselineDisconnectedCount = mongoose.connection.listenerCount('disconnected');
+    const baselineReconnectedCount = mongoose.connection.listenerCount('reconnected');
+    const baselineErrorCount = mongoose.connection.listenerCount('error');
+
+    // 3. Create test-controlled MongoManager
+    const mongoManager = new MongoManager();
+    const connectSpy = vi.spyOn(mongoManager, 'connect');
+
+    // Listeners are attached to mongoose.connection upon creation (+1 each)
+    expect(mongoose.connection.listenerCount('disconnected')).toBe(baselineDisconnectedCount + 1);
+
     const env = loadEnv({
       NODE_ENV: 'development',
       PORT: 8787,
       WEB_ORIGIN: 'http://localhost:5173',
       MOCK_DATABASE: false,
+      MONGODB_URI: 'mongodb://localhost:27017/eaddrinuse_db',
     });
 
-    // Attempting to start server on occupied port must reject cleanly
-    await expect(startServer({ env, port: occupiedPort })).rejects.toThrow();
+    // 4. Attempt startup on occupied port - must reject cleanly
+    await expect(
+      startServer({
+        env,
+        mongoManager,
+        port: occupiedPort,
+      })
+    ).rejects.toThrow();
 
-    // Clean up blocker
+    // 5. Verification:
+    // a) No database connection attempt was made
+    expect(connectSpy).not.toHaveBeenCalled();
+
+    // b) Manager-owned listeners were cleanly removed
+    expect(mongoose.connection.listenerCount('disconnected')).toBe(baselineDisconnectedCount);
+    expect(mongoose.connection.listenerCount('reconnected')).toBe(baselineReconnectedCount);
+    expect(mongoose.connection.listenerCount('error')).toBe(baselineErrorCount);
+
+    // c) Unrelated external listener is still registered
+    expect(mongoose.connection.listeners('disconnected')).toContain(externalListener);
+
+    // Clean up
+    mongoose.connection.removeListener('disconnected', externalListener);
     await new Promise<void>((resolve) => blockerServer.close(() => resolve()));
   });
 

@@ -107,11 +107,16 @@ export function createErrorHandler(logger?: Logger): ErrorRequestHandler {
     }
 
     // 4. Unexpected server exception (500)
-    // Log sanitized error details internally, never exposing them in the client response
+    // R3-01: Log safe fixed category and requestId, never the exception object, message, or stack trace
+    const errorLogMeta = {
+      category: 'UNEXPECTED_SERVER_ERROR',
+      requestId,
+    };
+
     if (logger) {
-      logger.error({ err, requestId }, 'Internal server error');
+      logger.error(errorLogMeta, 'Internal server error occurred');
     } else if (req.log) {
-      req.log.error({ err, requestId }, 'Internal server error');
+      req.log.error(errorLogMeta, 'Internal server error occurred');
     }
 
     res.status(500).json({

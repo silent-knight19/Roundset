@@ -33,15 +33,20 @@ export const REDACTED_PATHS = [
 /**
  * Creates a structured Pino logger instance with strict redaction of sensitive credentials.
  */
-export function createLogger(options?: pino.LoggerOptions): pino.Logger {
-  return pino({
+export function createLogger(
+  options?: pino.LoggerOptions,
+  destination?: pino.DestinationStream
+): pino.Logger {
+  const pinoOptions: pino.LoggerOptions = {
     level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'test' ? 'silent' : 'info'),
     redact: {
       paths: REDACTED_PATHS,
       censor: '[REDACTED]',
     },
     ...options,
-  });
+  };
+
+  return destination ? pino(pinoOptions, destination) : pino(pinoOptions);
 }
 
 /**
