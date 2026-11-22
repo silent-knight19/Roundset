@@ -11,6 +11,24 @@ import { VerifyEmailPage } from '../pages/VerifyEmailPage';
 import { ForgotPasswordPage } from '../pages/ForgotPasswordPage';
 import { ResetPasswordPage } from '../pages/ResetPasswordPage';
 
+/**
+ * Isolated dev-only route for the Voice Conversation Laboratory (P5-VOI-01a).
+ * In production builds (import.meta.env.DEV is statically false), Rollup dead-code
+ * elimination removes this ternary branch and avoids bundling VoiceLabPage or
+ * ONNX/Kokoro runtime assets.
+ */
+const devRoutes: RouteObject[] = import.meta.env.DEV
+  ? [
+      {
+        path: 'dev/voice-lab',
+        lazy: async () => {
+          const { VoiceLabPage } = await import('../pages/dev/VoiceLabPage');
+          return { Component: VoiceLabPage };
+        },
+      },
+    ]
+  : [];
+
 export const routes: RouteObject[] = [
   {
     path: '/',
@@ -52,6 +70,7 @@ export const routes: RouteObject[] = [
         path: 'reset-password',
         element: <ResetPasswordPage />,
       },
+      ...devRoutes,
       {
         path: '*',
         element: <NotFoundPage />,
