@@ -153,9 +153,9 @@ Database interactions are managed via `MongoManager` in `apps/api/src/integratio
    - Oversized payloads trigger standardized HTTP 413 `PAYLOAD_TOO_LARGE`.
 5. **Masked Error Handling:**
    - Standardized error codes: 400 (`INVALID_INPUT`), 404 (`NOT_FOUND`), 413 (`PAYLOAD_TOO_LARGE`), 403 (`FORBIDDEN`), and 500 (`INTERNAL_ERROR`).
-   - 500 error responses emit a sanitized generic message: `"An unexpected internal server error occurred"`. Raw exception objects, messages, stack traces, and internal paths are never exposed to clients.
+   - 500 error responses emit a sanitized generic message: `"Internal server error"`. Raw exception objects, messages, stack traces, and internal paths are never exposed to clients.
 6. **Structured Log Redaction:**
-   - Pino operational logger redacts sensitive HTTP headers (`authorization`, `cookie`, `set-cookie`, `x-api-key`), passwords, tokens, and URIs.
+   - Pino operational logger redacts sensitive HTTP headers (`authorization`, `cookie`, `set-cookie`), request bodies (`req.body`, `body`), and credential fields (`password`, `token`, `secret`, `apiKey`, and database connection URIs/strings) per `REDACTED_PATHS`.
    - Lifecycle and startup logs use static diagnostic strings without reflecting environment variables into log output.
 7. **Standalone Process Direct-Entry Detection:**
    - `isDirectEntry(import.meta.url)` compares `fs.realpathSync(process.argv[1])` to `fs.realpathSync(fileURLToPath(metaUrl))`.
