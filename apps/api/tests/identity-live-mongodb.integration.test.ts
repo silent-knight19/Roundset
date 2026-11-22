@@ -11,6 +11,21 @@ import {
   verifyIdentityIndexes,
   REQUIRED_IDENTITY_INDEXES,
 } from '../src/modules/identity/models/index.js';
+import {
+  EXPECTED_TEST_DB_NAME,
+  extractDatabaseName,
+  validateIntegrationDatabaseName,
+  performHarnessCleanup,
+  executeGuaranteedCleanup,
+} from './identity-test-harness.js';
+
+export {
+  EXPECTED_TEST_DB_NAME,
+  extractDatabaseName,
+  validateIntegrationDatabaseName,
+  performHarnessCleanup,
+  executeGuaranteedCleanup,
+};
 
 // Auto-load .env if MONGODB_TEST_URI is not in process.env
 if (!process.env.MONGODB_TEST_URI && typeof process.loadEnvFile === 'function') {
@@ -49,21 +64,8 @@ describe.skipIf(!runLive)(
       );
     }
 
-    // Safety guardrail: Ensure the test suite refuses to run against non-test databases
-    try {
-      const parsed = new URL(uri);
-      testDbName = parsed.pathname.replace(/^\//, '');
-    } catch {
-      const match = uri.match(/\/([^/?]+)(\?|$)/);
-      testDbName = match ? match[1] : '';
-    }
-
-    if (!testDbName || !testDbName.toLowerCase().includes('test')) {
-      throw new Error(
-        `Execution refused: Target database "${testDbName}" is not explicitly identified as a test database. ` +
-          `The database name in MONGODB_TEST_URI must contain "test" (e.g. "roundset_test") to protect production and application data.`
-      );
-    }
+    // Safety guardrail: Ensure the test suite refuses to run against any database other than roundset_test
+    testDbName = validateIntegrationDatabaseName(uri);
 
     conn = await mongoose
       .createConnection(uri, {
@@ -78,41 +80,21 @@ describe.skipIf(!runLive)(
   afterAll(async () => {
     if (!conn) return;
 
-    try {
-      const UserModel = getUserModel(conn);
-      const AuthIdentityModel = getAuthIdentityModel(conn);
-      const SessionModel = getSessionModel(conn);
-      const VerificationChallengeModel = getVerificationChallengeModel(conn);
-
-      // Clean up only synthetic records created during this run
-      if (createdUserIds.length > 0) {
-        await UserModel.deleteMany({ _id: { $in: createdUserIds } });
-      }
-      if (createdIdentityIds.length > 0) {
-        await AuthIdentityModel.deleteMany({ _id: { $in: createdIdentityIds } });
-      }
-      if (createdSessionIds.length > 0) {
-        await SessionModel.deleteMany({ sessionId: { $in: createdSessionIds } });
-      }
-      if (createdChallengeIds.length > 0) {
-        await VerificationChallengeModel.deleteMany({ challengeId: { $in: createdChallengeIds } });
-      }
-
-      // Also clean up by runId prefix fallback
-      await UserModel.deleteMany({ emailNormalized: new RegExp(`^${runId}_`) });
-      await SessionModel.deleteMany({ sessionId: new RegExp(`^${runId}_`) });
-      await VerificationChallengeModel.deleteMany({ challengeId: new RegExp(`^${runId}_`) });
-    } catch (cleanupErr: unknown) {
-      console.error('Test cleanup notice:', cleanupErr);
-    } finally {
-      await conn.close();
-    }
+    await executeGuaranteedCleanup(conn, async () => {
+      await performHarnessCleanup(conn, {
+        createdUserIds,
+        createdIdentityIds,
+        createdSessionIds,
+        createdChallengeIds,
+        runId,
+      });
+    });
   });
 
   describe('Connection Verification & Environment Sanity', () => {
     it('successfully connects to live MongoDB Atlas replica set with valid version and test database isolation', () => {
       expect(conn.readyState).toBe(1); // 1 = connected
-      expect(testDbName.toLowerCase()).toContain('test');
+      expect(testDbName).toBe(EXPECTED_TEST_DB_NAME);
       expect(mongoVersion).toBeDefined();
       expect(typeof mongoVersion).toBe('string');
     });
