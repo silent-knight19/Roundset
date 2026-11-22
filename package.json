@@ -1,0 +1,28 @@
+{
+  "name": "roundset-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/contracts",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev:api",
+    "dev:web": "npm run --workspace=@roundset/web dev",
+    "dev:api": "npm run --workspace=@roundset/api dev",
+    "build": "npm run --workspace=@roundset/contracts build && npm run --workspace=@roundset/api build && npm run --workspace=@roundset/web build",
+    "typecheck": "npm run --workspace=@roundset/contracts build && npm run --workspaces --if-present typecheck",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@types/node": "^22.13.4",
+    "eslint": "^9.20.1",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.24.1",
+    "vitest": "^3.0.5"
+  }
+}

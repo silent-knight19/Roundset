@@ -1,0 +1,18 @@
+{
+  "name": "@roundset/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"console.error('Web UI shell not implemented yet. Scheduled for task P1-FND-05.'); process.exit(1)\"",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@roundset/contracts": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "typescript": "^5.7.3"
+  }
+}
