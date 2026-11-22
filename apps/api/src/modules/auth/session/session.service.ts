@@ -37,6 +37,7 @@ import {
   SessionReplayError,
   ForbiddenError,
   NotFoundError,
+  ServiceUnavailableError,
 } from '../../../core/errors.js';
 import type {
   SessionResponse,
@@ -387,139 +388,110 @@ export class SessionService {
     const payload = await verifyAccessToken(this.keyring, bearerToken);
     const now = new Date();
 
-    // 1. Verify user exists and is active with matching session epoch
-    const user = await this.userModel.findById(payload.sub);
-    if (!user) {
-      throw new UnauthorizedError('User not found');
-    }
-
-    if (user.accountStatus !== 'ACTIVE') {
-      throw new UnauthorizedError(`User account is ${user.accountStatus.toLowerCase()}`);
-    }
-
-    if (user.sessionEpoch !== payload.epoch) {
-      throw new UnauthorizedError('Session epoch mismatch');
-    }
-
-    // 2. R1: Verify the session referenced by the Bearer token exists, is ACTIVE, and is unexpired
-    const session = await this.sessionModel.findOne({ sessionId: payload.sid });
-    if (!session) {
-      throw new UnauthorizedError('Session not found');
-    }
-
-    if (session.userId.toString() !== payload.sub || !session.userId.equals(user._id)) {
-      throw new UnauthorizedError('Session does not belong to user');
-    }
-
-    if (session.status !== 'ACTIVE') {
-      throw new UnauthorizedError('Session is not active');
-    }
-
-    if (now >= session.idleExpiresAt || now >= session.absoluteExpiresAt) {
-      throw new UnauthorizedError('Session has expired');
-    }
-
-    if (session.epochAtIssue !== payload.epoch) {
-      throw new UnauthorizedError('Session epoch mismatch');
-    }
-
-    // 3. R2-03: Atomic logout-all persistence via MongoDB transaction
-    // Enforces conditional user epoch CAS and global session revocation atomically
+    // 1. Requirement 1: Production logout-all requires an available, supported MongoDB transaction.
+    // If startSession() fails or MongoDB cannot provide transactional guarantees,
+    // perform zero authentication-state mutations and return a 503 service-unavailable failure.
     const connection = this.conn ?? this.sessionModel.db;
-    let clientSession: ClientSession | null = null;
-    const isMockSession =
-      connection?.startSession &&
-      ('_isMockFunction' in connection.startSession ||
-        (connection.startSession as { getMockImplementation?: unknown }).getMockImplementation !== undefined);
-    if (connection && typeof connection.startSession === 'function' && (connection.readyState === 1 || isMockSession)) {
-      try {
-        clientSession = await connection.startSession();
-      } catch {
-        clientSession = null;
-      }
+    if (!connection || typeof connection.startSession !== 'function' || connection.readyState !== 1) {
+      throw new ServiceUnavailableError('Database transactions are not available');
     }
 
-    if (clientSession) {
+    let clientSession: ClientSession;
+    try {
+      clientSession = await connection.startSession();
+    } catch (startErr) {
+      throw new ServiceUnavailableError(
+        `Database transaction session unavailable: ${startErr instanceof Error ? startErr.message : String(startErr)}`
+      );
+    }
+
+    try {
+      clientSession.startTransaction();
+    } catch (txErr) {
       try {
-        clientSession.startTransaction();
-
-        const updateResult = await this.userModel.updateOne(
-          {
-            _id: user._id,
-            sessionEpoch: payload.epoch,
-            accountStatus: 'ACTIVE',
-          },
-          { $inc: { sessionEpoch: 1 } },
-          { session: clientSession }
-        );
-
-        if (updateResult.modifiedCount !== 1) {
-          throw new UnauthorizedError('Concurrent update or session epoch mismatch');
-        }
-
-        await this.sessionModel.updateMany(
-          { userId: user._id, status: 'ACTIVE' },
-          {
-            $set: {
-              status: 'REVOKED',
-              revokedAt: now,
-              revokedReason: 'LOGOUT_ALL',
-            },
-          },
-          { session: clientSession }
-        );
-
-        try {
-          await clientSession.commitTransaction();
-        } catch (commitErr: unknown) {
-          // R2-03: Handle uncertain transaction-commit results without blindly rerunning a logically completed operation
-          const isUncertainCommit =
-            commitErr instanceof Error &&
-            (('hasErrorLabel' in commitErr &&
-              typeof (commitErr as { hasErrorLabel: (label: string) => boolean }).hasErrorLabel === 'function' &&
-              (commitErr as { hasErrorLabel: (label: string) => boolean }).hasErrorLabel(
-                'UnknownTransactionCommitResult'
-              )) ||
-              (commitErr as { errorLabels?: string[] }).errorLabels?.includes(
-                'UnknownTransactionCommitResult'
-              ));
-
-          if (isUncertainCommit) {
-            const freshUser = await this.userModel.findById(user._id);
-            if (freshUser && freshUser.sessionEpoch > payload.epoch) {
-              // Logically completed on server before network failure; do not rerun
-              return;
-            }
-          }
-          throw commitErr;
-        }
-      } catch (err) {
-        if (clientSession.inTransaction()) {
-          try {
-            await clientSession.abortTransaction();
-          } catch {
-            // Ignore secondary abort failure
-          }
-        }
-        throw err;
-      } finally {
         await clientSession.endSession();
+      } catch {
+        // Ignore secondary cleanup error
       }
-    } else {
-      // Non-transactional fallback for mock or standalone database without transactions
+      throw new ServiceUnavailableError(
+        `Database transactions are not supported: ${txErr instanceof Error ? txErr.message : String(txErr)}`
+      );
+    }
+
+    try {
+      // 2. Verify user exists and is active with matching session epoch
+      const user = await this.userModel.findById(payload.sub);
+      if (!user) {
+        throw new UnauthorizedError('User not found');
+      }
+
+      if (user.accountStatus !== 'ACTIVE') {
+        throw new UnauthorizedError(`User account is ${user.accountStatus.toLowerCase()}`);
+      }
+
+      if (user.sessionEpoch !== payload.epoch) {
+        throw new UnauthorizedError('Session epoch mismatch');
+      }
+
+      // 3. Requirement 2: Serialize initiating-session validity and write-fence within the transaction.
+      // Conditionally validate and write-fence the initiating session against concurrent session revocation.
+      // Requires matching sessionId, userId, ACTIVE status, epochAtIssue, and unexpired idle/absolute deadlines.
+      const fenceResult = await this.sessionModel.updateOne(
+        {
+          sessionId: payload.sid,
+          userId: user._id,
+          status: 'ACTIVE',
+          epochAtIssue: payload.epoch,
+          idleExpiresAt: { $gt: now },
+          absoluteExpiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            status: 'REVOKED',
+            revokedAt: now,
+            revokedReason: 'LOGOUT_ALL',
+          },
+        },
+        { session: clientSession }
+      );
+
+      if (fenceResult.matchedCount !== 1) {
+        // Initiating session was invalid, expired, foreign, or already revoked
+        const existingSession = await this.sessionModel.findOne({ sessionId: payload.sid });
+        if (!existingSession) {
+          throw new UnauthorizedError('Session not found');
+        }
+        if (existingSession.userId.toString() !== payload.sub || !existingSession.userId.equals(user._id)) {
+          throw new UnauthorizedError('Session does not belong to user');
+        }
+        if (existingSession.status !== 'ACTIVE') {
+          throw new UnauthorizedError('Session is not active');
+        }
+        if (now >= existingSession.idleExpiresAt || now >= existingSession.absoluteExpiresAt) {
+          throw new UnauthorizedError('Session has expired');
+        }
+        if (existingSession.epochAtIssue !== payload.epoch) {
+          throw new UnauthorizedError('Session epoch mismatch');
+        }
+        throw new UnauthorizedError('Initiating session write-fence rejected');
+      }
+
+      // 4. Atomic user epoch CAS within transaction
       const updateResult = await this.userModel.updateOne(
         {
           _id: user._id,
           sessionEpoch: payload.epoch,
           accountStatus: 'ACTIVE',
         },
-        { $inc: { sessionEpoch: 1 } }
+        { $inc: { sessionEpoch: 1 } },
+        { session: clientSession }
       );
 
       if (updateResult.modifiedCount !== 1) {
         throw new UnauthorizedError('Concurrent update or session epoch mismatch');
       }
 
+      // 5. Revoke all remaining active sessions belonging to this user
       await this.sessionModel.updateMany(
         { userId: user._id, status: 'ACTIVE' },
         {
@@ -528,8 +500,120 @@ export class SessionService {
             revokedAt: now,
             revokedReason: 'LOGOUT_ALL',
           },
-        }
+        },
+        { session: clientSession }
       );
+
+      // 6. Requirement 3: Bounded retry of commitTransaction() on UnknownTransactionCommitResult
+      const MAX_COMMIT_RETRIES = 3;
+      let committed = false;
+      let lastCommitError: unknown = null;
+
+      for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt++) {
+        try {
+          await clientSession.commitTransaction();
+          committed = true;
+          break;
+        } catch (commitErr: unknown) {
+          lastCommitError = commitErr;
+          if (this.isUnknownTransactionCommitResult(commitErr) && attempt < MAX_COMMIT_RETRIES - 1) {
+            // Driver semantics: retry commitTransaction on the same session
+            continue;
+          }
+          break;
+        }
+      }
+
+      if (!committed) {
+        if (this.isUnknownTransactionCommitResult(lastCommitError)) {
+          // Reconcile durable user and session state before claiming success
+          const isReconciled = await this.reconcileLogoutAllCommit(
+            user._id,
+            payload.sid,
+            payload.epoch
+          );
+          if (isReconciled) {
+            return;
+          }
+        }
+        if (lastCommitError instanceof Error) {
+          throw lastCommitError;
+        }
+        throw new ServiceUnavailableError('Transaction commit outcome uncertain');
+      }
+    } catch (err) {
+      if (clientSession.inTransaction()) {
+        try {
+          await clientSession.abortTransaction();
+        } catch {
+          // Ignore secondary abort failure
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        await clientSession.endSession();
+      } catch {
+        // Ignore secondary endSession failure
+      }
+    }
+  }
+
+  private isUnknownTransactionCommitResult(err: unknown): boolean {
+    if (err && typeof err === 'object') {
+      if (
+        'hasErrorLabel' in err &&
+        typeof (err as { hasErrorLabel: unknown }).hasErrorLabel === 'function' &&
+        (err as { hasErrorLabel: (label: string) => boolean }).hasErrorLabel(
+          'UnknownTransactionCommitResult'
+        )
+      ) {
+        return true;
+      }
+      if (
+        'errorLabels' in err &&
+        Array.isArray((err as { errorLabels?: unknown }).errorLabels) &&
+        (err as { errorLabels: string[] }).errorLabels.includes('UnknownTransactionCommitResult')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async reconcileLogoutAllCommit(
+    userId: Types.ObjectId,
+    sessionId: string,
+    originalEpoch: number
+  ): Promise<boolean> {
+    try {
+      const freshUser = await this.userModel.findById(userId);
+      if (!freshUser || freshUser.sessionEpoch < originalEpoch + 1) {
+        return false;
+      }
+
+      const initiatingSession = await this.sessionModel.findOne({ sessionId });
+      if (
+        !initiatingSession ||
+        initiatingSession.status !== 'REVOKED' ||
+        initiatingSession.revokedReason !== 'LOGOUT_ALL'
+      ) {
+        return false;
+      }
+
+      const activeRemainingSessions = await this.sessionModel.countDocuments({
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: { $lte: originalEpoch },
+      });
+
+      if (activeRemainingSessions > 0) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return false;
     }
   }
 

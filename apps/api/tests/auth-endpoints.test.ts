@@ -46,6 +46,20 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
     vi.restoreAllMocks();
     keyring = new SessionKeyring(env);
     await keyring.initialize();
+
+    // Default mocked healthy connection and transaction session for deterministic unit tests
+    Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true, writable: true });
+    let defaultInTx = false;
+    const defaultMockSession = {
+      startTransaction: vi.fn(() => { defaultInTx = true; }),
+      commitTransaction: vi.fn(async () => { defaultInTx = false; }),
+      abortTransaction: vi.fn(async () => { defaultInTx = false; }),
+      endSession: vi.fn(async () => {}),
+      inTransaction: vi.fn(() => defaultInTx),
+    };
+    vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(defaultMockSession as unknown as mongoose.ClientSession);
+    vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ matchedCount: 0, modifiedCount: 0, acknowledged: true, upsertedCount: 0, upsertedId: null });
+
     sessionService = new SessionService(env, keyring, mongoose.connection);
     app = createApp({
       env,
@@ -548,6 +562,9 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       } as unknown as SessionDocument);
 
+      const sessionUpdateSpy = vi
+        .spyOn(SessionModel, 'updateOne')
+        .mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       const userUpdateSpy = vi
         .spyOn(UserModel, 'updateOne')
         .mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
@@ -563,10 +580,28 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
 
       expect(res.status).toBe(204);
 
+      // Verifies initiating session write fence
+      expect(sessionUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId,
+          userId,
+          status: 'ACTIVE',
+          epochAtIssue: 1,
+        }),
+        expect.objectContaining({
+          $set: expect.objectContaining({
+            status: 'REVOKED',
+            revokedReason: 'LOGOUT_ALL',
+          }),
+        }),
+        { session: expect.anything() }
+      );
+
       // Verifies conditional epoch increment
       expect(userUpdateSpy).toHaveBeenCalledWith(
         { _id: userId, sessionEpoch: 1, accountStatus: 'ACTIVE' },
-        { $inc: { sessionEpoch: 1 } }
+        { $inc: { sessionEpoch: 1 } },
+        { session: expect.anything() }
       );
 
       // Verifies revocation of all sessions
@@ -577,7 +612,8 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
             status: 'REVOKED',
             revokedReason: 'LOGOUT_ALL',
           }),
-        })
+        }),
+        { session: expect.anything() }
       );
 
       const setCookies = res.headers['set-cookie'];
@@ -922,8 +958,67 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
     }
   });
 
-  describe('R2-03 — Atomic Logout-All Persistence and Transactional Fault Handling', () => {
-    it('aborts transaction and rolls back when session revocation fails after epoch increment', async () => {
+  describe('R2-03 — Atomic Logout-All Persistence, Session Fence, and Transactional Fault Handling', () => {
+    it('rejects logout-all when transaction session is unavailable with 503 and zero writes', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_unavailable_zero_writes';
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      // Disconnected state -> readyState = 0
+      Object.defineProperty(mongoose.connection, 'readyState', { value: 0, configurable: true, writable: true });
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+      const sessionUpdateSpy = vi.spyOn(SessionModel, 'updateOne');
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateManySpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects logout-all when transaction session creation throws with 503 and zero writes', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_creation_throws_zero_writes';
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(mongoose.connection, 'startSession').mockRejectedValue(
+        new Error('MongoServerError: Transaction numbers are only allowed on a replica set member')
+      );
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+      const sessionUpdateSpy = vi.spyOn(SessionModel, 'updateOne');
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateManySpy).not.toHaveBeenCalled();
+    });
+
+    it('rolls back all mutations if session revocation fails after epoch update', async () => {
       const userId = new Types.ObjectId();
       const sessionId = 'sess_tx_rollback_test';
       const now = new Date();
@@ -960,7 +1055,7 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       };
 
       vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
-
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       // Inject failure on session revocation inside transaction
       vi.spyOn(SessionModel, 'updateMany').mockRejectedValue(new Error('Simulated database write failure during session revocation'));
@@ -978,9 +1073,75 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       expect(mockClientSession.endSession).toHaveBeenCalled();
     });
 
-    it('rejects concurrent logout-all when user epoch CAS detects modifiedCount !== 1', async () => {
+    it('aborts without updating user epoch or other sessions when concurrent single-session logout wins before session fence', async () => {
       const userId = new Types.ObjectId();
-      const sessionId = 'sess_tx_cas_conflict';
+      const sessionId = 'sess_race_single_logout_wins';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      let inTx = false;
+      let aborted = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => { inTx = false; }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+
+      // Single-session logout already revoked the initiating session before logout-all's fence write
+      // So the conditional update matches 0 documents
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({
+        matchedCount: 0,
+        modifiedCount: 0,
+        acknowledged: true,
+        upsertedCount: 0,
+        upsertedId: null,
+      });
+
+      // Inspection query finds the session is already revoked
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'REVOKED',
+        revokedReason: 'USER_LOGOUT',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe('AUTH_REQUIRED');
+      expect(res.body.error.message).toContain('Session is not active');
+      expect(aborted).toBe(true);
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateManySpy).not.toHaveBeenCalled();
+    });
+
+    it('logout-all wins before single-session logout and subsequent single logout completes cleanly', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_race_logout_all_wins';
       const now = new Date();
       const bearer = await signAccessToken(keyring, {
         userId: String(userId),
@@ -1004,20 +1165,97 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       } as unknown as SessionDocument);
 
-      let aborted = false;
+      const sessionUpdateSpy = vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({
+        modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null
+      });
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne').mockResolvedValue({
+        modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null
+      });
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({
+        modifiedCount: 2, acknowledged: true, matchedCount: 2, upsertedCount: 0, upsertedId: null
+      });
+
+      // 1. Logout-all runs and wins
+      const resLogoutAll = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(resLogoutAll.status).toBe(204);
+      expect(sessionUpdateSpy).toHaveBeenCalled();
+      expect(userUpdateSpy).toHaveBeenCalled();
+      expect(sessionUpdateManySpy).toHaveBeenCalled();
+
+      // 2. Subsequent single-session logout runs for the same session (now already revoked by logout-all)
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'REVOKED',
+        revokedReason: 'LOGOUT_ALL',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const resLogout = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(resLogout.status).toBe(204);
+    });
+
+    it('handles unknown commit followed by successful commit retry', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_retry_success';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const uncertainError = new Error('Transient commit network error');
+      (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
+
       let inTx = false;
+      let commitCalls = 0;
       const mockClientSession = {
         startTransaction: vi.fn(() => { inTx = true; }),
-        commitTransaction: vi.fn(async () => { inTx = false; }),
-        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        commitTransaction: vi.fn(async () => {
+          commitCalls++;
+          if (commitCalls === 1) {
+            throw uncertainError;
+          }
+          inTx = false;
+        }),
+        abortTransaction: vi.fn(async () => { inTx = false; }),
         endSession: vi.fn(async () => {}),
         inTransaction: vi.fn(() => inTx),
       };
 
       vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
-
-      // CAS conflict: another concurrent transaction already bumped the epoch
-      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 0, acknowledged: true, matchedCount: 0, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
 
       const res = await request(app)
         .post('/api/v1/auth/logout-all')
@@ -1025,14 +1263,82 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         .set('Authorization', `Bearer ${bearer}`)
         .send({});
 
-      expect(res.status).toBe(401);
-      expect(res.body.error.code).toBe('AUTH_REQUIRED');
-      expect(aborted).toBe(true);
+      expect(res.status).toBe(204);
+      expect(commitCalls).toBe(2);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
     });
 
-    it('handles uncertain commit outcome gracefully when user epoch was incremented on server', async () => {
+    it('rejects logout-all when commit is uncertain and session revocation is incomplete despite unrelated epoch bump', async () => {
       const userId = new Types.ObjectId();
-      const sessionId = 'sess_tx_uncertain_commit_success';
+      const sessionId = 'sess_tx_unrelated_bump_incomplete';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      // First findById succeeds with epoch 1
+      // Second findById during reconciliation finds epoch 2 (unrelated bump!)
+      vi.spyOn(UserModel, 'findById')
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 1,
+        } as unknown as UserDocument)
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 2,
+        } as unknown as UserDocument);
+
+      // Initiating session was NOT revoked with LOGOUT_ALL, or other active sessions remain
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE', // Still ACTIVE! Session revocation was NOT durable
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      vi.spyOn(SessionModel, 'countDocuments').mockResolvedValue(2); // 2 active sessions remain!
+
+      const uncertainError = new Error('Permanent network timeout during commit');
+      (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
+
+      let inTx = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => {
+          throw uncertainError;
+        }),
+        abortTransaction: vi.fn(async () => { inTx = false; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      // Must NOT return 204 success!
+      expect(res.status).toBe(500);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
+    });
+
+    it('handles uncertain commit outcome gracefully when durable state is fully reconciled', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_uncertain_commit_reconciled';
       const now = new Date();
       const bearer = await signAccessToken(keyring, {
         userId: String(userId),
@@ -1047,7 +1353,7 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
           accountStatus: 'ACTIVE',
           sessionEpoch: 1,
         } as unknown as UserDocument)
-        // Second call during uncertain commit recovery finds that epoch was indeed incremented on server
+        // Second call during reconciliation finds epoch was incremented
         .mockResolvedValueOnce({
           _id: userId,
           role: 'CANDIDATE',
@@ -1058,11 +1364,15 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
         sessionId,
         userId,
-        status: 'ACTIVE',
+        status: 'REVOKED',
+        revokedReason: 'LOGOUT_ALL',
         epochAtIssue: 1,
         idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       } as unknown as SessionDocument);
+
+      // Reconciliation verifies 0 remaining active sessions
+      vi.spyOn(SessionModel, 'countDocuments').mockResolvedValue(0);
 
       const uncertainError = new Error('Network timeout during commit');
       (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
@@ -1080,6 +1390,7 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       };
 
       vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
 
@@ -1094,9 +1405,9 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       expect(mockClientSession.endSession).toHaveBeenCalled();
     });
 
-    it('rethrows uncertain commit error when user epoch was NOT incremented on server', async () => {
+    it('prevents duplicate epoch bump on concurrent logout-all requests', async () => {
       const userId = new Types.ObjectId();
-      const sessionId = 'sess_tx_uncertain_commit_fail';
+      const sessionId = 'sess_concurrent_logout_all';
       const now = new Date();
       const bearer = await signAccessToken(keyring, {
         userId: String(userId),
@@ -1104,20 +1415,12 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         epoch: 1,
       });
 
-      vi.spyOn(UserModel, 'findById')
-        .mockResolvedValueOnce({
-          _id: userId,
-          role: 'CANDIDATE',
-          accountStatus: 'ACTIVE',
-          sessionEpoch: 1,
-        } as unknown as UserDocument)
-        // Second call finds epoch was NOT incremented on server
-        .mockResolvedValueOnce({
-          _id: userId,
-          role: 'CANDIDATE',
-          accountStatus: 'ACTIVE',
-          sessionEpoch: 1,
-        } as unknown as UserDocument);
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
 
       vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
         sessionId,
@@ -1128,34 +1431,31 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       } as unknown as SessionDocument);
 
-      const uncertainError = new Error('Network timeout during commit');
-      (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
-
-      let inTx = false;
-      let aborted = false;
-      const mockClientSession = {
-        startTransaction: vi.fn(() => { inTx = true; }),
-        commitTransaction: vi.fn(async () => {
-          throw uncertainError;
-        }),
-        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
-        endSession: vi.fn(async () => {}),
-        inTransaction: vi.fn(() => inTx),
-      };
-
-      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
-      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
       vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
 
-      const res = await request(app)
-        .post('/api/v1/auth/logout-all')
-        .set('Origin', allowedOrigin)
-        .set('Authorization', `Bearer ${bearer}`)
-        .send({});
+      // First call succeeds (modifiedCount: 1), second call fails CAS (modifiedCount: 0)
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne')
+        .mockResolvedValueOnce({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null })
+        .mockResolvedValueOnce({ modifiedCount: 0, acknowledged: true, matchedCount: 0, upsertedCount: 0, upsertedId: null });
 
-      expect(res.status).toBe(500);
-      expect(aborted).toBe(true);
-      expect(mockClientSession.endSession).toHaveBeenCalled();
+      const [res1, res2] = await Promise.all([
+        request(app)
+          .post('/api/v1/auth/logout-all')
+          .set('Origin', allowedOrigin)
+          .set('Authorization', `Bearer ${bearer}`)
+          .send({}),
+        request(app)
+          .post('/api/v1/auth/logout-all')
+          .set('Origin', allowedOrigin)
+          .set('Authorization', `Bearer ${bearer}`)
+          .send({}),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual([204, 401]);
+      // user update was called for both, but only one succeeded in incrementing epoch
+      expect(userUpdateSpy).toHaveBeenCalledTimes(2);
     });
   });
 });

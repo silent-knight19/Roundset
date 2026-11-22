@@ -1201,5 +1201,168 @@ describe.skipIf(!runLive)(
       expect(s1?.revokedReason).toBe('LOGOUT_ALL');
       expect(s2?.revokedReason).toBe('LOGOUT_ALL');
     });
+
+    it('demonstrates race where single-session logout wins before logout-all session fence in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_single_wins@example.test`,
+        displayName: 'Single Wins User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_sw_s1`;
+      const sessId2 = `${runId}_srv_sw_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // 1. Single-session logout wins first: revokes sessId1
+      await liveSessionService.logout({
+        bearerToken,
+        requestId: `${runId}_single_logout_req`,
+      });
+
+      const s1AfterSingle = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1AfterSingle?.status).toBe('REVOKED');
+      expect(s1AfterSingle?.revokedReason).toBe('USER_LOGOUT');
+
+      // 2. Logout-all attempts to run using the now-revoked session
+      let caughtError: unknown;
+      try {
+        await liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_logout_all_after_single_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      // Must be rejected with UnauthorizedError
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // User sessionEpoch must NOT have been incremented
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(1);
+
+      // Session 2 must remain ACTIVE
+      const s2After = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s2After?.status).toBe('ACTIVE');
+    });
+
+    it('demonstrates race where logout-all wins before single-session logout in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_all_wins@example.test`,
+        displayName: 'All Wins User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_aw_s1`;
+      const sessId2 = `${runId}_srv_aw_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // 1. Logout-all wins first: fences sessId1, bumps epoch to 2, revokes sessId1 and sessId2
+      await liveSessionService.logoutAll({
+        bearerToken,
+        requestId: `${runId}_all_wins_req`,
+      });
+
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(2);
+
+      const s1After = await SessionModel.findOne({ sessionId: sessId1 });
+      const s2After = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s1After?.status).toBe('REVOKED');
+      expect(s2After?.status).toBe('REVOKED');
+      expect(s1After?.revokedReason).toBe('LOGOUT_ALL');
+      expect(s2After?.revokedReason).toBe('LOGOUT_ALL');
+
+      // 2. Subsequent single-session logout runs: completes cleanly without crashing or changing epoch
+      await liveSessionService.logout({
+        bearerToken,
+        requestId: `${runId}_single_after_all_req`,
+      });
+
+      const userAfter = await UserModel.findById(user._id);
+      expect(userAfter?.sessionEpoch).toBe(2);
+    });
   });
 });
