@@ -3,6 +3,8 @@ import {
   LivenessResponseSchema,
   ReadinessResponseSchema,
   ApiErrorResponseSchema,
+  PlanCodeSchema,
+  InterviewStatusSchema,
 } from '../src/index.js';
 
 describe('Shared Contracts Smoke Tests', () => {
@@ -180,5 +182,35 @@ describe('Shared Contracts Smoke Tests', () => {
         attempt: 1,
       });
     }
+  });
+
+  // Future-domain enum schema tests
+  it('validates all approved PlanCode enum values and rejects unknown codes', () => {
+    const validPlans = ['FREE', 'PAID_250', 'PAID_500', 'PAID_1000', 'VIP'];
+    for (const plan of validPlans) {
+      expect(PlanCodeSchema.safeParse(plan).success).toBe(true);
+    }
+    expect(PlanCodeSchema.safeParse('ENTERPRISE').success).toBe(false);
+    expect(PlanCodeSchema.safeParse('').success).toBe(false);
+  });
+
+  it('validates all approved InterviewStatus enum values and rejects unknown statuses', () => {
+    const validStatuses = [
+      'DRAFT',
+      'PREFLIGHT',
+      'READY',
+      'ACTIVE',
+      'RECOVERING',
+      'COMPLETED',
+      'TERMINATED_INTEGRITY',
+      'ABORTED_PREFLIGHT',
+      'ABORTED_SYSTEM',
+      'EXPIRED',
+    ];
+    for (const status of validStatuses) {
+      expect(InterviewStatusSchema.safeParse(status).success).toBe(true);
+    }
+    expect(InterviewStatusSchema.safeParse('PENDING').success).toBe(false);
+    expect(InterviewStatusSchema.safeParse('').success).toBe(false);
   });
 });

@@ -4,15 +4,27 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node -e \"console.error('API application server not implemented yet. Scheduled for task P1-FND-02.'); process.exit(1)\"",
+    "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@roundset/contracts": "*"
+    "@roundset/contracts": "*",
+    "cors": "2.8.6",
+    "express": "5.3.0",
+    "helmet": "8.3.0",
+    "mongoose": "9.12.1",
+    "pino": "10.4.0",
+    "pino-http": "11.0.0"
   },
   "devDependencies": {
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
     "@types/node": "^22.13.4",
+    "@types/supertest": "7.2.1",
+    "supertest": "7.3.2",
+    "tsx": "4.23.15",
     "typescript": "^5.7.3"
   }
 }
