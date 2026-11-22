@@ -12,6 +12,15 @@ import {
 } from '../modules/auth/session/cookies.js';
 import { createOriginAndFetchMetadataMiddleware } from '../modules/auth/session/middleware.js';
 import { getRequestId } from '../core/request-id.js';
+import { InvalidInputError } from '../core/errors.js';
+
+function validateEmptyBody(body: unknown): void {
+  if (body !== undefined && body !== null && typeof body === 'object') {
+    if (Object.keys(body).length > 0) {
+      throw new InvalidInputError('Request body must be empty object {}');
+    }
+  }
+}
 
 export interface AuthRouteOptions {
   sessionService: SessionService;
@@ -42,12 +51,13 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/refresh (Cookie + CSRF + Origin)
   router.post('/refresh', requireOrigin, async (req, res, next) => {
     try {
+      validateEmptyBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 
       const cookies = parseCookies(req.headers.cookie);
-      const rawRefreshToken = extractRefreshCookie(cookies);
-      const csrfCookie = extractCsrfCookie(cookies);
+      const rawRefreshToken = extractRefreshCookie(cookies, { isProduction });
+      const csrfCookie = extractCsrfCookie(cookies, { isProduction });
       const csrfHeader = req.headers['x-csrf-token'] as string | undefined;
 
       const { sessionResponse, setCookieHeaders } = await sessionService.rotateSession({
@@ -71,12 +81,13 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/logout (Cookie + CSRF OR Bearer-only)
   router.post('/logout', requireOrigin, async (req, res, next) => {
     try {
+      validateEmptyBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 
       const cookies = parseCookies(req.headers.cookie);
-      const rawRefreshToken = extractRefreshCookie(cookies);
-      const csrfCookie = extractCsrfCookie(cookies);
+      const rawRefreshToken = extractRefreshCookie(cookies, { isProduction });
+      const csrfCookie = extractCsrfCookie(cookies, { isProduction });
       const csrfHeader = req.headers['x-csrf-token'] as string | undefined;
 
       let bearerToken: string | undefined;
@@ -111,6 +122,7 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/logout-all (Bearer + Origin)
   router.post('/logout-all', requireOrigin, async (req, res, next) => {
     try {
+      validateEmptyBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 

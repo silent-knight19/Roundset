@@ -35,24 +35,31 @@ export function createBearerAuthMiddleware(sessionService: SessionService): Requ
       const UserModel = getUserModel();
       const SessionModel = getSessionModel();
 
-      // Verify persistent user status and session epoch
+      // Verify persistent user status
       const user = await UserModel.findById(payload.sub);
       if (!user || user.accountStatus !== 'ACTIVE') {
         throw new UnauthorizedError('User account not active');
       }
 
-      if (user.sessionEpoch !== payload.epoch) {
-        throw new UnauthorizedError('Session epoch mismatch');
-      }
-
-      // Verify persistent session status and expiry
+      // Verify persistent session status
       const session = await SessionModel.findOne({ sessionId: payload.sid });
       if (!session || session.status !== 'ACTIVE') {
         throw new UnauthorizedError('Session not active');
       }
 
+      // Verify session expiry
       if (now >= session.absoluteExpiresAt || now >= session.idleExpiresAt) {
         throw new UnauthorizedError('Session has expired');
+      }
+
+      // R2: Enforce session.userId === user._id === payload.sub
+      if (session.userId.toString() !== payload.sub || !session.userId.equals(user._id)) {
+        throw new UnauthorizedError('Session principal mismatch');
+      }
+
+      // R2: Enforce session.epochAtIssue === payload.epoch === user.sessionEpoch
+      if (session.epochAtIssue !== payload.epoch || user.sessionEpoch !== payload.epoch) {
+        throw new UnauthorizedError('Session epoch mismatch');
       }
 
       req.user = user.toObject();

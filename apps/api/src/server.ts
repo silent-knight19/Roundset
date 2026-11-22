@@ -7,6 +7,7 @@ import { loadEnv, type AppConfig } from './config/env.js';
 import { createLogger } from './core/logging.js';
 import { MongoManager } from './integrations/mongodb.js';
 import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.js';
+import { SessionKeyring, SessionService } from './modules/auth/session/index.js';
 
 export const ALLOWLISTED_ERROR_CODES = new Set([
   'EADDRINUSE',
@@ -84,11 +85,17 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     readinessProvider = options.readinessProvider ?? new MockReadinessProvider(false);
   }
 
-  // 3. Create Express application
+  // 3. Initialize and validate cryptographic session keyring before HTTP startup
+  const keyring = new SessionKeyring(config);
+  await keyring.initialize();
+  const sessionService = new SessionService(config, keyring);
+
+  // 4. Create Express application
   const app = createApp({
     env: config,
     logger,
     readinessProvider,
+    sessionService,
   });
 
   const listenPort = options.port ?? config.PORT;

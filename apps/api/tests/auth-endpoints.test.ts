@@ -524,9 +524,11 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
   describe('POST /api/v1/auth/logout-all', () => {
     it('increments user sessionEpoch, revokes all active sessions for the user, and clears cookies', async () => {
       const userId = new Types.ObjectId();
+      const sessionId = 'sess_active_valid_logout_all';
+      const now = new Date();
       const bearer = await signAccessToken(keyring, {
         userId: String(userId),
-        sessionId: 'sess_active_any',
+        sessionId,
         epoch: 1,
       });
 
@@ -536,6 +538,15 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         accountStatus: 'ACTIVE',
         sessionEpoch: 1,
       } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
 
       const userUpdateSpy = vi
         .spyOn(UserModel, 'updateOne')
@@ -552,9 +563,9 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
 
       expect(res.status).toBe(204);
 
-      // Verifies epoch increment
+      // Verifies conditional epoch increment
       expect(userUpdateSpy).toHaveBeenCalledWith(
-        { _id: userId },
+        { _id: userId, sessionEpoch: 1, accountStatus: 'ACTIVE' },
         { $inc: { sessionEpoch: 1 } }
       );
 
@@ -575,6 +586,162 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       expect(setCookies[1]).toContain('Max-Age=0');
     });
 
+    it('R1: rejects logout-all when session is revoked', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_revoked_logout_all';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'REVOKED',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe('AUTH_REQUIRED');
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateManySpy).not.toHaveBeenCalled();
+    });
+
+    it('R1: rejects logout-all when session is expired', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_expired_logout_all';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() - 1000), // Expired idle
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+    });
+
+    it('R1: rejects logout-all when session belongs to a foreign user', async () => {
+      const userId = new Types.ObjectId();
+      const foreignUserId = new Types.ObjectId();
+      const sessionId = 'sess_foreign_logout_all';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId: foreignUserId, // Belongs to different user
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+    });
+
+    it('R1: rejects logout-all when session epoch is stale', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_stale_epoch_logout_all';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 2, // Session epoch does not match token epoch
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+    });
+
     it('rejects logout-all without Bearer token with 401 AUTH_REQUIRED', async () => {
       const res = await request(app)
         .post('/api/v1/auth/logout-all')
@@ -583,6 +750,143 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
 
       expect(res.status).toBe(401);
       expect(res.body.error.code).toBe('AUTH_REQUIRED');
+    });
+  });
+
+  describe('R3 — Production Cookie Namespace Enforcement', () => {
+    it('rejects development cookie names in production environment', async () => {
+      const prodEnv = loadEnv({
+        NODE_ENV: 'test',
+        WEB_ORIGIN: allowedOrigin,
+        INGRESS_MODE: 'SINGLE_ORIGIN',
+        MOCK_DATABASE: 'false',
+        POLICY_ID: 'roundset-prod-policy',
+        POLICY_CONSENT_VERSION: 'v2026.11.23',
+      });
+
+      // Override isProduction in route options via custom route mounting or testing with isProduction = true
+      const { rawToken } = createRefreshToken(keyring, {
+        sessionId: 'sess_prod_cookie_test',
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(keyring, {
+        sessionId: 'sess_prod_cookie_test',
+      });
+
+      // App mounted with isProduction=true (simulated by passing custom router or test app)
+      const prodAppWithFlag = createApp({
+        env: { ...prodEnv, NODE_ENV: 'production' } as unknown as ReturnType<typeof loadEnv>,
+        sessionService,
+        readinessProvider: new MockReadinessProvider(true),
+      });
+
+      // Sending development unprefixed cookie names (roundset_refresh, roundset_csrf)
+      const res = await request(prodAppWithFlag)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', allowedOrigin)
+        .set('Cookie', `roundset_refresh=${rawToken}; roundset_csrf=${csrfToken}`)
+        .set('X-CSRF-Token', csrfToken)
+        .send({});
+
+      // In production, unprefixed cookies are completely ignored; yields 401
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe('AUTH_REQUIRED');
+    });
+
+    it('accepts __Host- cookies in production environment', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_prod_host_cookie_test';
+      const now = new Date();
+
+      const { rawToken, digest } = createRefreshToken(keyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(keyring, { sessionId });
+
+      const prodEnv = loadEnv({
+        NODE_ENV: 'test',
+        WEB_ORIGIN: allowedOrigin,
+        INGRESS_MODE: 'SINGLE_ORIGIN',
+        MOCK_DATABASE: 'false',
+        POLICY_ID: 'roundset-prod-policy',
+        POLICY_CONSENT_VERSION: 'v2026.11.23',
+      });
+
+      const prodApp = createApp({
+        env: { ...prodEnv, NODE_ENV: 'production' } as unknown as ReturnType<typeof loadEnv>,
+        sessionService,
+        readinessProvider: new MockReadinessProvider(true),
+      });
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        generation: 1,
+        currentRefreshDigest: digest,
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        emailNormalized: 'user@example.test',
+        displayName: 'Test User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOneAndUpdate').mockResolvedValue({
+        sessionId,
+        generation: 2,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const res = await request(prodApp)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', allowedOrigin)
+        .set('Cookie', `__Host-roundset_refresh=${rawToken}; __Host-roundset_csrf=${csrfToken}`)
+        .set('X-CSRF-Token', csrfToken)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.session.id).toBe(sessionId);
+    });
+  });
+
+  describe('R7 — Request Body {} Contract Validation', () => {
+    it('rejects non-empty JSON body on /api/v1/auth/refresh with 400 INVALID_INPUT', async () => {
+      const res = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Origin', allowedOrigin)
+        .send({ unexpectedField: 'bad_payload' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_INPUT');
+      expect(res.body.error.message).toContain('Request body must be empty object {}');
+    });
+
+    it('rejects non-empty JSON body on /api/v1/auth/logout with 400 INVALID_INPUT', async () => {
+      const res = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .send({ malicious: true });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_INPUT');
+    });
+
+    it('rejects non-empty JSON body on /api/v1/auth/logout-all with 400 INVALID_INPUT', async () => {
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .send({ foo: 'bar' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_INPUT');
     });
   });
 });

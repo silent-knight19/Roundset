@@ -7,10 +7,20 @@ import {
   getAuthIdentityModel,
   getSessionModel,
   getVerificationChallengeModel,
+  getSecurityAuditEventModel,
   ensureIdentityIndexes,
   verifyIdentityIndexes,
   REQUIRED_IDENTITY_INDEXES,
 } from '../src/modules/identity/models/index.js';
+import {
+  SessionKeyring,
+  SessionService,
+  createRefreshToken,
+  createCsrfToken,
+  signAccessToken,
+} from '../src/modules/auth/session/index.js';
+import { loadEnv } from '../src/config/env.js';
+import { UnauthorizedError, SessionReplayError } from '../src/core/errors.js';
 import {
   EXPECTED_TEST_DB_NAME,
   extractDatabaseName,
@@ -836,14 +846,31 @@ describe.skipIf(!runLive)(
     });
   });
 
-  describe('Test Group E — Session Compare-and-Swap Concurrency & Replay Invariants (P2-AUTH-05a)', () => {
-    it('executes concurrent refresh CAS updates and guarantees exactly one successor commits', async () => {
+  describe('Test Group E — SessionService CAS Concurrency & Replay Invariants (P2-AUTH-05a)', () => {
+    let serviceKeyring: SessionKeyring;
+    let liveSessionService: SessionService;
+
+    beforeAll(async () => {
+      const config = loadEnv({
+        NODE_ENV: 'test',
+        MOCK_DATABASE: false,
+        WEB_ORIGIN: 'http://localhost:5173',
+        POLICY_ID: 'roundset-terms-privacy-2026',
+        POLICY_CONSENT_VERSION: '2026-11-22',
+        REGISTRATION_MODE: 'PUBLIC',
+      });
+      serviceKeyring = new SessionKeyring(config);
+      await serviceKeyring.initialize();
+      liveSessionService = new SessionService(config, serviceKeyring, conn);
+    });
+
+    it('demonstrates one successful CAS successor under concurrent SessionService.rotateSession() requests', async () => {
       const UserModel = getUserModel(conn);
       const SessionModel = getSessionModel(conn);
 
       const user = await UserModel.create({
-        emailNormalized: `${runId}_cas_user@example.test`,
-        displayName: 'CAS Test User',
+        emailNormalized: `${runId}_srv_cas@example.test`,
+        displayName: 'Service CAS User',
         role: 'CANDIDATE',
         accountStatus: 'ACTIVE',
         sessionEpoch: 1,
@@ -853,70 +880,66 @@ describe.skipIf(!runLive)(
       });
       createdUserIds.push(user._id);
 
-      const sessionId = `${runId}_cas_sess_1`;
+      const sessionId = `${runId}_srv_cas_sess`;
       createdSessionIds.push(sessionId);
 
-      const now = new Date();
-      const initialDigest = `digest_${runId}_gen_1`;
+      const { rawToken: rawRefresh, digest } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
 
-      const session = await SessionModel.create({
+      const now = new Date();
+      await SessionModel.create({
         sessionId,
         userId: user._id,
         status: 'ACTIVE',
         generation: 1,
-        currentRefreshDigest: initialDigest,
+        currentRefreshDigest: digest,
         epochAtIssue: 1,
         createdAt: now,
         lastUsedAt: now,
         idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       });
-      expect(session).toBeDefined();
 
-      // Execute 10 concurrent CAS operations contending for generation 1 -> 2
+      // 10 concurrent calls to sessionService.rotateSession()
       const concurrency = 10;
-      const casPromises = Array.from({ length: concurrency }, async (_, idx) => {
-        const nextDigest = `digest_${runId}_gen_2_from_${idx}`;
-        return SessionModel.findOneAndUpdate(
-          {
-            sessionId,
-            status: 'ACTIVE',
-            generation: 1,
-            currentRefreshDigest: initialDigest,
-            epochAtIssue: user.sessionEpoch,
-            idleExpiresAt: { $gt: now },
-            absoluteExpiresAt: { $gt: now },
-          },
-          {
-            $set: {
-              generation: 2,
-              currentRefreshDigest: nextDigest,
-              lastUsedAt: new Date(),
-            },
-          },
-          { new: true }
-        );
+      const rotatePromises = Array.from({ length: concurrency }, async (_, idx) => {
+        try {
+          const res = await liveSessionService.rotateSession({
+            rawRefreshToken: rawRefresh,
+            csrfHeader: csrfToken,
+            csrfCookie: csrfToken,
+            isSecure: false,
+            requestId: `${runId}_req_${idx}`,
+          });
+          return { success: true, res };
+        } catch (err) {
+          return { success: false, err };
+        }
       });
 
-      const results = await Promise.all(casPromises);
-      const successfulCommits = results.filter((res) => res !== null);
-      const failedCommits = results.filter((res) => res === null);
+      const results = await Promise.all(rotatePromises);
+      const successful = results.filter((r) => r.success);
+      const failed = results.filter((r) => !r.success);
 
-      expect(successfulCommits.length).toBe(1);
-      expect(failedCommits.length).toBe(concurrency - 1);
+      expect(successful.length).toBe(1);
+      expect(failed.length).toBe(concurrency - 1);
 
+      // Verify the single successor was committed to MongoDB with generation 2
       const finalSession = await SessionModel.findOne({ sessionId });
       expect(finalSession?.generation).toBe(2);
       expect(finalSession?.status).toBe('ACTIVE');
     });
 
-    it('identifies authentic stale generation replay and safely revokes session family', async () => {
+    it('demonstrates forged MAC never revokes a session in real MongoDB', async () => {
       const UserModel = getUserModel(conn);
       const SessionModel = getSessionModel(conn);
 
       const user = await UserModel.create({
-        emailNormalized: `${runId}_replay_user@example.test`,
-        displayName: 'Replay Test User',
+        emailNormalized: `${runId}_srv_forged@example.test`,
+        displayName: 'Forged MAC User',
         role: 'CANDIDATE',
         accountStatus: 'ACTIVE',
         sessionEpoch: 1,
@@ -926,17 +949,22 @@ describe.skipIf(!runLive)(
       });
       createdUserIds.push(user._id);
 
-      const sessionId = `${runId}_replay_sess_1`;
+      const sessionId = `${runId}_srv_forged_sess`;
       createdSessionIds.push(sessionId);
 
+      const { rawToken: rawRefresh, digest } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
+
       const now = new Date();
-      // Session has already progressed to generation 3
       await SessionModel.create({
         sessionId,
         userId: user._id,
         status: 'ACTIVE',
-        generation: 3,
-        currentRefreshDigest: `digest_${runId}_gen_3`,
+        generation: 1,
+        currentRefreshDigest: digest,
         epochAtIssue: 1,
         createdAt: now,
         lastUsedAt: now,
@@ -944,27 +972,156 @@ describe.skipIf(!runLive)(
         absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
       });
 
-      // A presentation of generation 1 (valid MAC, but generation 1 < current 3) triggers family revocation
-      const presentedGeneration = 1;
-      const targetSession = await SessionModel.findOne({ sessionId });
-      expect(targetSession?.status).toBe('ACTIVE');
-      expect(targetSession?.generation).toBeGreaterThan(presentedGeneration);
+      // Tamper with MAC
+      const parts = rawRefresh.split('.');
+      parts[5] = 'bad_mac_' + parts[5];
+      const forgedRefresh = parts.join('.');
 
-      // Perform family revocation
-      await SessionModel.updateOne(
-        { sessionId, status: 'ACTIVE' },
-        {
-          $set: {
-            status: 'REVOKED',
-            revokedAt: new Date(),
-            revokedReason: 'SESSION_REPLAY_DETECTED',
-          },
-        }
-      );
+      let caughtError: unknown;
+      try {
+        await liveSessionService.rotateSession({
+          rawRefreshToken: forgedRefresh,
+          csrfHeader: csrfToken,
+          csrfCookie: csrfToken,
+          isSecure: false,
+          requestId: `${runId}_forged_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
 
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // Session must remain completely untouched (ACTIVE, generation 1)
+      const untouchedSession = await SessionModel.findOne({ sessionId });
+      expect(untouchedSession?.status).toBe('ACTIVE');
+      expect(untouchedSession?.generation).toBe(1);
+    });
+
+    it('demonstrates authentic stale-generation replay revokes the correct session in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+      const AuditModel = getSecurityAuditEventModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_replay@example.test`,
+        displayName: 'Replay Service User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_replay_sess`;
+      createdSessionIds.push(sessionId);
+
+      // Generate a legitimate token for generation 1
+      const { rawToken: staleRefresh } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
+
+      const now = new Date();
+      // Persistent session is already at generation 2
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 2,
+        currentRefreshDigest: `digest_${runId}_gen2`,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      let caughtError: unknown;
+      try {
+        await liveSessionService.rotateSession({
+          rawRefreshToken: staleRefresh,
+          csrfHeader: csrfToken,
+          csrfCookie: csrfToken,
+          isSecure: false,
+          requestId: `${runId}_replay_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(SessionReplayError);
+
+      // Session family must be revoked in database
       const revokedSession = await SessionModel.findOne({ sessionId });
       expect(revokedSession?.status).toBe('REVOKED');
       expect(revokedSession?.revokedReason).toBe('SESSION_REPLAY_DETECTED');
+
+      // Audit record must be persisted
+      const auditRecord = await AuditModel.findOne({ targetId: sessionId });
+      expect(auditRecord).toBeDefined();
+      expect(auditRecord?.eventType).toBe('SESSION_REPLAY_DETECTED');
+      expect(auditRecord?.outcome).toBe('FAILURE');
+    });
+
+    it('demonstrates revoked-session logout-all is rejected in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_revoked_logout@example.test`,
+        displayName: 'Revoked Logout User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_revoked_logout_sess`;
+      createdSessionIds.push(sessionId);
+
+      const now = new Date();
+      // Session is already REVOKED
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'REVOKED',
+        generation: 1,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      // Bearer token issued for this now-revoked session
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId,
+        epoch: 1,
+      });
+
+      let caughtError: unknown;
+      try {
+        await liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_revoked_logout_all_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // User sessionEpoch must NOT have been incremented
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(1);
     });
   });
 });

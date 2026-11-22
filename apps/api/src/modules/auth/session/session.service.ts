@@ -377,6 +377,7 @@ export class SessionService {
     bearerToken?: string;
     requestId: string;
   }): Promise<void> {
+    await this.keyring.ensureInitialized();
     const { bearerToken } = options;
 
     if (!bearerToken) {
@@ -384,7 +385,9 @@ export class SessionService {
     }
 
     const payload = await verifyAccessToken(this.keyring, bearerToken);
+    const now = new Date();
 
+    // 1. Verify user exists and is active with matching session epoch
     const user = await this.userModel.findById(payload.sub);
     if (!user) {
       throw new UnauthorizedError('User not found');
@@ -398,15 +401,43 @@ export class SessionService {
       throw new UnauthorizedError('Session epoch mismatch');
     }
 
-    const now = new Date();
+    // 2. R1: Verify the session referenced by the Bearer token exists, is ACTIVE, and is unexpired
+    const session = await this.sessionModel.findOne({ sessionId: payload.sid });
+    if (!session) {
+      throw new UnauthorizedError('Session not found');
+    }
 
-    // Increment user sessionEpoch to invalidate all access tokens globally
-    await this.userModel.updateOne(
-      { _id: user._id },
+    if (session.userId.toString() !== payload.sub || !session.userId.equals(user._id)) {
+      throw new UnauthorizedError('Session does not belong to user');
+    }
+
+    if (session.status !== 'ACTIVE') {
+      throw new UnauthorizedError('Session is not active');
+    }
+
+    if (now >= session.idleExpiresAt || now >= session.absoluteExpiresAt) {
+      throw new UnauthorizedError('Session has expired');
+    }
+
+    if (session.epochAtIssue !== payload.epoch) {
+      throw new UnauthorizedError('Session epoch mismatch');
+    }
+
+    // 3. Conditional epoch increment preventing stale concurrent updates
+    const updateResult = await this.userModel.updateOne(
+      {
+        _id: user._id,
+        sessionEpoch: payload.epoch,
+        accountStatus: 'ACTIVE',
+      },
       { $inc: { sessionEpoch: 1 } }
     );
 
-    // Revoke all active sessions in the database for this user
+    if (updateResult.modifiedCount !== 1) {
+      throw new UnauthorizedError('Concurrent update or session epoch mismatch');
+    }
+
+    // 4. Revoke all active sessions in the database for this user
     await this.sessionModel.updateMany(
       { userId: user._id, status: 'ACTIVE' },
       {
@@ -421,7 +452,7 @@ export class SessionService {
 
   /**
    * Test fixture generator for creating a valid persistent user + active session.
-   * Useful for unit / integration tests without an unauthorized login endpoint.
+   * R6: Strictly forbidden in production environments.
    */
   public async createSessionFixture(params: {
     userId?: Types.ObjectId;
@@ -439,6 +470,9 @@ export class SessionService {
     csrfToken: string;
     setCookieHeaders: [string, string];
   }> {
+    if (this.config.NODE_ENV === 'production') {
+      throw new Error('createSessionFixture is strictly prohibited in production environment');
+    }
     await this.keyring.ensureInitialized();
     const now = params.now ?? new Date();
     const role = params.role ?? 'CANDIDATE';
@@ -500,7 +534,7 @@ export class SessionService {
 
     const cookieOptions = {
       isSecure: false,
-      isProduction: this.config.NODE_ENV === 'production',
+      isProduction: false,
     };
 
     const refreshCookie = serializeRefreshCookie(rawRefreshToken, remainingSeconds, cookieOptions);

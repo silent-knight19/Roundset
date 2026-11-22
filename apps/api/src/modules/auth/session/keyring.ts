@@ -54,7 +54,26 @@ export class SessionKeyring {
 
     this.jwtSigningKey = await jose.importPKCS8(privPem, 'EdDSA');
     const pubKey = await jose.importSPKI(pubPem, 'EdDSA');
+
+    // R4: Validate active JWT signing key and public-key pairing cryptographically
+    try {
+      const probePayload = { probe: true };
+      const probeJwt = await new jose.SignJWT(probePayload)
+        .setProtectedHeader({ alg: 'EdDSA', kid: this.activeJwtKid })
+        .sign(this.jwtSigningKey);
+      await jose.jwtVerify(probeJwt, pubKey, { algorithms: ['EdDSA'] });
+    } catch {
+      throw new Error('Active JWT private key and public key do not form a valid cryptographic pair');
+    }
+
     this.jwtVerificationKeys.set(this.activeJwtKid, pubKey);
+
+    // R4: Restore explicitly configured retired JWT verification keys across restart
+    if (this.config.JWT_RETIRED_KEYS_JSON) {
+      for (const item of this.config.JWT_RETIRED_KEYS_JSON) {
+        await this.registerRetiredJwtKey(item.kid, item.publicKeyPem);
+      }
+    }
 
     // 2. Refresh HMAC & Digest Keys Initialization
     const defaultRefreshSecret =
@@ -72,8 +91,23 @@ export class SessionKeyring {
       throw new Error('Refresh HMAC and Digest secrets must be configured');
     }
 
-    this.refreshHmacKeys.set(this.activeRefreshKid, Buffer.from(defaultRefreshSecret, 'utf-8'));
-    this.refreshDigestKeys.set(this.activeRefreshKid, Buffer.from(defaultDigestSecret, 'utf-8'));
+    const refreshHmacBuf = Buffer.from(defaultRefreshSecret, 'utf-8');
+    const refreshDigestBuf = Buffer.from(defaultDigestSecret, 'utf-8');
+
+    // R4: Enforce independent refresh integrity and digest key material
+    if (refreshHmacBuf.equals(refreshDigestBuf)) {
+      throw new Error('Refresh HMAC integrity key and digest key must be distinct');
+    }
+
+    this.refreshHmacKeys.set(this.activeRefreshKid, refreshHmacBuf);
+    this.refreshDigestKeys.set(this.activeRefreshKid, refreshDigestBuf);
+
+    // R4: Restore explicitly configured retired refresh keys across restart
+    if (this.config.REFRESH_RETIRED_KEYS_JSON) {
+      for (const item of this.config.REFRESH_RETIRED_KEYS_JSON) {
+        this.registerRetiredRefreshKeys(item.kid, item.hmacSecret, item.digestSecret);
+      }
+    }
 
     // 3. CSRF HMAC Key Initialization
     const defaultCsrfSecret =
@@ -87,6 +121,13 @@ export class SessionKeyring {
     }
 
     this.csrfHmacKeys.set(this.activeCsrfKid, Buffer.from(defaultCsrfSecret, 'utf-8'));
+
+    // R4: Restore explicitly configured retired CSRF keys across restart
+    if (this.config.CSRF_RETIRED_KEYS_JSON) {
+      for (const item of this.config.CSRF_RETIRED_KEYS_JSON) {
+        this.registerRetiredCsrfKey(item.kid, item.hmacSecret);
+      }
+    }
 
     this.initialized = true;
   }

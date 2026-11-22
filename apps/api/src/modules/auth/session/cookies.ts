@@ -42,11 +42,23 @@ export function parseCookies(header: string | undefined): Record<string, string>
   return cookies;
 }
 
-export function extractRefreshCookie(cookies: Record<string, string>): string | undefined {
+export function extractRefreshCookie(
+  cookies: Record<string, string>,
+  options: { isProduction?: boolean } = {}
+): string | undefined {
+  if (options.isProduction) {
+    return cookies[PROD_REFRESH_COOKIE_NAME];
+  }
   return cookies[PROD_REFRESH_COOKIE_NAME] ?? cookies[DEV_REFRESH_COOKIE_NAME];
 }
 
-export function extractCsrfCookie(cookies: Record<string, string>): string | undefined {
+export function extractCsrfCookie(
+  cookies: Record<string, string>,
+  options: { isProduction?: boolean } = {}
+): string | undefined {
+  if (options.isProduction) {
+    return cookies[PROD_CSRF_COOKIE_NAME];
+  }
   return cookies[PROD_CSRF_COOKIE_NAME] ?? cookies[DEV_CSRF_COOKIE_NAME];
 }
 

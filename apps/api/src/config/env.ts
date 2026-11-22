@@ -44,6 +44,43 @@ const MockDatabaseSchema = z
 export const IngressModeSchema = z.enum(['LOCAL', 'PAGES_PROXY', 'SINGLE_ORIGIN']);
 export type IngressMode = z.infer<typeof IngressModeSchema>;
 
+export const RetiredJwtKeySchema = z
+  .object({
+    kid: z.string().min(1),
+    publicKeyPem: z.string().min(1),
+  })
+  .strict();
+export type RetiredJwtKey = z.infer<typeof RetiredJwtKeySchema>;
+
+export const RetiredRefreshKeySchema = z
+  .object({
+    kid: z.string().min(1),
+    hmacSecret: z.string().min(32),
+    digestSecret: z.string().min(32),
+  })
+  .strict();
+export type RetiredRefreshKey = z.infer<typeof RetiredRefreshKeySchema>;
+
+export const RetiredCsrfKeySchema = z
+  .object({
+    kid: z.string().min(1),
+    hmacSecret: z.string().min(32),
+  })
+  .strict();
+export type RetiredCsrfKey = z.infer<typeof RetiredCsrfKeySchema>;
+
+const parseJsonArray = <T>(itemSchema: z.ZodType<T>) =>
+  z.preprocess((val) => {
+    if (typeof val === 'string' && val.trim().length > 0) {
+      try {
+        return JSON.parse(val);
+      } catch {
+        return val;
+      }
+    }
+    return val === '' ? undefined : val;
+  }, z.array(itemSchema).max(10).optional());
+
 /**
  * Zod schema for environment variables.
  */
@@ -74,13 +111,16 @@ export const EnvSchema = z
     JWT_ACTIVE_KID: z.string().min(1).default('jwt-k1'),
     JWT_PRIVATE_KEY_PEM: z.string().min(1).optional(),
     JWT_PUBLIC_KEY_PEM: z.string().min(1).optional(),
+    JWT_RETIRED_KEYS_JSON: parseJsonArray(RetiredJwtKeySchema),
 
     REFRESH_ACTIVE_KID: z.string().min(1).default('ref-k1'),
     REFRESH_HMAC_KEY: z.string().min(32).optional(),
     REFRESH_DIGEST_KEY: z.string().min(32).optional(),
+    REFRESH_RETIRED_KEYS_JSON: parseJsonArray(RetiredRefreshKeySchema),
 
     CSRF_ACTIVE_KID: z.string().min(1).default('csrf-k1'),
     CSRF_HMAC_KEY: z.string().min(32).optional(),
+    CSRF_RETIRED_KEYS_JSON: parseJsonArray(RetiredCsrfKeySchema),
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === 'production') {
@@ -96,6 +136,31 @@ export const EnvSchema = z
           code: z.ZodIssueCode.custom,
           message: 'MONGODB_URI is required in production environment',
           path: ['MONGODB_URI'],
+        });
+      }
+
+      // R5: Explicit approved policy configuration required in production (no placeholders)
+      const isPlaceholderPolicy =
+        !data.POLICY_ID ||
+        data.POLICY_ID === 'roundset-terms-privacy' ||
+        data.POLICY_ID.toLowerCase().includes('placeholder');
+      if (isPlaceholderPolicy) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Explicit approved POLICY_ID is required in production environment (placeholders forbidden)',
+          path: ['POLICY_ID'],
+        });
+      }
+
+      const isPlaceholderConsent =
+        !data.POLICY_CONSENT_VERSION ||
+        data.POLICY_CONSENT_VERSION === '2026-11-22' ||
+        data.POLICY_CONSENT_VERSION.toLowerCase().includes('placeholder');
+      if (isPlaceholderConsent) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Explicit approved POLICY_CONSENT_VERSION is required in production environment (placeholders forbidden)',
+          path: ['POLICY_CONSENT_VERSION'],
         });
       }
 

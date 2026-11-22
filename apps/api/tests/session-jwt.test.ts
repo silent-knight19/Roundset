@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as jose from 'jose';
 import crypto from 'node:crypto';
+import type { Request, Response } from 'express';
 import { loadEnv } from '../src/config/env.js';
 import {
   SessionKeyring,
@@ -9,6 +10,7 @@ import {
   ACCESS_TOKEN_TTL_SECONDS,
 } from '../src/modules/auth/session/index.js';
 import { UnauthorizedError } from '../src/core/errors.js';
+import type { UserDocument, SessionDocument } from '../src/modules/identity/models/index.js';
 
 describe('P2-AUTH-05a: Ed25519 Access JWT Verification Suite', () => {
   let keyring: SessionKeyring;
@@ -196,5 +198,185 @@ describe('P2-AUTH-05a: Ed25519 Access JWT Verification Suite', () => {
     // Verification succeeds using the registered retired key
     const payload = await verifyAccessToken(keyring, retiredKeyToken);
     expect(payload.sid).toBe('sess_retired_123');
+  });
+
+  describe('R2: Bearer Principal and Session Binding in Middleware', () => {
+    it('rejects when session.userId does not match user._id / payload.sub', async () => {
+      const { createBearerAuthMiddleware } = await import('../src/modules/auth/session/middleware.js');
+      const { SessionModel, UserModel } = await import('../src/modules/identity/models/index.js');
+      const { Types } = await import('mongoose');
+
+      const userId = new Types.ObjectId();
+      const foreignUserId = new Types.ObjectId();
+      const sessionId = 'sess_principal_mismatch';
+      const token = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const { vi } = await import('vitest');
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId: foreignUserId, // Mismatch
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(Date.now() + 100000),
+        absoluteExpiresAt: new Date(Date.now() + 100000),
+      } as unknown as SessionDocument);
+
+      const middleware = createBearerAuthMiddleware({ keyring });
+      const req = { headers: { authorization: `Bearer ${token}` } } as unknown as Request;
+      const res = {} as unknown as Response;
+      let nextError: unknown;
+
+      await middleware(req, res, ((err?: unknown) => {
+        nextError = err;
+      }) as unknown as (err?: unknown) => void);
+
+      expect(nextError).toBeInstanceOf(UnauthorizedError);
+      expect((nextError as UnauthorizedError).message).toContain('Session principal mismatch');
+    });
+
+    it('rejects when session.epochAtIssue does not match user.sessionEpoch', async () => {
+      const { createBearerAuthMiddleware } = await import('../src/modules/auth/session/middleware.js');
+      const { SessionModel, UserModel } = await import('../src/modules/identity/models/index.js');
+      const { Types } = await import('mongoose');
+
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_epoch_mismatch';
+      const token = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const { vi } = await import('vitest');
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 2, // User epoch bumped
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(Date.now() + 100000),
+        absoluteExpiresAt: new Date(Date.now() + 100000),
+      } as unknown as SessionDocument);
+
+      const middleware = createBearerAuthMiddleware({ keyring });
+      const req = { headers: { authorization: `Bearer ${token}` } } as unknown as Request;
+      const res = {} as unknown as Response;
+      let nextError: unknown;
+
+      await middleware(req, res, ((err?: unknown) => {
+        nextError = err;
+      }) as unknown as (err?: unknown) => void);
+
+      expect(nextError).toBeInstanceOf(UnauthorizedError);
+      expect((nextError as UnauthorizedError).message).toContain('Session epoch mismatch');
+    });
+
+    it('rejects when session is revoked', async () => {
+      const { createBearerAuthMiddleware } = await import('../src/modules/auth/session/middleware.js');
+      const { SessionModel, UserModel } = await import('../src/modules/identity/models/index.js');
+      const { Types } = await import('mongoose');
+
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_revoked';
+      const token = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const { vi } = await import('vitest');
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'REVOKED',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(Date.now() + 100000),
+        absoluteExpiresAt: new Date(Date.now() + 100000),
+      } as unknown as SessionDocument);
+
+      const middleware = createBearerAuthMiddleware({ keyring });
+      const req = { headers: { authorization: `Bearer ${token}` } } as unknown as Request;
+      const res = {} as unknown as Response;
+      let nextError: unknown;
+
+      await middleware(req, res, ((err?: unknown) => {
+        nextError = err;
+      }) as unknown as (err?: unknown) => void);
+
+      expect(nextError).toBeInstanceOf(UnauthorizedError);
+      expect((nextError as UnauthorizedError).message).toContain('Session not active');
+    });
+
+    it('rejects when user accountStatus is not ACTIVE', async () => {
+      const { createBearerAuthMiddleware } = await import('../src/modules/auth/session/middleware.js');
+      const { UserModel } = await import('../src/modules/identity/models/index.js');
+      const { Types } = await import('mongoose');
+
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_suspended_user';
+      const token = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const { vi } = await import('vitest');
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        accountStatus: 'SUSPENDED',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      const middleware = createBearerAuthMiddleware({ keyring });
+      const req = { headers: { authorization: `Bearer ${token}` } } as unknown as Request;
+      const res = {} as unknown as Response;
+      let nextError: unknown;
+
+      await middleware(req, res, ((err?: unknown) => {
+        nextError = err;
+      }) as unknown as (err?: unknown) => void);
+
+      expect(nextError).toBeInstanceOf(UnauthorizedError);
+      expect((nextError as UnauthorizedError).message).toContain('User account not active');
+    });
+  });
+
+  describe('R6: Production Test Fixture Isolation', () => {
+    it('strictly forbids createSessionFixture in production environment', async () => {
+      const { SessionService } = await import('../src/modules/auth/session/session.service.js');
+      const prodConfig = loadEnv({
+        NODE_ENV: 'test',
+        MOCK_DATABASE: 'false',
+      });
+      const prodService = new SessionService(
+        { ...prodConfig, NODE_ENV: 'production' } as unknown as ReturnType<typeof loadEnv>,
+        keyring
+      );
+
+      await expect(prodService.createSessionFixture({})).rejects.toThrow(
+        'createSessionFixture is strictly prohibited in production environment'
+      );
+    });
   });
 });
