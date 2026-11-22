@@ -7,10 +7,20 @@ import {
   getAuthIdentityModel,
   getSessionModel,
   getVerificationChallengeModel,
+  getSecurityAuditEventModel,
   ensureIdentityIndexes,
   verifyIdentityIndexes,
   REQUIRED_IDENTITY_INDEXES,
 } from '../src/modules/identity/models/index.js';
+import {
+  SessionKeyring,
+  SessionService,
+  createRefreshToken,
+  createCsrfToken,
+  signAccessToken,
+} from '../src/modules/auth/session/index.js';
+import { loadEnv } from '../src/config/env.js';
+import { UnauthorizedError, SessionReplayError } from '../src/core/errors.js';
 import {
   EXPECTED_TEST_DB_NAME,
   extractDatabaseName,
@@ -833,6 +843,670 @@ describe.skipIf(!runLive)(
       expect(mongooseErr.errors?.passwordIdentityIdAtIssue.message).toContain(
         'passwordIdentityIdAtIssue is required for RESET_PASSWORD verification challenge'
       );
+    });
+  });
+
+  describe('Test Group E — SessionService CAS Concurrency & Replay Invariants (P2-AUTH-05a)', () => {
+    let serviceKeyring: SessionKeyring;
+    let liveSessionService: SessionService;
+
+    beforeAll(async () => {
+      const config = loadEnv({
+        NODE_ENV: 'test',
+        MOCK_DATABASE: false,
+        WEB_ORIGIN: 'http://localhost:5173',
+        POLICY_ID: 'roundset-terms-privacy-2026',
+        POLICY_CONSENT_VERSION: '2026-11-22',
+        REGISTRATION_MODE: 'PUBLIC',
+      });
+      serviceKeyring = new SessionKeyring(config);
+      await serviceKeyring.initialize();
+      liveSessionService = new SessionService(config, serviceKeyring, conn);
+    });
+
+    it('demonstrates one successful CAS successor under concurrent SessionService.rotateSession() requests', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_cas@example.test`,
+        displayName: 'Service CAS User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_cas_sess`;
+      createdSessionIds.push(sessionId);
+
+      const { rawToken: rawRefresh, digest } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
+
+      const now = new Date();
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 1,
+        currentRefreshDigest: digest,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      // 10 concurrent calls to sessionService.rotateSession()
+      const concurrency = 10;
+      const rotatePromises = Array.from({ length: concurrency }, async (_, idx) => {
+        try {
+          const res = await liveSessionService.rotateSession({
+            rawRefreshToken: rawRefresh,
+            csrfHeader: csrfToken,
+            csrfCookie: csrfToken,
+            isSecure: false,
+            requestId: `${runId}_req_${idx}`,
+          });
+          return { success: true, res };
+        } catch (err) {
+          return { success: false, err };
+        }
+      });
+
+      const results = await Promise.all(rotatePromises);
+      const successful = results.filter((r) => r.success);
+      const failed = results.filter((r) => !r.success);
+
+      expect(successful.length).toBe(1);
+      expect(failed.length).toBe(concurrency - 1);
+
+      // Verify the single successor was committed to MongoDB with generation 2
+      const finalSession = await SessionModel.findOne({ sessionId });
+      expect(finalSession?.generation).toBe(2);
+      expect(finalSession?.status).toBe('ACTIVE');
+    });
+
+    it('demonstrates forged MAC never revokes a session in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_forged@example.test`,
+        displayName: 'Forged MAC User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_forged_sess`;
+      createdSessionIds.push(sessionId);
+
+      const { rawToken: rawRefresh, digest } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
+
+      const now = new Date();
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 1,
+        currentRefreshDigest: digest,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      // Tamper with MAC
+      const parts = rawRefresh.split('.');
+      parts[5] = 'bad_mac_' + parts[5];
+      const forgedRefresh = parts.join('.');
+
+      let caughtError: unknown;
+      try {
+        await liveSessionService.rotateSession({
+          rawRefreshToken: forgedRefresh,
+          csrfHeader: csrfToken,
+          csrfCookie: csrfToken,
+          isSecure: false,
+          requestId: `${runId}_forged_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // Session must remain completely untouched (ACTIVE, generation 1)
+      const untouchedSession = await SessionModel.findOne({ sessionId });
+      expect(untouchedSession?.status).toBe('ACTIVE');
+      expect(untouchedSession?.generation).toBe(1);
+    });
+
+    it('demonstrates authentic stale-generation replay revokes the correct session in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+      const AuditModel = getSecurityAuditEventModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_replay@example.test`,
+        displayName: 'Replay Service User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_replay_sess`;
+      createdSessionIds.push(sessionId);
+
+      // Generate a legitimate token for generation 1
+      const { rawToken: staleRefresh } = createRefreshToken(serviceKeyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(serviceKeyring, { sessionId });
+
+      const now = new Date();
+      // Persistent session is already at generation 2
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 2,
+        currentRefreshDigest: `digest_${runId}_gen2`,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      let caughtError: unknown;
+      try {
+        await liveSessionService.rotateSession({
+          rawRefreshToken: staleRefresh,
+          csrfHeader: csrfToken,
+          csrfCookie: csrfToken,
+          isSecure: false,
+          requestId: `${runId}_replay_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(SessionReplayError);
+
+      // Session family must be revoked in database
+      const revokedSession = await SessionModel.findOne({ sessionId });
+      expect(revokedSession?.status).toBe('REVOKED');
+      expect(revokedSession?.revokedReason).toBe('SESSION_REPLAY_DETECTED');
+
+      // Audit record must be persisted
+      const auditRecord = await AuditModel.findOne({ targetId: sessionId });
+      expect(auditRecord).toBeDefined();
+      expect(auditRecord?.eventType).toBe('SESSION_REPLAY_DETECTED');
+      expect(auditRecord?.outcome).toBe('FAILURE');
+    });
+
+    it('demonstrates revoked-session logout-all is rejected in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_revoked_logout@example.test`,
+        displayName: 'Revoked Logout User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_srv_revoked_logout_sess`;
+      createdSessionIds.push(sessionId);
+
+      const now = new Date();
+      // Session is already REVOKED
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'REVOKED',
+        generation: 1,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      // Bearer token issued for this now-revoked session
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId,
+        epoch: 1,
+      });
+
+      let caughtError: unknown;
+      try {
+        await liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_revoked_logout_all_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // User sessionEpoch must NOT have been incremented
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(1);
+    });
+
+    it('demonstrates atomic global logout-all commit and concurrent CAS isolation in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_atomic_logout@example.test`,
+        displayName: 'Atomic Logout User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_atomic_s1`;
+      const sessId2 = `${runId}_srv_atomic_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // Concurrent logout-all execution
+      const [res1, res2] = await Promise.allSettled([
+        liveSessionService.logoutAll({ bearerToken, requestId: `${runId}_atomic_req1` }),
+        liveSessionService.logoutAll({ bearerToken, requestId: `${runId}_atomic_req2` }),
+      ]);
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+      // Exactly one succeeds, the other gets 401 CAS conflict
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+
+      // Verify user sessionEpoch was bumped exactly once
+      const finalUser = await UserModel.findById(user._id);
+      expect(finalUser?.sessionEpoch).toBe(2);
+
+      // Verify both active sessions were revoked atomically
+      const s1 = await SessionModel.findOne({ sessionId: sessId1 });
+      const s2 = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s1?.status).toBe('REVOKED');
+      expect(s2?.status).toBe('REVOKED');
+      expect(s1?.revokedReason).toBe('LOGOUT_ALL');
+      expect(s2?.revokedReason).toBe('LOGOUT_ALL');
+    });
+
+    it('demonstrates race where single-session logout wins before logout-all session fence in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_single_wins@example.test`,
+        displayName: 'Single Wins User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_sw_s1`;
+      const sessId2 = `${runId}_srv_sw_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // 1. Single-session logout wins first: revokes sessId1
+      await liveSessionService.logout({
+        bearerToken,
+        requestId: `${runId}_single_logout_req`,
+      });
+
+      const s1AfterSingle = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1AfterSingle?.status).toBe('REVOKED');
+      expect(s1AfterSingle?.revokedReason).toBe('USER_LOGOUT');
+
+      // 2. Logout-all attempts to run using the now-revoked session
+      let caughtError: unknown;
+      try {
+        await liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_logout_all_after_single_req`,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      // Must be rejected with UnauthorizedError
+      expect(caughtError).toBeInstanceOf(UnauthorizedError);
+
+      // User sessionEpoch must NOT have been incremented
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(1);
+
+      // Session 2 must remain ACTIVE
+      const s2After = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s2After?.status).toBe('ACTIVE');
+    });
+
+    it('demonstrates race where logout-all wins before single-session logout in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_all_wins@example.test`,
+        displayName: 'All Wins User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_aw_s1`;
+      const sessId2 = `${runId}_srv_aw_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // 1. Logout-all wins first: fences sessId1, bumps epoch to 2, revokes sessId1 and sessId2
+      await liveSessionService.logoutAll({
+        bearerToken,
+        requestId: `${runId}_all_wins_req`,
+      });
+
+      const freshUser = await UserModel.findById(user._id);
+      expect(freshUser?.sessionEpoch).toBe(2);
+
+      const s1After = await SessionModel.findOne({ sessionId: sessId1 });
+      const s2After = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s1After?.status).toBe('REVOKED');
+      expect(s2After?.status).toBe('REVOKED');
+      expect(s1After?.revokedReason).toBe('LOGOUT_ALL');
+      expect(s2After?.revokedReason).toBe('LOGOUT_ALL');
+
+      // 2. Subsequent single-session logout runs: completes cleanly without crashing or changing epoch
+      await liveSessionService.logout({
+        bearerToken,
+        requestId: `${runId}_single_after_all_req`,
+      });
+
+      const userAfter = await UserModel.findById(user._id);
+      expect(userAfter?.sessionEpoch).toBe(2);
+
+      // Terminal revocation reason LOGOUT_ALL must NOT be overwritten by single-session logout
+      const s1FinalAfter = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1FinalAfter?.status).toBe('REVOKED');
+      expect(s1FinalAfter?.revokedReason).toBe('LOGOUT_ALL');
+    });
+
+    it('demonstrates genuinely overlapping concurrent race between single-session logout and logout-all in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_overlap_race@example.test`,
+        displayName: 'Overlapping Race User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_ol_s1`;
+      const sessId2 = `${runId}_srv_ol_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      // Foreign user to verify isolation: foreign session must never be modified
+      const foreignUser = await UserModel.create({
+        emailNormalized: `${runId}_srv_foreign_isolation@example.test`,
+        displayName: 'Foreign Isolation User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(foreignUser._id);
+
+      const foreignSessId = `${runId}_srv_foreign_s1`;
+      createdSessionIds.push(foreignSessId);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: foreignSessId,
+          userId: foreignUser._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // Genuinely overlapping concurrent dispatch of single-session logout and logout-all
+      const [_resSingle, resAll] = await Promise.allSettled([
+        liveSessionService.logout({
+          bearerToken,
+          requestId: `${runId}_ol_single_req`,
+        }),
+        liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_ol_all_req`,
+        }),
+      ]);
+
+      // The targeted session sessId1 MUST be revoked in all cases
+      const s1Final = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1Final?.status).toBe('REVOKED');
+      expect(['LOGOUT_ALL', 'USER_LOGOUT']).toContain(s1Final?.revokedReason);
+
+      const freshUser = await UserModel.findById(user._id);
+      // Epoch must either be 1 (single logout won) or 2 (logout-all won), never corrupted or duplicated (>2)
+      expect([1, 2]).toContain(freshUser?.sessionEpoch);
+
+      if (resAll.status === 'fulfilled') {
+        // If logout-all won, exactly one global epoch increment occurred
+        expect(freshUser?.sessionEpoch).toBe(2);
+        const s2Final = await SessionModel.findOne({ sessionId: sessId2 });
+        expect(s2Final?.status).toBe('REVOKED');
+        expect(s2Final?.revokedReason).toBe('LOGOUT_ALL');
+      } else {
+        // If single logout won before logout-all's fence, or MongoDB raised a write-conflict:
+        // Epoch must NOT be incremented
+        expect(freshUser?.sessionEpoch).toBe(1);
+        const s2Final = await SessionModel.findOne({ sessionId: sessId2 });
+        // Unrelated session s2 must remain ACTIVE
+        expect(s2Final?.status).toBe('ACTIVE');
+
+        // Documented error classification check: must NEVER silently accept arbitrary database errors
+        const err = resAll.reason;
+        const isUnauthorized = err instanceof UnauthorizedError;
+        const isWriteConflict =
+          err &&
+          typeof err === 'object' &&
+          ((err as { code?: unknown }).code === 112 ||
+            (err as { codeName?: unknown }).codeName === 'WriteConflict' ||
+            (typeof (err as { hasErrorLabel?: unknown }).hasErrorLabel === 'function' &&
+              (err as { hasErrorLabel: (l: string) => boolean }).hasErrorLabel('TransientTransactionError')) ||
+            (Array.isArray((err as { errorLabels?: unknown }).errorLabels) &&
+              (err as { errorLabels: string[] }).errorLabels.includes('TransientTransactionError')) ||
+            (typeof (err as { message?: unknown }).message === 'string' &&
+              (err as { message: string }).message.includes('WriteConflict')));
+
+        expect(isUnauthorized || isWriteConflict).toBe(true);
+      }
+
+      // Foreign user and foreign session must NEVER be modified regardless of race scheduling
+      const freshForeignUser = await UserModel.findById(foreignUser._id);
+      expect(freshForeignUser?.sessionEpoch).toBe(1);
+      const foreignSessionFinal = await SessionModel.findOne({ sessionId: foreignSessId });
+      expect(foreignSessionFinal?.status).toBe('ACTIVE');
     });
   });
 });

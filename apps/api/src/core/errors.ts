@@ -23,6 +23,18 @@ export class NotFoundError extends HttpError {
   }
 }
 
+export class UnauthorizedError extends HttpError {
+  constructor(message = 'Authentication required', code = 'AUTH_REQUIRED') {
+    super(401, code, message);
+  }
+}
+
+export class SessionReplayError extends HttpError {
+  constructor(message = 'Session replay detected') {
+    super(401, 'SESSION_REPLAY_DETECTED', message);
+  }
+}
+
 export class ForbiddenError extends HttpError {
   constructor(message = 'Forbidden') {
     super(403, 'FORBIDDEN', message);
@@ -38,6 +50,12 @@ export class InvalidInputError extends HttpError {
 export class PayloadTooLargeError extends HttpError {
   constructor(message = 'Payload too large') {
     super(413, 'PAYLOAD_TOO_LARGE', message);
+  }
+}
+
+export class ServiceUnavailableError extends HttpError {
+  constructor(message = 'Service unavailable') {
+    super(503, 'SERVICE_UNAVAILABLE', message);
   }
 }
 
