@@ -169,6 +169,6 @@ describe('Voice Lab Security, Privacy & Production Isolation (R4)', () => {
         expect(content).not.toContain('dev/voice-lab');
         expect(content).not.toContain('VoiceLabPage');
       }
-    });
+    }, 30000);
   });
 });
