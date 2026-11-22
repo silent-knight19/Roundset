@@ -4,6 +4,7 @@ import { AuthCard } from '../components/auth/AuthCard';
 import { FormField } from '../components/auth/FormField';
 import { AuthAlert, type AuthAlertVariant } from '../components/auth/AuthAlert';
 import { fetchAuthMeta, type AuthMetaData } from '../lib/api';
+import { validateNewPassword } from '../lib/validation';
 
 export function RegisterPage() {
   const [searchParams] = useSearchParams();
@@ -104,10 +105,9 @@ export function RegisterPage() {
       newErrors.email = 'Please enter a valid email address.';
     }
 
-    if (!password) {
-      newErrors.password = 'Password is required.';
-    } else if (password.length < 8) {
-      newErrors.password = 'Password must be at least 8 characters long.';
+    const passwordError = validateNewPassword(password);
+    if (passwordError) {
+      newErrors.password = passwordError;
     }
 
     // Consent validation: cannot proceed without discovered policy
@@ -229,7 +229,7 @@ export function RegisterPage() {
           }}
           error={errors.password}
           placeholder="••••••••"
-          helperText="Must be at least 8 characters long."
+          helperText="Must be 12–128 characters long."
         />
 
         {/* Consent Checkbox */}

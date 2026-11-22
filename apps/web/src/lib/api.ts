@@ -35,7 +35,7 @@ export interface AuthMetaData {
 }
 
 export type AuthMetaResult =
-  | { kind: 'success'; data: AuthMetaData; meta?: { requestId?: string } }
+  | { kind: 'success'; data: AuthMetaData; meta: { requestId: string } }
   | { kind: 'unavailable'; status: number; error: string }
   | { kind: 'offline'; error: string }
   | { kind: 'timeout'; error: string }
@@ -314,27 +314,53 @@ export async function fetchAuthMeta(
     };
   }
 
-  const json = result.json as Record<string, unknown> | null;
-  const data = json?.data as Record<string, unknown> | null;
+  const json = result.json;
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    return {
+      kind: 'invalid',
+      error: 'Malformed JSON response envelope from auth meta endpoint',
+    };
+  }
+
+  const envelope = json as Record<string, unknown>;
+  const meta = envelope.meta as Record<string, unknown> | null | undefined;
+  if (
+    !meta ||
+    typeof meta !== 'object' ||
+    typeof meta.requestId !== 'string' ||
+    meta.requestId.trim().length === 0
+  ) {
+    return {
+      kind: 'invalid',
+      error: 'Missing or empty requestId in auth meta response envelope',
+    };
+  }
+
+  const data = envelope.data as Record<string, unknown> | null | undefined;
   if (
     !data ||
+    typeof data !== 'object' ||
     typeof data.activePolicyId !== 'string' ||
+    data.activePolicyId.trim().length === 0 ||
     typeof data.activeConsentVersion !== 'string' ||
+    data.activeConsentVersion.trim().length === 0 ||
     (data.registrationMode !== 'PUBLIC' && data.registrationMode !== 'INVITE_ONLY')
   ) {
     return {
       kind: 'invalid',
-      error: 'Invalid API response schema for auth meta',
+      error: 'Invalid API response schema for auth meta data',
     };
   }
 
   return {
     kind: 'success',
     data: {
-      activePolicyId: data.activePolicyId,
-      activeConsentVersion: data.activeConsentVersion,
+      activePolicyId: data.activePolicyId.trim(),
+      activeConsentVersion: data.activeConsentVersion.trim(),
       registrationMode: data.registrationMode as 'PUBLIC' | 'INVITE_ONLY',
     },
-    meta: json?.meta as { requestId?: string } | undefined,
+    meta: {
+      requestId: meta.requestId.trim(),
+    },
   };
 }

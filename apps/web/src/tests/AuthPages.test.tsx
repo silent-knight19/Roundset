@@ -43,6 +43,7 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
             activeConsentVersion: '2026-11-v1',
             registrationMode: 'PUBLIC',
           },
+          meta: { requestId: 'req-auth-policy' },
         }),
       } as unknown as Response);
 
@@ -118,7 +119,7 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
       expect(screen.getByText('Please enter a valid email address.')).toBeTruthy();
     });
 
-    it('validates password length and email on registration', async () => {
+    it('rejects 8–11-code-point passwords and accepts valid 12-code-point passwords on registration', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         status: 200,
         json: async () => ({
@@ -127,6 +128,7 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
             activeConsentVersion: '2026-11-v1',
             registrationMode: 'PUBLIC',
           },
+          meta: { requestId: 'req-reg-1' },
         }),
       } as unknown as Response);
 
@@ -141,13 +143,49 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
       const passwordInput = screen.getByLabelText(/^Password/i);
       const submitBtn = screen.getByRole('button', { name: /Create Account/i });
 
-      // Password too short
+      // 1. Password of 8 code points: rejected
       fireEvent.change(emailInput, { target: { value: 'test@example.com' } });
-      fireEvent.change(passwordInput, { target: { value: 'short' } });
+      fireEvent.change(passwordInput, { target: { value: 'Pass1234' } });
       fireEvent.click(submitBtn);
+      expect(screen.getByText('Password must be at least 12 characters long.')).toBeTruthy();
 
-      expect(screen.getByText('Password must be at least 8 characters long.')).toBeTruthy();
+      // 2. Password of 11 code points: rejected
+      fireEvent.change(passwordInput, { target: { value: 'Pass1234567' } });
+      fireEvent.click(submitBtn);
+      expect(screen.getByText('Password must be at least 12 characters long.')).toBeTruthy();
+
+      // 3. Password of 12 code points: passes password validation
+      fireEvent.change(passwordInput, { target: { value: 'ValidPass123' } });
+      fireEvent.click(submitBtn);
+      expect(screen.queryByText('Password must be at least 12 characters long.')).toBeNull();
+      // Consent still required
       expect(screen.getByText('You must agree to the policy terms to create an account.')).toBeTruthy();
+    });
+
+    it('rejects 8–11-code-point passwords and accepts valid 12-code-point passwords on reset', () => {
+      const router = createMemoryRouter(routes, { initialEntries: ['/reset-password'] });
+      render(<App router={router} />);
+
+      const emailInput = screen.getByLabelText(/Account email address/i);
+      const codeInput = screen.getByLabelText(/6-Digit Recovery Code/i);
+      const newPasswordInput = screen.getByLabelText(/^New password/i);
+      const confirmPasswordInput = screen.getByLabelText(/Confirm new password/i);
+      const submitBtn = screen.getByRole('button', { name: /Reset Password/i });
+
+      fireEvent.change(emailInput, { target: { value: 'candidate@example.com' } });
+      fireEvent.change(codeInput, { target: { value: '123456' } });
+
+      // 11 code points: rejected
+      fireEvent.change(newPasswordInput, { target: { value: 'ShortPass11' } });
+      fireEvent.change(confirmPasswordInput, { target: { value: 'ShortPass11' } });
+      fireEvent.click(submitBtn);
+      expect(screen.getByText('Password must be at least 12 characters long.')).toBeTruthy();
+
+      // 12 code points: accepted
+      fireEvent.change(newPasswordInput, { target: { value: 'ValidPass123' } });
+      fireEvent.change(confirmPasswordInput, { target: { value: 'ValidPass123' } });
+      fireEvent.click(submitBtn);
+      expect(screen.queryByText('Password must be at least 12 characters long.')).toBeNull();
     });
 
     it('rejects password confirmation mismatch on reset password', () => {
@@ -221,6 +259,7 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
             activeConsentVersion: '2026-11-invite',
             registrationMode: 'INVITE_ONLY',
           },
+          meta: { requestId: 'req-auth-invite' },
         }),
       } as unknown as Response);
 
@@ -235,7 +274,43 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
   });
 
   describe('Registration Flow Context and Safe Handling', () => {
-    it('displays target email when passed in navigation state', () => {
+    it('rejects email-only context and requires a valid nonempty registrationId', () => {
+      // 1. Navigation state with email only (missing registrationId)
+      const routerStateOnly = createMemoryRouter(routes, {
+        initialEntries: [
+          {
+            pathname: '/verify-email',
+            state: { email: 'applicant@example.com' },
+          },
+        ],
+      });
+      const { unmount } = render(<App router={routerStateOnly} />);
+
+      expect(screen.getByText(/Missing Registration Context/i)).toBeTruthy();
+      expect(
+        screen.getByText(/email verification requires an active registration flow with a valid registration id/i),
+      ).toBeTruthy();
+
+      // Submitting without registrationId shows warning alert
+      fireEvent.change(screen.getByLabelText(/6-Digit Verification Code/i), {
+        target: { value: '123456' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /Verify Email/i }));
+      expect(
+        screen.getByText(/Cannot verify email without an active registration session and valid registration ID/i),
+      ).toBeTruthy();
+
+      unmount();
+
+      // 2. Query params with email only (?email=...)
+      const routerQueryOnly = createMemoryRouter(routes, {
+        initialEntries: ['/verify-email?email=candidate@example.com'],
+      });
+      render(<App router={routerQueryOnly} />);
+      expect(screen.getByText(/Missing Registration Context/i)).toBeTruthy();
+    });
+
+    it('accepts valid registration context with nonempty registrationId', () => {
       const router = createMemoryRouter(routes, {
         initialEntries: [
           {
@@ -320,6 +395,7 @@ describe('Auth Pages and Flows (P2-FE-01)', () => {
             activeConsentVersion: '2026-11-v1',
             registrationMode: 'PUBLIC',
           },
+          meta: { requestId: 'req-auth-policy' },
         }),
       } as unknown as Response);
 

@@ -15,10 +15,11 @@ export function VerifyEmailPage() {
 
   // Extract context from state or search params
   const stateContext = (location.state as RegistrationContextState) || {};
-  const emailContext = stateContext.email || searchParams.get('email') || '';
-  const registrationId = stateContext.registrationId || searchParams.get('reg') || '';
+  const emailContext = (stateContext.email || searchParams.get('email') || '').trim();
+  const registrationId = (stateContext.registrationId || searchParams.get('reg') || '').trim();
 
-  const hasRegistrationContext = Boolean(emailContext || registrationId);
+  // A nonempty registrationId is strictly required for valid registration context; email alone is insufficient.
+  const hasRegistrationContext = Boolean(registrationId);
 
   const [otp, setOtp] = useState('');
   const [otpError, setOtpError] = useState<string | undefined>();
@@ -87,6 +88,16 @@ export function VerifyEmailPage() {
       return;
     }
 
+    if (!hasRegistrationContext) {
+      setSubmitStatus({
+        variant: 'warning',
+        title: 'Missing Registration Context',
+        message:
+          'Cannot verify email without an active registration session and valid registration ID. Please create an account first.',
+      });
+      return;
+    }
+
     // Honest Phase 2 UI Shell notice — no fake verification or auto-login
     setSubmitStatus({
       variant: 'unavailable',
@@ -109,7 +120,7 @@ export function VerifyEmailPage() {
     <AuthCard
       title="Verify your email"
       subtitle={
-        emailContext
+        hasRegistrationContext && emailContext
           ? `Enter the 6-digit verification code sent to ${emailContext}`
           : 'Enter your 6-digit verification code to complete account activation'
       }
@@ -140,7 +151,7 @@ export function VerifyEmailPage() {
         <AuthAlert
           variant="warning"
           title="Missing Registration Context"
-          message="No active registration session was found. Email verification requires a pending registration flow. If you have not registered yet, please create an account first."
+          message="No active registration session was found. Email verification requires an active registration flow with a valid registration ID. If you have not registered yet, please create an account first."
           action={{
             label: 'Go to Registration',
             href: '/register',

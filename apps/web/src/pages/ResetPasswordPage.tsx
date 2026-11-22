@@ -4,6 +4,7 @@ import { AuthCard } from '../components/auth/AuthCard';
 import { FormField } from '../components/auth/FormField';
 import { OtpInputField } from '../components/auth/OtpInputField';
 import { AuthAlert, type AuthAlertVariant } from '../components/auth/AuthAlert';
+import { validateNewPassword } from '../lib/validation';
 
 export function ResetPasswordPage() {
   const [searchParams] = useSearchParams();
@@ -85,10 +86,9 @@ export function ResetPasswordPage() {
       newErrors.code = 'Please enter a valid 6-digit recovery code.';
     }
 
-    if (!newPassword) {
-      newErrors.newPassword = 'New password is required.';
-    } else if (newPassword.length < 8) {
-      newErrors.newPassword = 'New password must be at least 8 characters long.';
+    const passwordError = validateNewPassword(newPassword);
+    if (passwordError) {
+      newErrors.newPassword = passwordError;
     }
 
     if (!confirmPassword) {
@@ -198,7 +198,7 @@ export function ResetPasswordPage() {
           }}
           error={errors.newPassword}
           placeholder="••••••••"
-          helperText="Must be at least 8 characters long."
+          helperText="Must be 12–128 characters long."
         />
 
         <FormField
