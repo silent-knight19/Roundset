@@ -17,17 +17,18 @@ import { ResetPasswordPage } from '../pages/ResetPasswordPage';
  * elimination removes this ternary branch and avoids bundling VoiceLabPage or
  * ONNX/Kokoro runtime assets.
  */
-const devRoutes: RouteObject[] = import.meta.env.DEV
-  ? [
-      {
-        path: 'dev/voice-lab',
-        lazy: async () => {
-          const { VoiceLabPage } = await import('../pages/dev/VoiceLabPage');
-          return { Component: VoiceLabPage };
+const devRoutes: RouteObject[] =
+  import.meta.env.DEV && import.meta.env.MODE === 'development'
+    ? [
+        {
+          path: 'dev/voice-lab',
+          lazy: async () => {
+            const { VoiceLabPage } = await import('../pages/dev/VoiceLabPage');
+            return { Component: VoiceLabPage };
+          },
         },
-      },
-    ]
-  : [];
+      ]
+    : [];
 
 export const routes: RouteObject[] = [
   {

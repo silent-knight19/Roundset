@@ -147,6 +147,7 @@ describe('Voice Lab Security, Privacy & Production Isolation (R4)', () => {
         execSync('npm run build', {
           cwd: path.resolve(__dirname, '../../..'),
           stdio: 'pipe',
+          env: { ...process.env, NODE_ENV: 'production' },
         });
       }
 
