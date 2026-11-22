@@ -102,7 +102,7 @@ export function HealthStatus() {
 
     if (liveness?.kind === 'online') {
       if (readiness?.kind === 'ready') {
-        return 'Backend online and backend ready: all services operational.';
+        return 'Backend online and reporting ready.';
       }
       if (readiness?.kind === 'not_ready') {
         return 'Backend online but backend not ready: dependencies are initializing (HTTP 503).';
@@ -273,7 +273,7 @@ export function HealthStatus() {
                 </div>
                 <div className="text-xs text-slate-600 pl-4">
                   <p>Request ID: <span className="font-mono">{readiness.meta.requestId}</span></p>
-                  <p className="text-emerald-700 mt-1">Database &amp; dependencies operational.</p>
+                  <p className="text-emerald-700 mt-1">Backend readiness check passed.</p>
                 </div>
               </div>
             )}

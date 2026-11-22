@@ -124,9 +124,10 @@ Live processes were spawned and verified simultaneously:
   - Live: HTTP 200 (status: `"ok"`, version: `"0.1.0"`)
   - Ready: HTTP 200 (ready: `true`, requestId: `3887cb5e-7409-46c1-a9f0-0a481aac3112`)
 - **Frontend Browser Display:**
-  - Status Summary: `"Backend online and backend ready: all services operational."`
+  - Status Summary: `"Backend online and reporting ready."`
   - Liveness card: Green dot `"Backend online"`.
-  - Readiness card: Green dot `"Backend ready"`, `"Database & dependencies operational."`
+  - Readiness card: Green dot `"Backend ready"`, `"Backend readiness check passed."`
+- **Note on Connectivity:** Development mock readiness (`MOCK_DATABASE=true`) serves exclusively to verify frontend contract handling under development simulation; it does NOT demonstrate real MongoDB connectivity.
 - **Screenshot Evidence:** `screenshot-2.png`
 
 ### Scenario C — Backend Stopped (Controlled Unavailable State)
@@ -155,7 +156,7 @@ Live processes were spawned and verified simultaneously:
 ## 5. Security & Architectural Invariants Verified
 
 1. **Secret Scanning:** Zero API keys, database credentials, or auth tokens committed or logged.
-2. **Connection URI Sanitization:** Mongo URI credentials redact passwords to `//***:***@` in all startup logs and error payloads.
+2. **Database URI Logging Avoidance:** The current implementation intentionally avoids logging MongoDB connection URIs in any form during startup, health checks, or error responses, preventing any credential leakage.
 3. **CORS Enforcement:** Server rejects cross-origin requests from unapproved origins (e.g. `http://evil.com`), returning no CORS headers.
 4. **Header Correlation:** `X-Request-ID` HTTP header strictly matches `meta.requestId` in response bodies.
 5. **No Speculative Architecture:** No artificial user accounts, mock interview transcripts, fake credit card checkouts, or premature proctoring state machines were created.
@@ -174,6 +175,6 @@ Captured during browser integration testing:
 
 ## 7. Known Limitations & Next Phase Handoff
 
-1. **MongoDB Atlas Production Provisioning:** Deferred to deployment phases. Tested locally using disconnected mode (HTTP 503) and development mock mode (`MOCK_DATABASE=true`).
+1. **MongoDB Atlas Production Provisioning:** Deferred to deployment phases. Tested locally using disconnected mode (HTTP 503) and development mock mode (`MOCK_DATABASE=true`). Development mock readiness does not demonstrate real MongoDB connectivity.
 2. **Canonical Implementation Tracker:** Unchanged in this branch per instruction; to be updated by the Principal Architect upon final PR merge authorization.
 3. **Phase 2 Readiness:** Clean module seams established in `apps/api` and `apps/web` for Identity & Authentication kickoff.

@@ -64,6 +64,8 @@ describe('HealthStatus Component', () => {
     await waitFor(() => {
       expect(screen.getByText('Backend online')).toBeTruthy();
       expect(screen.getByText('Backend ready')).toBeTruthy();
+      expect(screen.getByText('Backend readiness check passed.')).toBeTruthy();
+      expect(screen.getByText(/Backend online and reporting ready\./i)).toBeTruthy();
       expect(screen.getByText('0.1.0')).toBeTruthy();
     });
   });
