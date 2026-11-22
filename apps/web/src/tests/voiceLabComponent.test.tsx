@@ -18,12 +18,11 @@ import { VoiceLabPage } from '../pages/dev/VoiceLabPage';
 import { ConversationController } from '../lib/voice/conversationController';
 import * as recognitionModule from '../lib/voice/recognition';
 
-describe('VoiceLabPage Component (Laboratory UI & Unmount Safety)', () => {
+describe('VoiceLabPage Component (Laboratory UI & Unmount Safety - R3, R5)', () => {
   let mockControllerInstance: {
     startSession: ReturnType<typeof vi.fn>;
     stopSession: ReturnType<typeof vi.fn>;
     manualInterrupt: ReturnType<typeof vi.fn>;
-    playPreparedAudio: ReturnType<typeof vi.fn>;
     reset: ReturnType<typeof vi.fn>;
     setVoice: ReturnType<typeof vi.fn>;
     updateDraft: ReturnType<typeof vi.fn>;
@@ -36,24 +35,25 @@ describe('VoiceLabPage Component (Laboratory UI & Unmount Safety)', () => {
     vi.spyOn(recognitionModule, 'isSpeechRecognitionSupported').mockReturnValue(true);
 
     mockControllerInstance = {
-      startSession: vi.fn(),
+      startSession: vi.fn().mockResolvedValue(undefined),
       stopSession: vi.fn(),
       manualInterrupt: vi.fn(),
-      playPreparedAudio: vi.fn(),
       reset: vi.fn(),
       setVoice: vi.fn(),
       updateDraft: vi.fn(),
-      submitAnswer: vi.fn(),
+      submitAnswer: vi.fn().mockResolvedValue(undefined),
       cleanup: vi.fn(),
       getState: vi.fn().mockReturnValue({
         stage: 'idle',
         status: 'Ready to start practice.',
         voice: 'af_heart',
+        inputMode: 'voice',
         draft: '',
         messages: [],
         interruptedCount: 0,
         latencyMs: null,
         vadSpeech: false,
+        microphoneActive: false,
         modelDevice: 'wasm',
         eventLog: [],
       }),
@@ -67,9 +67,6 @@ describe('VoiceLabPage Component (Laboratory UI & Unmount Safety)', () => {
     );
     vi.spyOn(ConversationController.prototype, 'manualInterrupt').mockImplementation(
       mockControllerInstance.manualInterrupt as () => void,
-    );
-    vi.spyOn(ConversationController.prototype, 'playPreparedAudio').mockImplementation(
-      mockControllerInstance.playPreparedAudio as () => void,
     );
     vi.spyOn(ConversationController.prototype, 'reset').mockImplementation(
       mockControllerInstance.reset as () => void,
@@ -111,6 +108,11 @@ describe('VoiceLabPage Component (Laboratory UI & Unmount Safety)', () => {
     expect(screen.getByText(/Pipeline Diagnostics/i)).toBeDefined();
   });
 
+  it('verifies inert "Play Prepared" button is removed from UI (R5)', () => {
+    render(<VoiceLabPage />);
+    expect(screen.queryByRole('button', { name: /Play Prepared/i })).toBeNull();
+  });
+
   it('triggers startSession when start button is clicked', () => {
     render(<VoiceLabPage />);
     const startButton = screen.getByRole('button', { name: /▶ Start Interview/i });
@@ -146,15 +148,20 @@ describe('VoiceLabPage Component (Laboratory UI & Unmount Safety)', () => {
     expect(mockControllerInstance.cleanup).toHaveBeenCalled();
   });
 
-  it('displays warning when browser speech recognition is unsupported', () => {
+  it('enables typed-only fallback when browser speech recognition is unsupported (R3)', () => {
     vi.spyOn(recognitionModule, 'isSpeechRecognitionSupported').mockReturnValue(false);
     render(<VoiceLabPage />);
 
     expect(
       screen.getByText(/Browser speech recognition is not supported in this browser/i),
     ).toBeDefined();
+    expect(screen.getByText(/Typed-Only Fallback/i)).toBeDefined();
 
+    // Start button remains enabled so candidate can still practice with Kokoro TTS and typed input
     const startButton = screen.getByRole('button', { name: /▶ Start Interview/i });
-    expect(startButton.hasAttribute('disabled')).toBe(true);
+    expect(startButton.hasAttribute('disabled')).toBe(false);
+
+    fireEvent.click(startButton);
+    expect(mockControllerInstance.startSession).toHaveBeenCalledTimes(1);
   });
 });

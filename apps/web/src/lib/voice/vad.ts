@@ -20,6 +20,7 @@ export interface VADAdapterOptions {
 
 export class VADAdapter {
   private detector: VADInstance | null = null;
+  private currentGeneration = 0;
   private isInitializing = false;
   private isRunning = false;
   private callbacks: VADCallbacks = {};
@@ -35,8 +36,19 @@ export class VADAdapter {
   }
 
   public async initialize(options?: VADAdapterOptions): Promise<boolean> {
-    if (this.isInitializing) return false;
-    this.cleanup();
+    const sessionGeneration = ++this.currentGeneration;
+
+    // Dispose any previous instance permanently
+    if (this.detector) {
+      const prev = this.detector;
+      this.detector = null;
+      this.isRunning = false;
+      try {
+        await prev.destroy();
+      } catch {
+        // Safe disposal
+      }
+    }
 
     this.isInitializing = true;
     try {
@@ -54,70 +66,101 @@ export class VADAdapter {
         redemptionMs: options?.redemptionMs ?? 950,
         preSpeechPadMs: options?.preSpeechPadMs ?? 450,
         onSpeechStart: () => {
-          if (this.isRunning) {
+          if (this.isRunning && this.currentGeneration === sessionGeneration) {
             this.callbacks.onSpeechStart?.();
           }
         },
         onSpeechEnd: () => {
-          if (this.isRunning) {
+          if (this.isRunning && this.currentGeneration === sessionGeneration) {
             this.callbacks.onSpeechEnd?.();
           }
         },
         onVADMisfire: () => {
-          this.callbacks.onVADMisfire?.();
+          if (this.currentGeneration === sessionGeneration) {
+            this.callbacks.onVADMisfire?.();
+          }
         },
       });
+
+      // Check if session became stale while waiting for MicVAD.new
+      if (this.currentGeneration !== sessionGeneration) {
+        try {
+          await detector.destroy();
+        } catch {
+          // Safe disposal
+        }
+        return false;
+      }
 
       this.detector = detector;
       return true;
     } catch (error) {
-      this.cleanup();
-      throw error;
+      if (this.currentGeneration === sessionGeneration) {
+        this.detector = null;
+        this.isRunning = false;
+        throw error;
+      }
+      return false;
     } finally {
-      this.isInitializing = false;
+      if (this.currentGeneration === sessionGeneration) {
+        this.isInitializing = false;
+      }
     }
   }
 
-  public start(): void {
+  public async start(): Promise<void> {
     if (!this.detector) return;
     try {
-      this.detector.start();
+      await this.detector.start();
       this.isRunning = true;
     } catch {
       this.isRunning = false;
     }
   }
 
-  public pause(): void {
+  public async pause(): Promise<void> {
     if (!this.detector) return;
     try {
-      this.detector.pause();
+      await this.detector.pause();
     } catch {
-      // noop
+      // safe pause
     } finally {
       this.isRunning = false;
     }
   }
 
-  public cleanup(): void {
-    this.pause();
-    if (this.detector) {
-      try {
-        this.detector.pause();
-      } catch {
-        // noop
-      }
-      this.detector = null;
-    }
+  public async destroy(): Promise<void> {
+    // Invalidate any in-flight initialization
+    ++this.currentGeneration;
     this.isRunning = false;
     this.isInitializing = false;
+
+    if (this.detector) {
+      const instance = this.detector;
+      this.detector = null;
+      try {
+        await instance.destroy();
+      } catch {
+        // Safe disposal
+      }
+    }
   }
 
-  public getStatus(): { isRunning: boolean; isInitializing: boolean; hasInstance: boolean } {
+  public async cleanup(): Promise<void> {
+    await this.destroy();
+  }
+
+  public getStatus(): {
+    isRunning: boolean;
+    isInitializing: boolean;
+    hasInstance: boolean;
+    generation: number;
+  } {
     return {
       isRunning: this.isRunning,
       isInitializing: this.isInitializing,
       hasInstance: Boolean(this.detector),
+      generation: this.currentGeneration,
     };
   }
 }

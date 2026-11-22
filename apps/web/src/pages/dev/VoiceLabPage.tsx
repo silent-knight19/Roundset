@@ -10,13 +10,16 @@ export function VoiceLabPage() {
   const controllerRef = useRef<ConversationController | null>(null);
   const [controllerState, setControllerState] = useState<VoiceControllerState>({
     stage: 'idle',
-    status: 'Chrome or Edge recommended. Wear headphones for reliable interruptions.',
+    status:
+      'Desktop Chrome or Edge recommended. External network required on first load for models. Wear headphones for interruptions.',
     voice: 'af_heart',
+    inputMode: 'voice',
     draft: '',
     messages: [],
     interruptedCount: 0,
     latencyMs: null,
     vadSpeech: false,
+    microphoneActive: false,
     modelDevice: 'not loaded',
     eventLog: [],
   });
@@ -42,11 +45,13 @@ export function VoiceLabPage() {
     stage,
     status,
     voice,
+    inputMode,
     draft,
     messages,
     interruptedCount,
     latencyMs,
     vadSpeech,
+    microphoneActive,
     modelDevice,
     eventLog,
   } = controllerState;
@@ -63,10 +68,6 @@ export function VoiceLabPage() {
 
   const handleManualInterrupt = () => {
     controllerRef.current?.manualInterrupt();
-  };
-
-  const handlePlayPrepared = () => {
-    controllerRef.current?.playPreparedAudio();
   };
 
   const handleReset = () => {
@@ -90,7 +91,7 @@ export function VoiceLabPage() {
   return (
     <div className="max-w-7xl mx-auto space-y-6 pb-12">
       {/* Dev-only notice banner */}
-      <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-center justify-between">
+      <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
         <div className="flex items-center gap-3">
           <span className="px-2 py-0.5 rounded text-xs font-semibold bg-amber-500 text-slate-900 tracking-wide uppercase">
             Development Only
@@ -99,8 +100,8 @@ export function VoiceLabPage() {
             Isolated Voice Conversation Laboratory (P5-VOI-01a) — Excluded from production builds
           </span>
         </div>
-        <span className="text-xs text-amber-700/80 hidden sm:inline">
-          Local Kokoro TTS · Browser SpeechRecognition · Silero VAD
+        <span className="text-xs text-amber-700/80">
+          Scripted demonstration, not real AI · Initial model downloads require internet
         </span>
       </div>
 
@@ -115,7 +116,7 @@ export function VoiceLabPage() {
               Natural Voice Conversation Lab
             </h1>
             <p className="mt-1 text-sm text-slate-600">
-              Test local TTS synthesis, speech activity detection, natural turn-taking, and user-initiated barge-in interruptions.
+              Test local Kokoro TTS synthesis, Silero speech activity detection, natural turn-taking, and user-initiated barge-in interruptions.
             </p>
           </div>
         </div>
@@ -137,7 +138,7 @@ export function VoiceLabPage() {
               disabled
               className="w-full text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-700 cursor-not-allowed"
             >
-              <option value="demo">Scripted Demo (No API key / offline)</option>
+              <option value="demo">Scripted Demo (Local rule-based · No API key)</option>
             </select>
           </div>
 
@@ -163,7 +164,7 @@ export function VoiceLabPage() {
             <button
               type="button"
               onClick={handleStart}
-              disabled={isRunning || !speechSupported}
+              disabled={isRunning}
               className="flex-1 bg-blue-600 text-white font-medium text-sm py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:ring-offset-2 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
             >
               ▶ Start Interview
@@ -186,14 +187,6 @@ export function VoiceLabPage() {
             </button>
             <button
               type="button"
-              onClick={handlePlayPrepared}
-              disabled={stage !== 'generating'}
-              className="bg-slate-100 text-slate-700 font-medium text-sm py-2 px-3 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-300 disabled:bg-slate-50 disabled:text-slate-300 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
-            >
-              Play Prepared
-            </button>
-            <button
-              type="button"
               onClick={handleReset}
               className="bg-slate-100 text-slate-700 font-medium text-sm py-2 px-3 rounded-lg hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-300 transition-colors"
             >
@@ -203,8 +196,13 @@ export function VoiceLabPage() {
         </div>
 
         {!speechSupported && (
-          <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs font-medium text-rose-700">
-            Browser speech recognition is not supported in this browser. Please use Chrome, Edge, or another Chromium browser.
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs font-medium text-amber-800 flex items-center justify-between">
+            <span>
+              Browser speech recognition is not supported in this browser. You can still practice with Kokoro TTS audio and typed answers.
+            </span>
+            <span className="font-semibold text-amber-900 uppercase text-[10px] bg-amber-100 px-2 py-0.5 rounded">
+              Typed-Only Fallback
+            </span>
           </div>
         )}
       </section>
@@ -217,7 +215,12 @@ export function VoiceLabPage() {
           className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col space-y-6"
         >
           <div className="flex items-center justify-between border-b border-slate-100 pb-4">
-            <h2 className="text-lg font-bold text-slate-900">Live Conversation</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-bold text-slate-900">Live Conversation</h2>
+              <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">
+                {inputMode === 'voice' ? 'Voice Mode' : 'Typed-Only Mode'}
+              </span>
+            </div>
             <span
               className={`px-3 py-1 rounded-full text-xs font-semibold ${
                 stage === 'speaking'
@@ -253,14 +256,22 @@ export function VoiceLabPage() {
                   : 'bg-slate-100 text-slate-400'
               }`}
             >
-              {vadSpeech ? '◉' : stage === 'speaking' ? '≋' : '◎'}
+              {vadSpeech ? '◉' : stage === 'speaking' ? '≋' : inputMode === 'voice' ? '◎' : '⌨'}
             </div>
             <div>
               <p className="text-sm font-semibold text-slate-900">
-                {vadSpeech ? 'Candidate Voice Detected' : VOICE_STAGE_LABELS[stage]}
+                {vadSpeech
+                  ? 'Candidate Voice Detected'
+                  : inputMode === 'typed_only'
+                  ? stage === 'listening'
+                    ? 'Awaiting Typed Answer'
+                    : VOICE_STAGE_LABELS[stage]
+                  : VOICE_STAGE_LABELS[stage]}
               </p>
               <p className="text-xs text-slate-500">
-                {stage === 'listening'
+                {inputMode === 'typed_only'
+                  ? 'Type your response below and click Send Answer'
+                  : stage === 'listening'
                   ? 'Automatic turn-taking active · Speak your answer'
                   : stage === 'speaking'
                   ? 'Speak into microphone to interrupt AI playback'
@@ -310,7 +321,9 @@ export function VoiceLabPage() {
                 Live Speech Transcript / Manual Typed Fallback
               </label>
               <span className="text-[11px] text-slate-400">
-                VAD auto-submits upon speech pause
+                {inputMode === 'voice'
+                  ? 'VAD auto-submits upon speech pause'
+                  : 'Type answer and click Send Answer'}
               </span>
             </div>
             <textarea
@@ -319,12 +332,16 @@ export function VoiceLabPage() {
               value={draft}
               onChange={handleDraftChange}
               disabled={!isRunning || stage === 'speaking' || stage === 'generating'}
-              placeholder="Spoken words will appear here in real time. You can also type your response manually."
+              placeholder={
+                inputMode === 'voice'
+                  ? 'Spoken words will appear here in real time. You can also type your response manually.'
+                  : 'Type your answer here and click Send Answer below.'
+              }
               className="w-full text-sm p-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-600 disabled:bg-slate-50 disabled:text-slate-400 resize-none"
             />
             <div className="flex items-center justify-between pt-1">
               <span className="text-xs text-slate-500">
-                Candidate can correct recognized speech or type an answer.
+                Candidate can correct recognized speech or type an answer directly.
               </span>
               <button
                 type="button"
@@ -385,14 +402,22 @@ export function VoiceLabPage() {
               </div>
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                 <span className="block text-[11px] font-semibold text-slate-500 uppercase">
-                  Voice Activity
+                  Microphone / VAD
                 </span>
                 <strong
                   className={`text-sm font-bold ${
-                    vadSpeech ? 'text-emerald-600' : 'text-slate-600'
+                    vadSpeech
+                      ? 'text-emerald-600'
+                      : microphoneActive
+                      ? 'text-blue-600'
+                      : 'text-slate-400'
                   }`}
                 >
-                  {vadSpeech ? 'Speaking' : 'Silent'}
+                  {vadSpeech
+                    ? 'Voice Detected'
+                    : microphoneActive
+                    ? 'Listening'
+                    : 'Inactive'}
                 </strong>
               </div>
             </div>
@@ -413,7 +438,7 @@ export function VoiceLabPage() {
               <li>Listen to the AI interviewer&apos;s initial Java question.</li>
               <li>Speak into your microphone mid-playback to trigger a barge-in interruption.</li>
               <li>Complete your response and pause for ~1 second to verify auto-submission.</li>
-              <li>Inspect transcription accuracy and try manual typing fallback.</li>
+              <li>Inspect transcription accuracy or practice using typed answers.</li>
               <li>Verify that clicking &ldquo;Stop&rdquo; immediately releases all audio resources.</li>
             </ul>
           </section>
@@ -445,10 +470,16 @@ export function VoiceLabPage() {
       <footer className="p-4 bg-slate-100/60 border border-slate-200 rounded-xl text-xs text-slate-500 space-y-1">
         <p className="font-semibold text-slate-700">Security &amp; Privacy Notice:</p>
         <p>
-          This development laboratory runs audio processing locally in your browser. Silero VAD and Kokoro TTS execute entirely on-device (via WebGPU/WASM). Browser speech recognition (`SpeechRecognition`) is provided by your browser vendor and may transmit audio to vendor servers.
+          <strong>Scripted demonstration, not real AI.</strong> Follow-up questions are rule-based examples. No LLM or Groq connection is used.
         </p>
         <p>
-          Transcripts and audio are ephemeral in JavaScript memory. No recordings, transcripts, or audio data are sent to Roundset&apos;s backend, saved to disk, MongoDB, localStorage, or IndexedDB. Camera and fullscreen permissions are never requested.
+          Kokoro TTS and Silero VAD execute locally in your browser (via WebGPU/WASM). On initial load, model weights and WASM runtimes are downloaded externally from Hugging Face and jsDelivr.
+        </p>
+        <p>
+          Browser speech recognition (`SpeechRecognition`) is provided by your browser vendor and may transmit audio to vendor servers.
+        </p>
+        <p>
+          Transcripts and audio are strictly ephemeral in JavaScript memory. No recordings, transcripts, or audio data are sent to Roundset&apos;s backend, saved to disk, MongoDB, localStorage, or IndexedDB. Camera and fullscreen permissions are never requested.
         </p>
       </footer>
     </div>

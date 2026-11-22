@@ -10,20 +10,22 @@ vi.mock('@ricky0123/vad-web', () => {
   };
 });
 
-describe('VADAdapter (Silero VAD Web Adapter)', () => {
+describe('VADAdapter (Silero VAD Web Adapter - R1 Lifecycle & Race Invalidation)', () => {
   let mockVADInstance: {
     start: ReturnType<typeof vi.fn>;
     pause: ReturnType<typeof vi.fn>;
-    destroy?: ReturnType<typeof vi.fn>;
+    destroy: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
     mockVADInstance = {
-      start: vi.fn(),
-      pause: vi.fn(),
-      destroy: vi.fn(),
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
     };
-    vi.mocked(MicVAD.new).mockResolvedValue(mockVADInstance as unknown as Awaited<ReturnType<typeof MicVAD.new>>);
+    vi.mocked(MicVAD.new).mockResolvedValue(
+      mockVADInstance as unknown as Awaited<ReturnType<typeof MicVAD.new>>,
+    );
   });
 
   afterEach(() => {
@@ -47,13 +49,16 @@ describe('VADAdapter (Silero VAD Web Adapter)', () => {
       }),
     );
 
-    adapter.start();
+    await adapter.start();
     expect(mockVADInstance.start).toHaveBeenCalled();
     expect(adapter.getStatus().isRunning).toBe(true);
+    expect(adapter.getStatus().hasInstance).toBe(true);
   });
 
   it('handles VAD initialization failure gracefully (Requirement 3)', async () => {
-    vi.mocked(MicVAD.new).mockRejectedValueOnce(new Error('Microphone permission denied (NotAllowedError)'));
+    vi.mocked(MicVAD.new).mockRejectedValueOnce(
+      new Error('Microphone permission denied (NotAllowedError)'),
+    );
 
     const adapter = new VADAdapter();
     await expect(adapter.initialize()).rejects.toThrow('NotAllowedError');
@@ -63,14 +68,43 @@ describe('VADAdapter (Silero VAD Web Adapter)', () => {
     expect(adapter.getStatus().isInitializing).toBe(false);
   });
 
-  it('cleans up existing VAD instance before re-initializing (Requirement 12)', async () => {
+  it('cleans up and destroys existing VAD instance before re-initializing (R1)', async () => {
+    const firstInstance = {
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+    const secondInstance = {
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+
+    vi.mocked(MicVAD.new)
+      .mockResolvedValueOnce(firstInstance as unknown as Awaited<ReturnType<typeof MicVAD.new>>)
+      .mockResolvedValueOnce(secondInstance as unknown as Awaited<ReturnType<typeof MicVAD.new>>);
+
     const adapter = new VADAdapter();
     await adapter.initialize();
-    adapter.start();
+    await adapter.start();
 
     // Call initialize second time
     await adapter.initialize();
-    expect(mockVADInstance.pause).toHaveBeenCalled();
+    expect(firstInstance.destroy).toHaveBeenCalled();
+    expect(adapter.getStatus().hasInstance).toBe(true);
+  });
+
+  it('supports pause for temporary suspension without permanently destroying detector (R1)', async () => {
+    const adapter = new VADAdapter();
+    await adapter.initialize();
+    await adapter.start();
+    expect(adapter.getStatus().isRunning).toBe(true);
+
+    await adapter.pause();
+    expect(mockVADInstance.pause).toHaveBeenCalledTimes(1);
+    expect(mockVADInstance.destroy).not.toHaveBeenCalled();
+    expect(adapter.getStatus().isRunning).toBe(false);
+    expect(adapter.getStatus().hasInstance).toBe(true);
   });
 
   it('executes speech callbacks only when running', async () => {
@@ -94,7 +128,7 @@ describe('VADAdapter (Silero VAD Web Adapter)', () => {
     expect(onSpeechEnd).not.toHaveBeenCalled();
 
     // Now start
-    adapter.start();
+    await adapter.start();
     capturedOptions?.onSpeechStart?.();
     capturedOptions?.onSpeechEnd?.(new Float32Array());
     capturedOptions?.onVADMisfire?.();
@@ -104,13 +138,88 @@ describe('VADAdapter (Silero VAD Web Adapter)', () => {
     expect(onVADMisfire).toHaveBeenCalledTimes(1);
   });
 
-  it('cleans up and releases microphone processing completely', async () => {
+  it('disposes newly resolved detector immediately if initialization completed after destroy (R1 Stale Resolution)', async () => {
+    let resolvePendingVAD: (inst: unknown) => void = () => {};
+    const pendingPromise = new Promise((resolve) => {
+      resolvePendingVAD = resolve;
+    });
+
+    vi.mocked(MicVAD.new).mockReturnValueOnce(
+      pendingPromise as unknown as ReturnType<typeof MicVAD.new>,
+    );
+
+    const staleInstance = {
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const adapter = new VADAdapter();
+    const initPromise = adapter.initialize();
+    expect(adapter.getStatus().isInitializing).toBe(true);
+
+    // Call destroy while initialization is still pending in-flight
+    await adapter.destroy();
+    expect(adapter.getStatus().isInitializing).toBe(false);
+    expect(adapter.getStatus().hasInstance).toBe(false);
+
+    // Late resolution occurs
+    resolvePendingVAD(staleInstance);
+    const result = await initPromise;
+
+    // Initialization returned false because session was invalidated
+    expect(result).toBe(false);
+    // Stale detector must be immediately destroyed and not retained
+    expect(staleInstance.destroy).toHaveBeenCalledTimes(1);
+    expect(adapter.getStatus().hasInstance).toBe(false);
+  });
+
+  it('disposes newly resolved detector if superseded by a newer initialize call (R1 Multiple Sessions)', async () => {
+    let resolveFirst: (inst: unknown) => void = () => {};
+    const firstPromise = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const firstInstance = {
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+    const secondInstance = {
+      start: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+
+    vi.mocked(MicVAD.new)
+      .mockReturnValueOnce(firstPromise as unknown as ReturnType<typeof MicVAD.new>)
+      .mockResolvedValueOnce(secondInstance as unknown as Awaited<ReturnType<typeof MicVAD.new>>);
+
+    const adapter = new VADAdapter();
+    const firstInitPromise = adapter.initialize();
+
+    // Start second initialization while first is still pending
+    const secondInitPromise = adapter.initialize();
+    const secondResult = await secondInitPromise;
+    expect(secondResult).toBe(true);
+
+    // Resolve first initialization late
+    resolveFirst(firstInstance);
+    const firstResult = await firstInitPromise;
+
+    expect(firstResult).toBe(false);
+    expect(firstInstance.destroy).toHaveBeenCalledTimes(1);
+    expect(secondInstance.destroy).not.toHaveBeenCalled();
+    expect(adapter.getStatus().hasInstance).toBe(true);
+  });
+
+  it('cleans up and releases microphone processing completely via destroy (R1)', async () => {
     const adapter = new VADAdapter();
     await adapter.initialize();
-    adapter.start();
+    await adapter.start();
 
-    adapter.cleanup();
-    expect(mockVADInstance.pause).toHaveBeenCalled();
+    await adapter.cleanup();
+    expect(mockVADInstance.destroy).toHaveBeenCalledTimes(1);
     expect(adapter.getStatus().isRunning).toBe(false);
     expect(adapter.getStatus().hasInstance).toBe(false);
   });

@@ -299,6 +299,127 @@ describe('ConversationController', () => {
     );
   });
 
+  it('stop during pending initialization does NOT transition to ERROR on late rejection (R2)', async () => {
+    let rejectInit: (err: unknown) => void = () => {};
+    mockVADAdapter.initialize.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectInit = reject;
+        }),
+    );
+
+    const controller = new ConversationController();
+    const startPromise = controller.startSession();
+
+    expect(controller.getState().stage).toBe('setup');
+
+    // User clicks stop while still initializing
+    controller.stopSession();
+    expect(controller.getState().stage).toBe('stopped');
+
+    // Late rejection occurs
+    rejectInit(new Error('Microphone permission denied'));
+    await startPromise;
+
+    // Must remain stopped; must NOT transition to error
+    expect(controller.getState().stage).toBe('stopped');
+  });
+
+  it('stop followed by immediate restart: previous session late failure does NOT terminate new session (R2)', async () => {
+    let rejectFirstInit: (err: unknown) => void = () => {};
+    mockVADAdapter.initialize
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectFirstInit = reject;
+          }),
+      )
+      .mockResolvedValueOnce(true);
+
+    const controller = new ConversationController();
+    const session1Promise = controller.startSession();
+    expect(controller.getState().stage).toBe('setup');
+
+    controller.stopSession();
+    expect(controller.getState().stage).toBe('stopped');
+
+    // Start session 2 immediately
+    const session2Promise = controller.startSession();
+    await vi.waitFor(() => {
+      expect(controller.getState().stage).toBe('generating');
+    });
+
+    // Session 1 rejects late
+    rejectFirstInit(new Error('Stale failure from session 1'));
+    await session1Promise;
+
+    // Session 2 is unaffected and still healthy
+    expect(controller.getState().stage).toBe('generating');
+    expect(controller.getState().messages).toHaveLength(1);
+    await session2Promise;
+  });
+
+  it('treats VADAdapter.initialize() === false as failure and enters typed-only mode (R2/R3)', async () => {
+    mockVADAdapter.initialize.mockResolvedValueOnce(false);
+
+    const controller = new ConversationController();
+    await controller.startSession();
+
+    expect(controller.getState().inputMode).toBe('typed_only');
+    expect(controller.getState().microphoneActive).toBe(false);
+    expect(mockVADAdapter.start).not.toHaveBeenCalled();
+    // Still speaks the initial question using Kokoro TTS
+    expect(controller.getState().messages[0]?.text).toBe(INITIAL_QUESTION);
+
+    // When audio finishes, status prompts for typed response
+    audioCallbacks.onPlaying?.();
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+    expect(controller.getState().status).toContain('Type your answer');
+  });
+
+  it('starts in typed-only mode when SpeechRecognition is unsupported (R3)', async () => {
+    vi.spyOn(recognitionModule, 'isSpeechRecognitionSupported').mockReturnValue(false);
+
+    const controller = new ConversationController();
+    await controller.startSession();
+
+    expect(controller.getState().inputMode).toBe('typed_only');
+    expect(controller.getState().microphoneActive).toBe(false);
+    expect(mockRecognitionAdapter.initialize).not.toHaveBeenCalled();
+    expect(mockVADAdapter.initialize).not.toHaveBeenCalled();
+
+    // Speaks initial question
+    audioCallbacks.onPlaying?.();
+    expect(controller.getState().stage).toBe('speaking');
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+
+    // Candidate types and submits answer
+    await controller.submitAnswer('Typed architectural response');
+    expect(controller.getState().messages[1]?.text).toBe('Typed architectural response');
+    expect(controller.getState().stage).toBe('generating');
+  });
+
+  it('handles microphone permission denial gracefully by switching to typed-only mode (R3)', async () => {
+    mockVADAdapter.initialize.mockRejectedValueOnce(
+      new Error('NotAllowedError: Permission denied'),
+    );
+
+    const controller = new ConversationController();
+    await controller.startSession();
+
+    expect(controller.getState().stage).toBe('generating');
+    expect(controller.getState().inputMode).toBe('typed_only');
+    expect(controller.getState().microphoneActive).toBe(false);
+
+    // Audio finishes, status prompts for typed response
+    audioCallbacks.onPlaying?.();
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+    expect(controller.getState().status).toContain('Type your answer');
+  });
+
   it('resets session metrics and state cleanly', async () => {
     const controller = new ConversationController();
     await controller.startSession();

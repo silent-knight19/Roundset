@@ -23,9 +23,11 @@ export type VoiceStage =
   | 'stopped'
   | 'error';
 
+export type VoiceInputMode = 'voice' | 'typed_only';
+
 export const VOICE_STAGE_LABELS: Record<VoiceStage, string> = {
   idle: 'Ready to start',
-  setup: 'Starting microphone and VAD',
+  setup: 'Initializing laboratory session',
   generating: 'Preparing interviewer voice',
   speaking: 'AI interviewer speaking',
   listening: 'Listening for your answer',
@@ -44,24 +46,29 @@ export interface VoiceControllerState {
   stage: VoiceStage;
   status: string;
   voice: string;
+  inputMode: VoiceInputMode;
   draft: string;
   messages: VoiceMessage[];
   interruptedCount: number;
   latencyMs: number | null;
   vadSpeech: boolean;
+  microphoneActive: boolean;
   modelDevice: string;
   eventLog: string[];
 }
 
 export class ConversationController {
   private stage: VoiceStage = 'idle';
-  private status = 'Chrome or Edge recommended. Wear headphones for reliable interruptions.';
+  private status =
+    'Desktop Chrome or Edge recommended. External network required on first load for models. Wear headphones for interruptions.';
   private voice = 'af_heart';
+  private inputMode: VoiceInputMode = 'voice';
   private draft = '';
   private messages: VoiceMessage[] = [];
   private interruptedCount = 0;
   private latencyMs: number | null = null;
   private vadSpeech = false;
+  private microphoneActive = false;
   private eventLog: string[] = [];
 
   private isRunning = false;
@@ -106,11 +113,13 @@ export class ConversationController {
       stage: this.stage,
       status: this.status,
       voice: this.voice,
+      inputMode: this.inputMode,
       draft: this.draft,
       messages: [...this.messages],
       interruptedCount: this.interruptedCount,
       latencyMs: this.latencyMs,
       vadSpeech: this.vadSpeech,
+      microphoneActive: this.microphoneActive,
       modelDevice: getActiveKokoroDevice(),
       eventLog: [...this.eventLog],
     };
@@ -163,12 +172,6 @@ export class ConversationController {
   public async startSession(): Promise<void> {
     if (this.isRunning) return;
 
-    if (!isSpeechRecognitionSupported()) {
-      this.setStage('error');
-      this.setStatus('Browser speech recognition unavailable. Try Chrome or Edge.');
-      return;
-    }
-
     this.isRunning = true;
     const currentSession = ++this.sessionId;
     this.interruptedCount = 0;
@@ -178,36 +181,64 @@ export class ConversationController {
     this.turnCount = 0;
     this.draft = '';
     this.vadSpeech = false;
+    this.microphoneActive = false;
 
     this.setStage('setup');
-    this.setStatus('Loading local Silero VAD and requesting microphone access…');
-    this.logEvent('Initializing session');
+    this.setStatus('Initializing voice pipeline and testing audio input capabilities…');
+    this.logEvent(`Session #${currentSession} starting`);
 
-    try {
-      const recInitialized = this.recognitionAdapter.initialize();
-      if (!recInitialized) {
-        throw new Error('Web Speech recognition failed to initialize');
+    const hasSpeechRecognition = isSpeechRecognitionSupported();
+    let voiceInputAvailable = false;
+
+    if (hasSpeechRecognition) {
+      try {
+        const recOk = this.recognitionAdapter.initialize();
+        if (recOk) {
+          const vadOk = await this.vadAdapter.initialize();
+          if (!this.isRunning || currentSession !== this.sessionId) {
+            // Obsolete or stopped session: clean up immediately and ignore
+            await this.vadAdapter.cleanup();
+            this.recognitionAdapter.cleanup();
+            return;
+          }
+
+          if (vadOk) {
+            await this.vadAdapter.start();
+            this.microphoneActive = true;
+            voiceInputAvailable = true;
+            this.logEvent('Silero VAD initialized · microphone active');
+          } else {
+            this.logEvent('VAD initialization returned false; falling back to typed-only mode');
+          }
+        }
+      } catch (voiceError) {
+        if (!this.isRunning || currentSession !== this.sessionId) {
+          // Late rejection belonging to an obsolete/stopped session must not alter state
+          return;
+        }
+        const msg = voiceError instanceof Error ? voiceError.message : String(voiceError);
+        this.logEvent(`Voice input initialization failed (${msg}); falling back to typed mode`);
       }
-
-      await this.vadAdapter.initialize();
-
-      if (!this.isRunning || currentSession !== this.sessionId) {
-        this.vadAdapter.cleanup();
-        this.recognitionAdapter.cleanup();
-        return;
-      }
-
-      this.vadAdapter.start();
-      this.logEvent('Silero VAD initialized · microphone active');
-
-      this.appendMessage('interviewer', INITIAL_QUESTION);
-      await this.speak(INITIAL_QUESTION);
-    } catch (error) {
-      this.stopSession();
-      this.setStage('error');
-      const msg = error instanceof Error ? error.message : String(error);
-      this.setStatus(`Setup failed: ${msg}. Check microphone permissions and network access.`);
+    } else {
+      this.logEvent('Browser SpeechRecognition unsupported; operating in typed-only mode');
     }
+
+    if (!this.isRunning || currentSession !== this.sessionId) {
+      return;
+    }
+
+    if (voiceInputAvailable) {
+      this.inputMode = 'voice';
+    } else {
+      this.inputMode = 'typed_only';
+      this.microphoneActive = false;
+      this.setStatus(
+        'Microphone / SpeechRecognition unavailable. Running in typed-answer mode. Type your answers below.',
+      );
+    }
+
+    this.appendMessage('interviewer', INITIAL_QUESTION);
+    await this.speak(INITIAL_QUESTION, currentSession);
   }
 
   public stopSession(): void {
@@ -217,8 +248,9 @@ export class ConversationController {
     this.clearTimers();
     this.recognitionAdapter.stop(false);
     this.recognitionAdapter.cleanup();
-    this.vadAdapter.cleanup();
+    void this.vadAdapter.cleanup();
     this.vadSpeech = false;
+    this.microphoneActive = false;
     this.setStage('stopped');
     this.setStatus('Session stopped. No audio files or transcripts were saved to disk.');
     this.logEvent('Session stopped');
@@ -232,16 +264,14 @@ export class ConversationController {
       this.clearPendingAsync();
       this.draft = '';
       this.setStage('listening');
-      this.setStatus('Audio stopped. You may speak or type.');
-      this.recognitionAdapter.start();
-    }
-  }
-
-  public playPreparedAudio(): void {
-    if (this.currentAudio) {
-      this.currentAudio.player.play().catch(() => {
-        this.setStatus('Browser refused playback; check site audio permissions.');
-      });
+      this.setStatus(
+        this.inputMode === 'voice'
+          ? 'Audio stopped. You may speak or type.'
+          : 'Audio stopped. Please type your answer below.',
+      );
+      if (this.inputMode === 'voice') {
+        this.recognitionAdapter.start();
+      }
     }
   }
 
@@ -254,8 +284,11 @@ export class ConversationController {
     this.draft = '';
     this.interruptedCount = 0;
     this.latencyMs = null;
+    this.vadSpeech = false;
+    this.microphoneActive = false;
+    this.inputMode = 'voice';
     this.setStage('idle');
-    this.setStatus('Ready to start a new conversation.');
+    this.setStatus('Ready to start a new scripted conversation.');
   }
 
   public updateDraft(text: string): void {
@@ -274,81 +307,117 @@ export class ConversationController {
     }
 
     this.clearTimers();
-    this.recognitionAdapter.stop(false);
+    if (this.inputMode === 'voice') {
+      this.recognitionAdapter.stop(false);
+    }
+
     const currentToken = ++this.activeToken;
+    const currentSession = this.sessionId;
 
     this.setStage('processing');
     this.draft = '';
     this.appendMessage('candidate', answer);
-    this.setStatus('Preparing scripted follow-up…');
+    this.setStatus('Preparing scripted follow-up question…');
     this.answerSentAt = performance.now();
     this.turnCount++;
 
     const followUp = nextDemoQuestion(answer, this.turnCount);
 
-    if (!this.isRunning || this.activeToken !== currentToken) return;
+    if (!this.isRunning || this.activeToken !== currentToken || this.sessionId !== currentSession) {
+      return;
+    }
 
     this.appendMessage('interviewer', followUp);
     this.logEvent('Scripted reply generated');
-    await this.speak(followUp);
+    await this.speak(followUp, currentSession);
   }
 
-  private async speak(text: string): Promise<void> {
-    if (!this.isRunning) return;
+  private async speak(text: string, sessionGen: number): Promise<void> {
+    if (!this.isRunning || this.sessionId !== sessionGen) return;
     const currentToken = ++this.activeToken;
 
     this.setStage('generating');
-    this.recognitionAdapter.stop(false);
-    this.setStatus('Synthesizing locally with Kokoro. First model load may be slow.');
+    if (this.inputMode === 'voice') {
+      this.recognitionAdapter.stop(false);
+    }
+    this.setStatus('Synthesizing interviewer speech locally with Kokoro (ONNX)…');
 
     const startMs = performance.now();
     try {
       const output = await synthesizeKokoro(text, this.voice);
 
-      if (!this.isRunning || this.activeToken !== currentToken) {
+      if (
+        !this.isRunning ||
+        this.activeToken !== currentToken ||
+        this.sessionId !== sessionGen
+      ) {
         return;
       }
 
       this.currentAudio = playAudioBlob(output.blob, {
         onPlaying: () => {
-          if (this.activeToken !== currentToken) return;
+          if (this.activeToken !== currentToken || this.sessionId !== sessionGen) return;
           this.setStage('speaking');
-          this.setStatus('AI speaking. Speak into microphone to interrupt it. Wear headphones.');
+          this.setStatus(
+            this.inputMode === 'voice'
+              ? 'AI speaking. Speak into microphone to interrupt it. Use headphones.'
+              : 'AI speaking. Listen or type your answer below.',
+          );
           if (this.answerSentAt !== null) {
             this.latencyMs = Math.round(performance.now() - this.answerSentAt);
             this.answerSentAt = null;
           }
           this.logEvent(
-            `Kokoro playback · ${Math.round(performance.now() - startMs)}ms after TTS start`,
+            `Kokoro playback · ${Math.round(performance.now() - startMs)}ms after synthesis start`,
           );
         },
         onEnded: () => {
-          if (this.activeToken !== currentToken || !this.isRunning) return;
+          if (this.activeToken !== currentToken || this.sessionId !== sessionGen || !this.isRunning) {
+            return;
+          }
           this.clearActiveAudio();
           this.setStage('listening');
-          this.setStatus('Your turn. Speak naturally; pause to send your answer.');
+          this.setStatus(
+            this.inputMode === 'voice'
+              ? 'Your turn. Speak naturally; pause to send your answer.'
+              : 'Your turn. Type your answer and click Send Answer.',
+          );
           this.draft = '';
-          this.recognitionAdapter.start();
+          if (this.inputMode === 'voice') {
+            this.recognitionAdapter.start();
+          }
         },
         onError: () => {
-          if (this.activeToken !== currentToken) return;
+          if (this.activeToken !== currentToken || this.sessionId !== sessionGen) return;
           this.clearActiveAudio();
           this.setStage('listening');
-          this.setStatus('Kokoro playback failed. You can still answer by voice or typing.');
-          this.recognitionAdapter.start();
+          this.setStatus(
+            'Kokoro audio playback failed. You can still answer by typing below.',
+          );
+          if (this.inputMode === 'voice') {
+            this.recognitionAdapter.start();
+          }
         },
       });
     } catch (error) {
-      if (this.activeToken !== currentToken || !this.isRunning) return;
+      if (
+        this.activeToken !== currentToken ||
+        this.sessionId !== sessionGen ||
+        !this.isRunning
+      ) {
+        return;
+      }
       this.setStage('listening');
       const msg = error instanceof Error ? error.message : String(error);
-      this.setStatus(`Kokoro failed: ${msg}. You can type instead.`);
-      this.recognitionAdapter.start();
+      this.setStatus(`Kokoro synthesis unavailable (${msg}). Please type your answer below.`);
+      if (this.inputMode === 'voice') {
+        this.recognitionAdapter.start();
+      }
     }
   }
 
   private handleVoiceStart(): void {
-    if (!this.isRunning) return;
+    if (!this.isRunning || this.inputMode !== 'voice') return;
     this.vadSpeech = true;
     this.emitState();
 
@@ -377,7 +446,7 @@ export class ConversationController {
   }
 
   private handleVoiceEnd(): void {
-    if (!this.isRunning) return;
+    if (!this.isRunning || this.inputMode !== 'voice') return;
     this.vadSpeech = false;
     this.emitState();
 
@@ -415,9 +484,12 @@ export class ConversationController {
 
   private handleRecognitionError(error: string, isPermissionDenied: boolean): void {
     if (isPermissionDenied) {
+      this.inputMode = 'typed_only';
+      this.microphoneActive = false;
       this.setStatus(
-        'Browser speech recognition was denied. Use text input or grant microphone permissions.',
+        'Microphone/SpeechRecognition permission was denied. Switched to typed-answer mode.',
       );
+      this.logEvent('Microphone permission denied; switched to typed-only mode');
     } else if (error !== 'aborted' && error !== 'no-speech') {
       this.logEvent(`Speech recognition warning: ${error}`);
     }
