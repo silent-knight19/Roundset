@@ -53,7 +53,7 @@ Roundset/
 
 ## Engineering Governance & Operating Rules
 
-All contributors and coding implementation agents must strictly adhere to the operating rules documented in [`AGENTS.md`](file:///Users/silentknight/Roundset/AGENTS.md):
+All contributors and coding implementation agents must strictly adhere to the operating rules documented in [`AGENTS.md`](AGENTS.md):
 
 - **Architect Role:** ChatGPT acts as Principal Software Architect and independent reviewer.
 - **Merge Authority:** Project owner retains exclusive merge authority. Implementation completed does not equal accepted.

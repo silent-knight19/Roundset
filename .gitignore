@@ -55,15 +55,7 @@ Thumbs.db
 *.swo
 *~
 
-# Documentation, legacy archives, and reference prototypes
-docs/
-legacy/
+# Reference prototypes (temporarily excluded until visibility verification)
 reference-prototypes/
-AI_INTERVIEWER_MASTER_ENGINEERING_ROADMAP_v1.md
-MANIFEST_SHA256.txt
-README_START_HERE.md
-AGENT_A_BACKEND_PROMPT.md
-AGENT_B_FRONTEND_PROMPT.md
-PARALLEL_AGENT_EXECUTION_PLAN_v1.md
 
 
