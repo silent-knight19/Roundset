@@ -15,6 +15,7 @@ import {
   normalizeEmail,
   EmailNormalizedSchema,
   PasswordSchema,
+  VerificationPasswordSchema,
   OtpCodeSchema,
   PhoneE164Schema,
   UserPreferencesSchema,
@@ -336,7 +337,75 @@ describe('Phase 2 Auth Shared Contracts', () => {
       expect(ResendOtpRequestSchema.safeParse({ registrationId: '' }).success).toBe(false);
     });
 
-    it('validates LoginRequest: normalizes password to Unicode NFC and avoids account-enumerating constraints', () => {
+    it('validates VerificationPasswordSchema: enforces 512 UTF-8 byte limit after NFC normalization', () => {
+      // 1. Boundary: exactly 512 ASCII bytes passes, 513 fails
+      const ascii512 = 'a'.repeat(512);
+      expect(VerificationPasswordSchema.safeParse(ascii512).success).toBe(true);
+      const ascii513 = 'a'.repeat(513);
+      const ascii513Result = VerificationPasswordSchema.safeParse(ascii513);
+      expect(ascii513Result.success).toBe(false);
+      if (!ascii513Result.success) {
+        expect(ascii513Result.error.issues[0]?.message).toBe('password must not exceed 512 UTF-8 bytes');
+      }
+
+      // 2. Multi-byte Unicode boundary: 256 2-byte characters (512 bytes) passes, 257 (514 bytes) fails
+      // 'é' (U+00E9) is 2 UTF-8 bytes (0xC3, 0xA9)
+      const unicode512 = 'é'.repeat(256);
+      expect(new TextEncoder().encode(unicode512).length).toBe(512);
+      expect(VerificationPasswordSchema.safeParse(unicode512).success).toBe(true);
+
+      const unicode514 = 'é'.repeat(257);
+      expect(unicode514.length).toBe(257); // JS string length is well below 512
+      expect(new TextEncoder().encode(unicode514).length).toBe(514);
+      const unicode514Result = VerificationPasswordSchema.safeParse(unicode514);
+      expect(unicode514Result.success).toBe(false);
+      if (!unicode514Result.success) {
+        expect(unicode514Result.error.issues[0]?.message).toBe('password must not exceed 512 UTF-8 bytes');
+      }
+
+      // 3. 4-byte Unicode characters (emoji): 128 emoji is 512 UTF-8 bytes, 129 is 516 UTF-8 bytes
+      const emoji128 = '🚀'.repeat(128); // 256 JS code units, 512 UTF-8 bytes
+      expect(new TextEncoder().encode(emoji128).length).toBe(512);
+      expect(VerificationPasswordSchema.safeParse(emoji128).success).toBe(true);
+
+      const emoji129 = '🚀'.repeat(129); // 258 JS code units, 516 UTF-8 bytes
+      expect(emoji129.length).toBe(258); // JS string length is far below 512
+      expect(new TextEncoder().encode(emoji129).length).toBe(516);
+      const emoji129Result = VerificationPasswordSchema.safeParse(emoji129);
+      expect(emoji129Result.success).toBe(false);
+      if (!emoji129Result.success) {
+        expect(emoji129Result.error.issues[0]?.message).toBe('password must not exceed 512 UTF-8 bytes');
+      }
+
+      // 4. Byte limit is evaluated AFTER NFC normalization:
+      // Decomposed 'e\u0301' is 3 UTF-8 bytes in NFD. 256 repeats = 768 UTF-8 bytes in NFD.
+      // But after NFC normalization, it combines to 256 'é' characters = 512 UTF-8 bytes!
+      const decomposed256 = 'e\u0301'.repeat(256);
+      expect(new TextEncoder().encode(decomposed256).length).toBe(768); // 768 bytes before NFC
+      expect(new TextEncoder().encode(decomposed256.normalize('NFC')).length).toBe(512); // 512 bytes after NFC
+      expect(VerificationPasswordSchema.safeParse(decomposed256).success).toBe(true);
+
+      const decomposed257 = 'e\u0301'.repeat(257);
+      expect(new TextEncoder().encode(decomposed257.normalize('NFC')).length).toBe(514); // 514 bytes after NFC
+      expect(VerificationPasswordSchema.safeParse(decomposed257).success).toBe(false);
+
+      // 5. Canonically equivalent composed vs decomposed strings produce identical output
+      const decomposed = 'Caf\u0065\u030112345';
+      const composed = 'Caf\u00E912345';
+      const parsedDecomposed = VerificationPasswordSchema.parse(decomposed);
+      const parsedComposed = VerificationPasswordSchema.parse(composed);
+      expect(parsedDecomposed).toBe('Caf\u00E912345');
+      expect(parsedComposed).toBe('Caf\u00E912345');
+      expect(parsedDecomposed).toBe(parsedComposed);
+
+      // 6. Empty password fails
+      expect(VerificationPasswordSchema.safeParse('').success).toBe(false);
+
+      // 7. Non-empty short password passes (no min-12 complexity check)
+      expect(VerificationPasswordSchema.safeParse('short').success).toBe(true);
+    });
+
+    it('validates LoginRequest: normalizes password to Unicode NFC and enforces UTF-8 byte limit without account-enumerating constraints', () => {
       // Decomposed Unicode "Café" -> Caf + combining acute (\u0065\u0301)
       const decomposedPassword = 'Caf\u0065\u030112345';
       const parsed = LoginRequestSchema.parse({
@@ -345,6 +414,13 @@ describe('Phase 2 Auth Shared Contracts', () => {
       });
       // Normalized to NFC (\u00E9)
       expect(parsed.password).toBe('Caf\u00E912345');
+
+      // Composed password parses to identical NFC string
+      const composedParsed = LoginRequestSchema.parse({
+        email: 'test@example.com',
+        password: 'Caf\u00E912345',
+      });
+      expect(composedParsed.password).toBe('Caf\u00E912345');
 
       // Accepts short wrong password without leaking policy constraints before identity lookup
       const shortPasswordResult = LoginRequestSchema.safeParse({
@@ -358,6 +434,34 @@ describe('Phase 2 Auth Shared Contracts', () => {
         LoginRequestSchema.safeParse({
           email: 'test@example.com',
           password: '',
+        }).success
+      ).toBe(false);
+
+      // Over-512-byte Unicode password where JS length < 512 (200 emoji = 400 JS length, 800 UTF-8 bytes)
+      const over512ByteUnicode = '🚀'.repeat(200);
+      expect(over512ByteUnicode.length).toBe(400); // string length < 512
+      const overUnicodeResult = LoginRequestSchema.safeParse({
+        email: 'test@example.com',
+        password: over512ByteUnicode,
+      });
+      expect(overUnicodeResult.success).toBe(false);
+      if (!overUnicodeResult.success) {
+        expect(overUnicodeResult.error.issues[0]?.message).toBe('password must not exceed 512 UTF-8 bytes');
+      }
+
+      // Exactly 512 UTF-8 bytes passes
+      expect(
+        LoginRequestSchema.safeParse({
+          email: 'test@example.com',
+          password: 'a'.repeat(512),
+        }).success
+      ).toBe(true);
+
+      // 513 UTF-8 bytes fails
+      expect(
+        LoginRequestSchema.safeParse({
+          email: 'test@example.com',
+          password: 'a'.repeat(513),
         }).success
       ).toBe(false);
     });
@@ -408,6 +512,38 @@ describe('Phase 2 Auth Shared Contracts', () => {
           password: 'CurrentPassword123!',
         }).success
       ).toBe(true);
+
+      // Password reauth normalizes password to NFC
+      const parsedReauth = ReauthRequestSchema.parse({
+        action: 'CHANGE_PASSWORD',
+        method: 'PASSWORD',
+        password: 'Caf\u0065\u030112345',
+      });
+      if (parsedReauth.method === 'PASSWORD') {
+        expect(parsedReauth.password).toBe('Caf\u00E912345');
+      }
+
+      // Password reauth enforces 512 UTF-8 byte limit after NFC normalization
+      const reauth512Ascii = ReauthRequestSchema.safeParse({
+        action: 'CHANGE_PASSWORD',
+        method: 'PASSWORD',
+        password: 'a'.repeat(512),
+      });
+      expect(reauth512Ascii.success).toBe(true);
+
+      const reauth513Ascii = ReauthRequestSchema.safeParse({
+        action: 'CHANGE_PASSWORD',
+        method: 'PASSWORD',
+        password: 'a'.repeat(513),
+      });
+      expect(reauth513Ascii.success).toBe(false);
+
+      const reauthOver512Unicode = ReauthRequestSchema.safeParse({
+        action: 'CHANGE_PASSWORD',
+        method: 'PASSWORD',
+        password: '🚀'.repeat(200),
+      });
+      expect(reauthOver512Unicode.success).toBe(false);
 
       // Valid google reauth
       expect(

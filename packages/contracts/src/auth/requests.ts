@@ -36,14 +36,23 @@ export const ResendOtpRequestSchema = z
   .strict();
 export type ResendOtpRequest = z.infer<typeof ResendOtpRequestSchema>;
 
+export const VerificationPasswordSchema = z
+  .string()
+  .min(1, 'password is required')
+  .refine(
+    (val) => {
+      const nfc = val.normalize('NFC');
+      return new TextEncoder().encode(nfc).length <= 512;
+    },
+    { message: 'password must not exceed 512 UTF-8 bytes' }
+  )
+  .transform((val) => val.normalize('NFC'));
+export type VerificationPassword = z.infer<typeof VerificationPasswordSchema>;
+
 export const LoginRequestSchema = z
   .object({
     email: EmailNormalizedSchema,
-    password: z
-      .string()
-      .min(1, 'password is required')
-      .max(512, 'password must not exceed 512 bytes')
-      .transform((val) => val.normalize('NFC')),
+    password: VerificationPasswordSchema,
   })
   .strict();
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
@@ -77,7 +86,7 @@ const PasswordReauthSchema = z
     action: ReauthActionSchema,
     target: z.string().nullable().optional(),
     method: z.literal('PASSWORD'),
-    password: z.string().min(1, 'password is required').max(512),
+    password: VerificationPasswordSchema,
   })
   .strict();
 
