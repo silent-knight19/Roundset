@@ -33,6 +33,27 @@ export const AuthIdentitySchema = new Schema<IAuthIdentity>(
     },
     passwordHash: {
       type: String,
+      trim: true,
+      required: [
+        function (this: IAuthIdentity) {
+          return this.provider === 'PASSWORD';
+        },
+        'passwordHash is required for PASSWORD identity',
+      ],
+      validate: {
+        validator: function (val: string | undefined | null) {
+          const self = this as unknown as Partial<IAuthIdentity>;
+          if (self.provider === 'FIREBASE_GOOGLE' && val !== undefined && val !== null) {
+            return false;
+          }
+          if (self.provider === 'PASSWORD' && (typeof val !== 'string' || val.trim().length === 0)) {
+            return false;
+          }
+          return true;
+        },
+        message:
+          'passwordHash must be omitted for FIREBASE_GOOGLE identities and a valid string for PASSWORD identities',
+      },
     },
     linkedAt: {
       type: Date,

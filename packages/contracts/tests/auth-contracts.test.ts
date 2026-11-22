@@ -154,10 +154,18 @@ describe('Phase 2 Auth Shared Contracts', () => {
         'candidate.name+tag@example.com'
       );
 
-      // Rejects control characters
-      expect(() => normalizeEmail('bad\nemail@example.com')).toThrow();
-      expect(() => normalizeEmail('bad\remail@example.com')).toThrow();
-      expect(() => normalizeEmail('bad\x00email@example.com')).toThrow();
+      // Rejects control characters anywhere, including trailing and leading positions before trimming
+      expect(() => normalizeEmail('bad\nemail@example.com')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('bad\remail@example.com')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('bad\x00email@example.com')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('test@example.com\n')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('test@example.com\r')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('test@example.com\t')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('\ntest@example.com')).toThrow(/illegal control characters/);
+      expect(() => normalizeEmail('test@example.com\r\n')).toThrow(/illegal control characters/);
+      expect(EmailNormalizedSchema.safeParse('test@example.com\n').success).toBe(false);
+      expect(EmailNormalizedSchema.safeParse('test@example.com\r').success).toBe(false);
+      expect(EmailNormalizedSchema.safeParse('test@example.com\t').success).toBe(false);
       expect(EmailNormalizedSchema.safeParse('bad\nemail@example.com').success).toBe(false);
 
       // Rejects non-ASCII
@@ -328,14 +336,33 @@ describe('Phase 2 Auth Shared Contracts', () => {
       expect(ResendOtpRequestSchema.safeParse({ registrationId: '' }).success).toBe(false);
     });
 
-    it('validates LoginRequest and PasswordForgotRequest', () => {
+    it('validates LoginRequest: normalizes password to Unicode NFC and avoids account-enumerating constraints', () => {
+      // Decomposed Unicode "Café" -> Caf + combining acute (\u0065\u0301)
+      const decomposedPassword = 'Caf\u0065\u030112345';
+      const parsed = LoginRequestSchema.parse({
+        email: 'test@example.com',
+        password: decomposedPassword,
+      });
+      // Normalized to NFC (\u00E9)
+      expect(parsed.password).toBe('Caf\u00E912345');
+
+      // Accepts short wrong password without leaking policy constraints before identity lookup
+      const shortPasswordResult = LoginRequestSchema.safeParse({
+        email: 'test@example.com',
+        password: 'short',
+      });
+      expect(shortPasswordResult.success).toBe(true);
+
+      // Empty password fails
       expect(
         LoginRequestSchema.safeParse({
           email: 'test@example.com',
-          password: 'Password123!',
+          password: '',
         }).success
-      ).toBe(true);
+      ).toBe(false);
+    });
 
+    it('validates PasswordForgotRequest and GoogleExchangeRequest', () => {
       expect(
         PasswordForgotRequestSchema.safeParse({
           email: 'test@example.com',

@@ -1,4 +1,4 @@
-import mongoose, { Schema, HydratedDocument, Model, Connection } from 'mongoose';
+import mongoose, { Schema, HydratedDocument, Model, Connection, Query } from 'mongoose';
 
 export interface IConsentAuditMetadata {
   userId: string;
@@ -66,14 +66,38 @@ export const SecurityAuditEventSchema = new Schema<ISecurityAuditEvent>(
       type: Schema.Types.Mixed,
       default: () => ({}),
       validate: {
-        validator: function (this: ISecurityAuditEvent, val: unknown) {
-          if (this.eventType === 'CONSENT_ACCEPTED') {
-            const meta = (val || {}) as Record<string, unknown>;
-            return Boolean(meta.userId && meta.policyId && meta.consentVersion && meta.consentAt);
+        validator: function (val: unknown) {
+          const self = this as unknown as Partial<ISecurityAuditEvent>;
+          if (self.eventType === 'CONSENT_ACCEPTED') {
+            if (typeof val !== 'object' || val === null || Array.isArray(val)) {
+              return false;
+            }
+            const meta = val as Record<string, unknown>;
+            if (typeof meta.userId !== 'string' || meta.userId.trim().length === 0) {
+              return false;
+            }
+            if (typeof meta.policyId !== 'string' || meta.policyId.trim().length === 0) {
+              return false;
+            }
+            if (typeof meta.consentVersion !== 'string' || meta.consentVersion.trim().length === 0) {
+              return false;
+            }
+            if (meta.consentAt instanceof Date) {
+              if (isNaN(meta.consentAt.getTime())) {
+                return false;
+              }
+            } else if (typeof meta.consentAt === 'string') {
+              if (meta.consentAt.trim().length === 0 || isNaN(Date.parse(meta.consentAt))) {
+                return false;
+              }
+            } else {
+              return false;
+            }
           }
           return true;
         },
-        message: 'userId, policyId, consentVersion, and consentAt are required in metadata for CONSENT_ACCEPTED audit events',
+        message:
+          'userId (non-empty string), policyId (non-empty string), consentVersion (non-empty string), and consentAt (valid timestamp) are required in metadata for CONSENT_ACCEPTED audit events',
       },
     },
   },
@@ -91,9 +115,40 @@ SecurityAuditEventSchema.pre('save', function () {
   }
 });
 
-SecurityAuditEventSchema.pre(['updateOne', 'updateMany', 'findOneAndUpdate'], function () {
-  throw new Error('Security audit events are immutable and cannot be updated');
-});
+// Block query-based update and replacement paths unconditionally
+SecurityAuditEventSchema.pre(
+  ['updateOne', 'updateMany', 'findOneAndUpdate', 'replaceOne', 'findOneAndReplace'],
+  function () {
+    throw new Error('Security audit events are immutable and cannot be updated or replaced');
+  }
+);
+
+// Block document-level deletion unless retentionPurge is explicitly authorized
+SecurityAuditEventSchema.pre(
+  'deleteOne',
+  { document: true, query: false },
+  function (this: SecurityAuditEventDocument, opts?: Record<string, unknown>) {
+    if (!opts?.retentionPurge) {
+      throw new Error(
+        'Security audit events cannot be deleted except via explicit authorized retentionPurge'
+      );
+    }
+  }
+);
+
+// Block query-based deletion unless retentionPurge is explicitly authorized
+SecurityAuditEventSchema.pre(
+  ['deleteOne', 'deleteMany', 'findOneAndDelete'],
+  { document: false, query: true },
+  function (this: Query<unknown, SecurityAuditEventDocument>) {
+    const options = this.getOptions();
+    if (!options?.retentionPurge) {
+      throw new Error(
+        'Security audit events cannot be deleted except via explicit authorized retentionPurge'
+      );
+    }
+  }
+);
 
 // Critical indexes defined in P2_AUTH_API_CONTRACTS_v1.md §4:
 // unique({eventId: 1})

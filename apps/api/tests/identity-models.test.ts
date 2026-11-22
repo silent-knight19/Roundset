@@ -149,8 +149,40 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
         userId: new Types.ObjectId(),
         provider: 'GITHUB' as unknown as 'PASSWORD',
         subject: 'github_user',
+        passwordHash: 'hash',
       });
       await expect(invalidProvider.validate()).rejects.toThrow(/provider/);
+    });
+
+    it('requires a valid passwordHash for PASSWORD identities and rejects missing/empty values', async () => {
+      // Missing passwordHash on PASSWORD identity fails
+      const missingPasswordHash = new AuthIdentityModel({
+        userId: new Types.ObjectId(),
+        provider: 'PASSWORD',
+        subject: 'user@example.com',
+      });
+      await expect(missingPasswordHash.validate()).rejects.toThrow(/passwordHash is required for PASSWORD identity/);
+
+      // Empty string passwordHash fails
+      const emptyPasswordHash = new AuthIdentityModel({
+        userId: new Types.ObjectId(),
+        provider: 'PASSWORD',
+        subject: 'user@example.com',
+        passwordHash: '   ',
+      });
+      await expect(emptyPasswordHash.validate()).rejects.toThrow(/passwordHash/);
+    });
+
+    it('strictly rejects passwordHash on FIREBASE_GOOGLE identities', async () => {
+      const googleWithPasswordHash = new AuthIdentityModel({
+        userId: new Types.ObjectId(),
+        provider: 'FIREBASE_GOOGLE',
+        subject: 'firebase_uid_123456789',
+        passwordHash: '$argon2id$v=19$m=19456,t=2,p=1$unexpected_hash',
+      });
+      await expect(googleWithPasswordHash.validate()).rejects.toThrow(
+        /passwordHash must be omitted for FIREBASE_GOOGLE identities/
+      );
     });
   });
 
@@ -192,7 +224,7 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
       });
 
       await expect(challengeWithoutBindings.validate()).rejects.toThrow(
-        /userId is required for RESET_PASSWORD verification challenge/
+        /userId is required for RESET_PASSWORD, LINK_PASSWORD, and PHONE_VERIFY challenges/
       );
 
       // With userId only
@@ -212,24 +244,50 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
       await expect(challengeWithoutBindings.validate()).resolves.toBeUndefined();
     });
 
-    it('does not require passwordIdentityIdAtIssue for LINK_PASSWORD or PHONE_VERIFY', async () => {
-      const linkChallenge = new VerificationChallengeModel({
+    it('requires userId, sessionId, and reauthTicketDigest for LINK_PASSWORD challenges', async () => {
+      // Missing userId, sessionId, reauthTicketDigest
+      const linkWithoutBindings = new VerificationChallengeModel({
         challengeId: 'chal_link_1',
         purpose: 'LINK_PASSWORD',
         subjectDigest: 'sha256_subject',
         otpDigest: 'sha256_otp',
         expiresAt: new Date(Date.now() + 300 * 1000),
       });
-      await expect(linkChallenge.validate()).resolves.toBeUndefined();
+      await expect(linkWithoutBindings.validate()).rejects.toThrow(
+        /userId is required for RESET_PASSWORD, LINK_PASSWORD, and PHONE_VERIFY challenges/
+      );
 
-      const phoneChallenge = new VerificationChallengeModel({
+      // With userId only: fails on missing sessionId
+      linkWithoutBindings.userId = new Types.ObjectId();
+      await expect(linkWithoutBindings.validate()).rejects.toThrow(
+        /sessionId is required for LINK_PASSWORD verification challenge/
+      );
+
+      // With userId and sessionId: fails on missing reauthTicketDigest
+      linkWithoutBindings.sessionId = 'sess_123';
+      await expect(linkWithoutBindings.validate()).rejects.toThrow(
+        /reauthTicketDigest is required for LINK_PASSWORD verification challenge/
+      );
+
+      // With all three required bindings: passes validation
+      linkWithoutBindings.reauthTicketDigest = 'sha256_ticket_digest';
+      await expect(linkWithoutBindings.validate()).resolves.toBeUndefined();
+    });
+
+    it('requires userId for PHONE_VERIFY challenges', async () => {
+      const phoneWithoutUser = new VerificationChallengeModel({
         challengeId: 'chal_phone_1',
         purpose: 'PHONE_VERIFY',
         subjectDigest: 'sha256_subject',
         otpDigest: 'sha256_otp',
         expiresAt: new Date(Date.now() + 300 * 1000),
       });
-      await expect(phoneChallenge.validate()).resolves.toBeUndefined();
+      await expect(phoneWithoutUser.validate()).rejects.toThrow(
+        /userId is required for RESET_PASSWORD, LINK_PASSWORD, and PHONE_VERIFY challenges/
+      );
+
+      phoneWithoutUser.userId = new Types.ObjectId();
+      await expect(phoneWithoutUser.validate()).resolves.toBeUndefined();
     });
   });
 
@@ -274,7 +332,8 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
   });
 
   describe('SecurityAuditEvent Schema & Immutability Invariant', () => {
-    it('requires userId, policyId, consentVersion, and consentAt in metadata for CONSENT_ACCEPTED', async () => {
+    it('strictly validates CONSENT_ACCEPTED metadata types, nonempty identifiers and valid timestamps', async () => {
+      // Missing metadata entirely
       const missingMeta = new SecurityAuditEventModel({
         eventId: 'evt_1',
         eventType: 'CONSENT_ACCEPTED',
@@ -282,13 +341,87 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
         outcome: 'SUCCESS',
         metadata: {},
       });
-
       await expect(missingMeta.validate()).rejects.toThrow(
-        /userId, policyId, consentVersion, and consentAt are required in metadata for CONSENT_ACCEPTED audit events/
+        /userId \(non-empty string\), policyId \(non-empty string\), consentVersion \(non-empty string\), and consentAt \(valid timestamp\) are required/
       );
 
-      const validConsentEvent = new SecurityAuditEventModel({
+      // Empty or whitespace identifiers rejected
+      const emptyUserMeta = new SecurityAuditEventModel({
         eventId: 'evt_1',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_1',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: '   ',
+          policyId: 'policy_v1',
+          consentVersion: '2026-11-22.1',
+          consentAt: new Date(),
+        },
+      });
+      await expect(emptyUserMeta.validate()).rejects.toThrow(/userId/);
+
+      // Non-string userId rejected
+      const nonStringUserMeta = new SecurityAuditEventModel({
+        eventId: 'evt_1',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_1',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: 12345 as unknown as string,
+          policyId: 'policy_v1',
+          consentVersion: '2026-11-22.1',
+          consentAt: new Date(),
+        },
+      });
+      await expect(nonStringUserMeta.validate()).rejects.toThrow(/userId/);
+
+      // Empty policyId rejected
+      const emptyPolicyMeta = new SecurityAuditEventModel({
+        eventId: 'evt_1',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_1',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: 'usr_123',
+          policyId: '',
+          consentVersion: '2026-11-22.1',
+          consentAt: new Date(),
+        },
+      });
+      await expect(emptyPolicyMeta.validate()).rejects.toThrow(/policyId/);
+
+      // Invalid consentAt rejected (invalid Date object or unparseable string)
+      const invalidDateMeta = new SecurityAuditEventModel({
+        eventId: 'evt_1',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_1',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: 'usr_123',
+          policyId: 'policy_v1',
+          consentVersion: '2026-11-22.1',
+          consentAt: new Date('invalid date'),
+        },
+      });
+      await expect(invalidDateMeta.validate()).rejects.toThrow(/consentAt/);
+
+      const unparseableStringMeta = new SecurityAuditEventModel({
+        eventId: 'evt_1',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_1',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: 'usr_123',
+          policyId: 'policy_v1',
+          consentVersion: '2026-11-22.1',
+          consentAt: 'not-a-timestamp',
+        },
+      });
+      await expect(unparseableStringMeta.validate()).rejects.toThrow(/consentAt/);
+
+      // Valid with Date instance
+      const validWithDate = new SecurityAuditEventModel({
+        eventId: 'evt_valid_date',
         eventType: 'CONSENT_ACCEPTED',
         requestId: 'req_1',
         outcome: 'SUCCESS',
@@ -299,7 +432,22 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
           consentAt: new Date(),
         },
       });
-      await expect(validConsentEvent.validate()).resolves.toBeUndefined();
+      await expect(validWithDate.validate()).resolves.toBeUndefined();
+
+      // Valid with ISO string timestamp
+      const validWithString = new SecurityAuditEventModel({
+        eventId: 'evt_valid_str',
+        eventType: 'CONSENT_ACCEPTED',
+        requestId: 'req_2',
+        outcome: 'SUCCESS',
+        metadata: {
+          userId: 'usr_123',
+          policyId: 'policy_v1',
+          consentVersion: '2026-11-22.1',
+          consentAt: '2026-11-22T10:00:00.000Z',
+        },
+      });
+      await expect(validWithString.validate()).resolves.toBeUndefined();
     });
 
     it('enforces immutability: throws on attempts to save modified existing audit event', async () => {
@@ -314,6 +462,60 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
       eventDoc.isNew = false;
       await expect(eventDoc.save()).rejects.toThrow(
         /Security audit events are immutable and cannot be updated/
+      );
+    });
+
+    it('blocks ordinary Mongoose update, replace, and deletion paths while preserving explicit retentionPurge exception', async () => {
+      // 1. Query update and replace paths throw unconditionally
+      const updateQuery = SecurityAuditEventModel.updateOne(
+        { eventId: 'evt_1' },
+        { outcome: 'FAILURE' }
+      );
+      await expect(updateQuery.exec()).rejects.toThrow(
+        /Security audit events are immutable and cannot be updated or replaced/
+      );
+
+      const findOneAndUpdateQuery = SecurityAuditEventModel.findOneAndUpdate(
+        { eventId: 'evt_1' },
+        { outcome: 'FAILURE' }
+      );
+      await expect(findOneAndUpdateQuery.exec()).rejects.toThrow(
+        /Security audit events are immutable and cannot be updated or replaced/
+      );
+
+      const replaceQuery = SecurityAuditEventModel.replaceOne(
+        { eventId: 'evt_1' },
+        { eventId: 'evt_1', eventType: 'TAMPERED', requestId: 'req', outcome: 'FAILURE', at: new Date() }
+      );
+      await expect(replaceQuery.exec()).rejects.toThrow(
+        /Security audit events are immutable and cannot be updated or replaced/
+      );
+
+      // 2. Query deletion without retentionPurge throws
+      const ordinaryDeleteQuery = SecurityAuditEventModel.deleteOne({ eventId: 'evt_1' });
+      await expect(ordinaryDeleteQuery.exec()).rejects.toThrow(
+        /Security audit events cannot be deleted except via explicit authorized retentionPurge/
+      );
+
+      const ordinaryDeleteManyQuery = SecurityAuditEventModel.deleteMany({});
+      await expect(ordinaryDeleteManyQuery.exec()).rejects.toThrow(
+        /Security audit events cannot be deleted except via explicit authorized retentionPurge/
+      );
+
+      const ordinaryFindAndDeleteQuery = SecurityAuditEventModel.findOneAndDelete({ eventId: 'evt_1' });
+      await expect(ordinaryFindAndDeleteQuery.exec()).rejects.toThrow(
+        /Security audit events cannot be deleted except via explicit authorized retentionPurge/
+      );
+
+      // 3. Document deletion without retentionPurge throws
+      const doc = new SecurityAuditEventModel({
+        eventId: 'evt_doc_del',
+        eventType: 'LOGIN_ATTEMPT',
+        requestId: 'req_del',
+        outcome: 'SUCCESS',
+      });
+      await expect(doc.deleteOne()).rejects.toThrow(
+        /Security audit events cannot be deleted except via explicit authorized retentionPurge/
       );
     });
   });

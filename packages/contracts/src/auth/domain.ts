@@ -33,15 +33,16 @@ export function normalizeEmail(email: string): string {
   if (typeof email !== 'string') {
     throw new Error('Email must be a string');
   }
+  // Reject forbidden CR/LF/control characters on raw input before boundary trimming
+  if (hasControlCharacters(email)) {
+    throw new Error('Email contains illegal control characters');
+  }
   const trimmed = email.trim();
   if (trimmed.length === 0) {
     throw new Error('Email must not be empty');
   }
   if (trimmed.length > 254) {
     throw new Error('Email must not exceed 254 characters');
-  }
-  if (hasControlCharacters(trimmed)) {
-    throw new Error('Email contains illegal control characters');
   }
   if (!/^[\x20-\x7E]+$/.test(trimmed)) {
     throw new Error('Email contains non-ASCII characters');

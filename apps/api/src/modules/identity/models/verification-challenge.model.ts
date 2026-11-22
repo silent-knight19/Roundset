@@ -45,9 +45,13 @@ export const VerificationChallengeSchema = new Schema<IVerificationChallenge>(
       ref: 'User',
       required: [
         function (this: IVerificationChallenge) {
-          return this.purpose === 'RESET_PASSWORD';
+          return (
+            this.purpose === 'RESET_PASSWORD' ||
+            this.purpose === 'LINK_PASSWORD' ||
+            this.purpose === 'PHONE_VERIFY'
+          );
         },
-        'userId is required for RESET_PASSWORD verification challenge',
+        'userId is required for RESET_PASSWORD, LINK_PASSWORD, and PHONE_VERIFY challenges',
       ],
     },
     identityVersionAtIssue: {
@@ -73,10 +77,22 @@ export const VerificationChallengeSchema = new Schema<IVerificationChallenge>(
     sessionId: {
       type: String,
       trim: true,
+      required: [
+        function (this: IVerificationChallenge) {
+          return this.purpose === 'LINK_PASSWORD';
+        },
+        'sessionId is required for LINK_PASSWORD verification challenge',
+      ],
     },
     reauthTicketDigest: {
       type: String,
       trim: true,
+      required: [
+        function (this: IVerificationChallenge) {
+          return this.purpose === 'LINK_PASSWORD';
+        },
+        'reauthTicketDigest is required for LINK_PASSWORD verification challenge',
+      ],
     },
     otpDigest: {
       type: String,

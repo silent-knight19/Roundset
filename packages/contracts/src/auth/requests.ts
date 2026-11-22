@@ -39,7 +39,11 @@ export type ResendOtpRequest = z.infer<typeof ResendOtpRequestSchema>;
 export const LoginRequestSchema = z
   .object({
     email: EmailNormalizedSchema,
-    password: z.string().min(1, 'password is required').max(512),
+    password: z
+      .string()
+      .min(1, 'password is required')
+      .max(512, 'password must not exceed 512 bytes')
+      .transform((val) => val.normalize('NFC')),
   })
   .strict();
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
