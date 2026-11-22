@@ -1,8 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import request from 'supertest';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startServer, type RunningServer } from '../src/server.js';
 import { loadEnv } from '../src/config/env.js';
 import type { ReadinessProvider } from '../src/core/readiness.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 class DelayedMongoManager {
   private connected = false;
@@ -37,7 +43,7 @@ class DelayedMongoManager {
   }
 }
 
-describe('Server Startup & Liveness Independence (R1-02)', () => {
+describe('Server Startup & Lifecycle Hardening (R1-02, R2-01, R2-02, R2-03)', () => {
   let runningServer: RunningServer | null = null;
 
   afterEach(async () => {
@@ -47,7 +53,88 @@ describe('Server Startup & Liveness Independence (R1-02)', () => {
     }
   });
 
-  it('R1-02: Liveness is available immediately while MongoDB connection is still pending', async () => {
+  it('R2-01: Importing API module in a separate process without test env vars does not start an HTTP server', async () => {
+    const script = `
+      import * as api from './src/index.js';
+      import * as server from './src/server.js';
+      console.log('IMPORTED_WITHOUT_STARTING_SERVER');
+    `;
+
+    const repoRoot = path.resolve(__dirname, '../../..');
+
+    const child = spawn(
+      process.execPath,
+      ['--import', 'tsx', '-e', script],
+      {
+        cwd: path.resolve(repoRoot, 'apps/api'),
+        env: {
+          PATH: process.env.PATH,
+          NODE_ENV: 'production',
+          PORT: '8787',
+          // Explicitly delete test-runner environment variables
+          VITEST: undefined,
+          NODE_TEST_CONTEXT: undefined,
+        },
+      }
+    );
+
+    let output = '';
+    child.stdout?.on('data', (d) => { output += d.toString(); });
+    child.stderr?.on('data', (d) => { output += d.toString(); });
+
+    const exitCode = await new Promise<number>((resolve) => {
+      child.on('close', resolve);
+    });
+
+    expect(exitCode).toBe(0);
+    expect(output).toContain('IMPORTED_WITHOUT_STARTING_SERVER');
+    expect(output).not.toContain('API service listening on port');
+  });
+
+  it('R2-02: Rejects startup cleanly when port is occupied (EADDRINUSE) without crashing process', async () => {
+    // Occupy an ephemeral port with a raw net server
+    const blockerServer = net.createServer();
+    const occupiedPort = await new Promise<number>((resolve) => {
+      blockerServer.listen(0, () => {
+        const addr = blockerServer.address() as net.AddressInfo;
+        resolve(addr.port);
+      });
+    });
+
+    const env = loadEnv({
+      NODE_ENV: 'development',
+      PORT: 8787,
+      WEB_ORIGIN: 'http://localhost:5173',
+      MOCK_DATABASE: false,
+    });
+
+    // Attempting to start server on occupied port must reject cleanly
+    await expect(startServer({ env, port: occupiedPort })).rejects.toThrow();
+
+    // Clean up blocker
+    await new Promise<void>((resolve) => blockerServer.close(() => resolve()));
+  });
+
+  it('R2-03: Repeated calls to stop() are safe and idempotent', async () => {
+    const env = loadEnv({
+      NODE_ENV: 'development',
+      PORT: 8787,
+      WEB_ORIGIN: 'http://localhost:5173',
+    });
+
+    runningServer = await startServer({ env, port: 0 });
+
+    // First stop
+    await expect(runningServer.stop()).resolves.toBeUndefined();
+    // Second stop (idempotent)
+    await expect(runningServer.stop()).resolves.toBeUndefined();
+    // Third stop (idempotent)
+    await expect(runningServer.stop()).resolves.toBeUndefined();
+
+    runningServer = null;
+  });
+
+  it('R1-02 & R2-03: Liveness is available immediately while MongoDB connection is still pending', async () => {
     const delayedManager = new DelayedMongoManager();
 
     const env = loadEnv({
@@ -76,7 +163,7 @@ describe('Server Startup & Liveness Independence (R1-02)', () => {
     expect(readyPendingResponse.status).toBe(503);
     expect(readyPendingResponse.body.data.ready).toBe(false);
 
-    // 3. Resolve the delayed connection
+    // 3. Resolve delayed connection
     delayedManager.completeConnection(true);
     await delayedManager.connectionPromise;
 
@@ -118,7 +205,7 @@ describe('Server Startup & Liveness Independence (R1-02)', () => {
     expect(readyResponse.body.data.ready).toBe(false);
   });
 
-  it('R1-02: Graceful shutdown is safe when connection attempt is still pending', async () => {
+  it('R1-02 & R2-03: Graceful shutdown is safe when connection attempt is still pending', async () => {
     const delayedManager = new DelayedMongoManager();
 
     const env = loadEnv({

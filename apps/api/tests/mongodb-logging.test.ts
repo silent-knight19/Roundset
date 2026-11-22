@@ -33,7 +33,7 @@ function createRecordingLogger(): { logger: Logger; logs: LogEntry[] } {
   return { logger: dummyLogger, logs };
 }
 
-describe('MongoDB Diagnostic Logging Security (R1-01)', () => {
+describe('MongoDB Diagnostic Logging Security & Lifecycle (R1-01, R2-04)', () => {
   const FAKE_USER = 'super_secret_agent_user';
   const FAKE_PASSWORD = 'TopSecretP@ssw0rd!987';
   const FAKE_HOST = 'fake-cluster-999.mongodb.net';
@@ -89,9 +89,11 @@ describe('MongoDB Diagnostic Logging Security (R1-01)', () => {
       category: 'DATABASE_LIFECYCLE',
     });
     expect(connectingLog?.msg).toBe('Database connection attempt initiated');
+
+    await mongoManager.disconnect();
   });
 
-  it('R1-01: Runtime error events log fixed diagnostic category without serializing error objects', () => {
+  it('R1-01: Runtime error events log fixed diagnostic category without serializing error objects', async () => {
     const { logger, logs } = createRecordingLogger();
     const mongoManager = new MongoManager(logger);
 
@@ -114,6 +116,8 @@ describe('MongoDB Diagnostic Logging Security (R1-01)', () => {
       category: 'DATABASE_RUNTIME_ERROR',
     });
     expect(errorLog?.msg).toBe('Database runtime error occurred');
+
+    await mongoManager.disconnect();
   });
 
   it('R1-01: Disconnect errors log fixed category without exposing error exceptions', async () => {
@@ -139,5 +143,38 @@ describe('MongoDB Diagnostic Logging Security (R1-01)', () => {
       category: 'DATABASE_DISCONNECT_ERROR',
     });
     expect(errorLog?.msg).toBe('Error during database disconnect');
+  });
+
+  it('R2-04: Listener counts remain stable after repeated manager creation and cleanup', async () => {
+    const initialDisconnectedCount = mongoose.connection.listenerCount('disconnected');
+    const initialReconnectedCount = mongoose.connection.listenerCount('reconnected');
+    const initialErrorCount = mongoose.connection.listenerCount('error');
+
+    // Install an unrelated listener to verify it is never touched
+    const unrelatedListener = () => {};
+    mongoose.connection.on('disconnected', unrelatedListener);
+    expect(mongoose.connection.listenerCount('disconnected')).toBe(initialDisconnectedCount + 1);
+
+    // Repeatedly create and cleanup MongoManager instances
+    for (let i = 0; i < 5; i++) {
+      const manager = new MongoManager();
+      expect(mongoose.connection.listenerCount('disconnected')).toBe(initialDisconnectedCount + 2);
+      expect(mongoose.connection.listenerCount('reconnected')).toBe(initialReconnectedCount + 1);
+      expect(mongoose.connection.listenerCount('error')).toBe(initialErrorCount + 1);
+
+      await manager.disconnect();
+
+      // Counts return exactly to baseline (+ unrelated listener)
+      expect(mongoose.connection.listenerCount('disconnected')).toBe(initialDisconnectedCount + 1);
+      expect(mongoose.connection.listenerCount('reconnected')).toBe(initialReconnectedCount);
+      expect(mongoose.connection.listenerCount('error')).toBe(initialErrorCount);
+    }
+
+    // Unrelated listener was retained throughout
+    expect(mongoose.connection.listeners('disconnected')).toContain(unrelatedListener);
+
+    // Clean up unrelated listener
+    mongoose.connection.removeListener('disconnected', unrelatedListener);
+    expect(mongoose.connection.listenerCount('disconnected')).toBe(initialDisconnectedCount);
   });
 });
