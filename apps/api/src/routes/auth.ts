@@ -14,11 +14,14 @@ import { createOriginAndFetchMetadataMiddleware } from '../modules/auth/session/
 import { getRequestId } from '../core/request-id.js';
 import { InvalidInputError } from '../core/errors.js';
 
-function validateEmptyBody(body: unknown): void {
-  if (body !== undefined && body !== null && typeof body === 'object') {
-    if (Object.keys(body).length > 0) {
-      throw new InvalidInputError('Request body must be empty object {}');
-    }
+function validateStrictEmptyObjectBody(body: unknown): void {
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    Array.isArray(body) ||
+    Object.keys(body).length !== 0
+  ) {
+    throw new InvalidInputError('Request body must be an empty JSON object {}');
   }
 }
 
@@ -51,7 +54,7 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/refresh (Cookie + CSRF + Origin)
   router.post('/refresh', requireOrigin, async (req, res, next) => {
     try {
-      validateEmptyBody(req.body);
+      validateStrictEmptyObjectBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 
@@ -81,7 +84,7 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/logout (Cookie + CSRF OR Bearer-only)
   router.post('/logout', requireOrigin, async (req, res, next) => {
     try {
-      validateEmptyBody(req.body);
+      validateStrictEmptyObjectBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 
@@ -122,7 +125,7 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
   // POST /api/v1/auth/logout-all (Bearer + Origin)
   router.post('/logout-all', requireOrigin, async (req, res, next) => {
     try {
-      validateEmptyBody(req.body);
+      validateStrictEmptyObjectBody(req.body);
       res.setHeader('Cache-Control', 'no-store');
       const requestId = getRequestId(res, req);
 

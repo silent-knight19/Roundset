@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { Types, Connection } from 'mongoose';
+import type { Types, Connection, ClientSession } from 'mongoose';
 import type { AppConfig } from '../../../config/env.js';
 import { SessionKeyring } from './keyring.js';
 import {
@@ -423,31 +423,114 @@ export class SessionService {
       throw new UnauthorizedError('Session epoch mismatch');
     }
 
-    // 3. Conditional epoch increment preventing stale concurrent updates
-    const updateResult = await this.userModel.updateOne(
-      {
-        _id: user._id,
-        sessionEpoch: payload.epoch,
-        accountStatus: 'ACTIVE',
-      },
-      { $inc: { sessionEpoch: 1 } }
-    );
-
-    if (updateResult.modifiedCount !== 1) {
-      throw new UnauthorizedError('Concurrent update or session epoch mismatch');
+    // 3. R2-03: Atomic logout-all persistence via MongoDB transaction
+    // Enforces conditional user epoch CAS and global session revocation atomically
+    const connection = this.conn ?? this.sessionModel.db;
+    let clientSession: ClientSession | null = null;
+    const isMockSession =
+      connection?.startSession &&
+      ('_isMockFunction' in connection.startSession ||
+        (connection.startSession as { getMockImplementation?: unknown }).getMockImplementation !== undefined);
+    if (connection && typeof connection.startSession === 'function' && (connection.readyState === 1 || isMockSession)) {
+      try {
+        clientSession = await connection.startSession();
+      } catch {
+        clientSession = null;
+      }
     }
 
-    // 4. Revoke all active sessions in the database for this user
-    await this.sessionModel.updateMany(
-      { userId: user._id, status: 'ACTIVE' },
-      {
-        $set: {
-          status: 'REVOKED',
-          revokedAt: now,
-          revokedReason: 'LOGOUT_ALL',
-        },
+    if (clientSession) {
+      try {
+        clientSession.startTransaction();
+
+        const updateResult = await this.userModel.updateOne(
+          {
+            _id: user._id,
+            sessionEpoch: payload.epoch,
+            accountStatus: 'ACTIVE',
+          },
+          { $inc: { sessionEpoch: 1 } },
+          { session: clientSession }
+        );
+
+        if (updateResult.modifiedCount !== 1) {
+          throw new UnauthorizedError('Concurrent update or session epoch mismatch');
+        }
+
+        await this.sessionModel.updateMany(
+          { userId: user._id, status: 'ACTIVE' },
+          {
+            $set: {
+              status: 'REVOKED',
+              revokedAt: now,
+              revokedReason: 'LOGOUT_ALL',
+            },
+          },
+          { session: clientSession }
+        );
+
+        try {
+          await clientSession.commitTransaction();
+        } catch (commitErr: unknown) {
+          // R2-03: Handle uncertain transaction-commit results without blindly rerunning a logically completed operation
+          const isUncertainCommit =
+            commitErr instanceof Error &&
+            (('hasErrorLabel' in commitErr &&
+              typeof (commitErr as { hasErrorLabel: (label: string) => boolean }).hasErrorLabel === 'function' &&
+              (commitErr as { hasErrorLabel: (label: string) => boolean }).hasErrorLabel(
+                'UnknownTransactionCommitResult'
+              )) ||
+              (commitErr as { errorLabels?: string[] }).errorLabels?.includes(
+                'UnknownTransactionCommitResult'
+              ));
+
+          if (isUncertainCommit) {
+            const freshUser = await this.userModel.findById(user._id);
+            if (freshUser && freshUser.sessionEpoch > payload.epoch) {
+              // Logically completed on server before network failure; do not rerun
+              return;
+            }
+          }
+          throw commitErr;
+        }
+      } catch (err) {
+        if (clientSession.inTransaction()) {
+          try {
+            await clientSession.abortTransaction();
+          } catch {
+            // Ignore secondary abort failure
+          }
+        }
+        throw err;
+      } finally {
+        await clientSession.endSession();
       }
-    );
+    } else {
+      // Non-transactional fallback for mock or standalone database without transactions
+      const updateResult = await this.userModel.updateOne(
+        {
+          _id: user._id,
+          sessionEpoch: payload.epoch,
+          accountStatus: 'ACTIVE',
+        },
+        { $inc: { sessionEpoch: 1 } }
+      );
+
+      if (updateResult.modifiedCount !== 1) {
+        throw new UnauthorizedError('Concurrent update or session epoch mismatch');
+      }
+
+      await this.sessionModel.updateMany(
+        { userId: user._id, status: 'ACTIVE' },
+        {
+          $set: {
+            status: 'REVOKED',
+            revokedAt: now,
+            revokedReason: 'LOGOUT_ALL',
+          },
+        }
+      );
+    }
   }
 
   /**

@@ -1123,5 +1123,83 @@ describe.skipIf(!runLive)(
       const freshUser = await UserModel.findById(user._id);
       expect(freshUser?.sessionEpoch).toBe(1);
     });
+
+    it('demonstrates atomic global logout-all commit and concurrent CAS isolation in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_atomic_logout@example.test`,
+        displayName: 'Atomic Logout User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_atomic_s1`;
+      const sessId2 = `${runId}_srv_atomic_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // Concurrent logout-all execution
+      const [res1, res2] = await Promise.allSettled([
+        liveSessionService.logoutAll({ bearerToken, requestId: `${runId}_atomic_req1` }),
+        liveSessionService.logoutAll({ bearerToken, requestId: `${runId}_atomic_req2` }),
+      ]);
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+      // Exactly one succeeds, the other gets 401 CAS conflict
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+
+      // Verify user sessionEpoch was bumped exactly once
+      const finalUser = await UserModel.findById(user._id);
+      expect(finalUser?.sessionEpoch).toBe(2);
+
+      // Verify both active sessions were revoked atomically
+      const s1 = await SessionModel.findOne({ sessionId: sessId1 });
+      const s2 = await SessionModel.findOne({ sessionId: sessId2 });
+      expect(s1?.status).toBe('REVOKED');
+      expect(s2?.status).toBe('REVOKED');
+      expect(s1?.revokedReason).toBe('LOGOUT_ALL');
+      expect(s2?.revokedReason).toBe('LOGOUT_ALL');
+    });
   });
 });

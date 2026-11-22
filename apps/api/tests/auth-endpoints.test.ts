@@ -857,36 +857,305 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
     });
   });
 
-  describe('R7 — Request Body {} Contract Validation', () => {
-    it('rejects non-empty JSON body on /api/v1/auth/refresh with 400 INVALID_INPUT', async () => {
-      const res = await request(app)
-        .post('/api/v1/auth/refresh')
-        .set('Origin', allowedOrigin)
-        .send({ unexpectedField: 'bad_payload' });
+  describe('R2-02 — Strict Empty Object {} Request Validation', () => {
+    const endpoints = [
+      { name: '/api/v1/auth/refresh', path: '/api/v1/auth/refresh' },
+      { name: '/api/v1/auth/logout', path: '/api/v1/auth/logout' },
+      { name: '/api/v1/auth/logout-all', path: '/api/v1/auth/logout-all' },
+    ];
 
-      expect(res.status).toBe(400);
-      expect(res.body.error.code).toBe('INVALID_INPUT');
-      expect(res.body.error.message).toContain('Request body must be empty object {}');
-    });
+    for (const ep of endpoints) {
+      it(`rejects array body [] on ${ep.name} with 400 INVALID_INPUT`, async () => {
+        const res = await request(app)
+          .post(ep.path)
+          .set('Origin', allowedOrigin)
+          .send([]);
 
-    it('rejects non-empty JSON body on /api/v1/auth/logout with 400 INVALID_INPUT', async () => {
-      const res = await request(app)
-        .post('/api/v1/auth/logout')
-        .set('Origin', allowedOrigin)
-        .send({ malicious: true });
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_INPUT');
+        expect(res.body.error.message).toContain('Request body must be an empty JSON object {}');
+      });
 
-      expect(res.status).toBe(400);
-      expect(res.body.error.code).toBe('INVALID_INPUT');
-    });
+      it(`rejects object with unknown keys on ${ep.name} with 400 INVALID_INPUT`, async () => {
+        const res = await request(app)
+          .post(ep.path)
+          .set('Origin', allowedOrigin)
+          .send({ unknownField: 'forbidden' });
 
-    it('rejects non-empty JSON body on /api/v1/auth/logout-all with 400 INVALID_INPUT', async () => {
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_INPUT');
+        expect(res.body.error.message).toContain('Request body must be an empty JSON object {}');
+      });
+
+      it(`rejects string primitive body on ${ep.name} with 400 INVALID_INPUT`, async () => {
+        const res = await request(app)
+          .post(ep.path)
+          .set('Origin', allowedOrigin)
+          .set('Content-Type', 'application/json')
+          .send(JSON.stringify('plain-string-payload'));
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_INPUT');
+      });
+
+      it(`rejects null body on ${ep.name} with 400 INVALID_INPUT`, async () => {
+        const res = await request(app)
+          .post(ep.path)
+          .set('Origin', allowedOrigin)
+          .set('Content-Type', 'application/json')
+          .send('null');
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_INPUT');
+      });
+
+      it(`rejects missing request body on ${ep.name} with 400 INVALID_INPUT`, async () => {
+        const res = await request(app)
+          .post(ep.path)
+          .set('Origin', allowedOrigin)
+          .send();
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_INPUT');
+        expect(res.body.error.message).toContain('Request body must be an empty JSON object {}');
+      });
+    }
+  });
+
+  describe('R2-03 — Atomic Logout-All Persistence and Transactional Fault Handling', () => {
+    it('aborts transaction and rolls back when session revocation fails after epoch increment', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_rollback_test';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      let inTx = false;
+      let aborted = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => { inTx = false; }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      // Inject failure on session revocation inside transaction
+      vi.spyOn(SessionModel, 'updateMany').mockRejectedValue(new Error('Simulated database write failure during session revocation'));
+
       const res = await request(app)
         .post('/api/v1/auth/logout-all')
         .set('Origin', allowedOrigin)
-        .send({ foo: 'bar' });
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
 
-      expect(res.status).toBe(400);
-      expect(res.body.error.code).toBe('INVALID_INPUT');
+      expect(res.status).toBe(500);
+      expect(mockClientSession.startTransaction).toHaveBeenCalled();
+      expect(mockClientSession.abortTransaction).toHaveBeenCalled();
+      expect(aborted).toBe(true);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
+    });
+
+    it('rejects concurrent logout-all when user epoch CAS detects modifiedCount !== 1', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_cas_conflict';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      let aborted = false;
+      let inTx = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => { inTx = false; }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+
+      // CAS conflict: another concurrent transaction already bumped the epoch
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 0, acknowledged: true, matchedCount: 0, upsertedCount: 0, upsertedId: null });
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe('AUTH_REQUIRED');
+      expect(aborted).toBe(true);
+    });
+
+    it('handles uncertain commit outcome gracefully when user epoch was incremented on server', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_uncertain_commit_success';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const findUserSpy = vi.spyOn(UserModel, 'findById')
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 1,
+        } as unknown as UserDocument)
+        // Second call during uncertain commit recovery finds that epoch was indeed incremented on server
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 2,
+        } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const uncertainError = new Error('Network timeout during commit');
+      (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
+
+      let inTx = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => {
+          inTx = false;
+          throw uncertainError;
+        }),
+        abortTransaction: vi.fn(async () => { inTx = false; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(204);
+      expect(findUserSpy).toHaveBeenCalledTimes(2);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
+    });
+
+    it('rethrows uncertain commit error when user epoch was NOT incremented on server', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_tx_uncertain_commit_fail';
+      const now = new Date();
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById')
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 1,
+        } as unknown as UserDocument)
+        // Second call finds epoch was NOT incremented on server
+        .mockResolvedValueOnce({
+          _id: userId,
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          sessionEpoch: 1,
+        } as unknown as UserDocument);
+
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        userId,
+        status: 'ACTIVE',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      } as unknown as SessionDocument);
+
+      const uncertainError = new Error('Network timeout during commit');
+      (uncertainError as unknown as { errorLabels: string[] }).errorLabels = ['UnknownTransactionCommitResult'];
+
+      let inTx = false;
+      let aborted = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => {
+          throw uncertainError;
+        }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+      vi.spyOn(UserModel, 'updateOne').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+      vi.spyOn(SessionModel, 'updateMany').mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(500);
+      expect(aborted).toBe(true);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
     });
   });
 });

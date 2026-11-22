@@ -44,6 +44,18 @@ const MockDatabaseSchema = z
 export const IngressModeSchema = z.enum(['LOCAL', 'PAGES_PROXY', 'SINGLE_ORIGIN']);
 export type IngressMode = z.infer<typeof IngressModeSchema>;
 
+function isDisallowedPolicyPlaceholder(val: string | undefined, defaultVal: string): boolean {
+  if (!val || val.trim().length === 0) return true;
+  const lower = val.trim().toLowerCase();
+  if (lower === defaultVal.toLowerCase()) return true;
+  if (lower.includes('placeholder')) return true;
+  if (lower === 'test' || lower.startsWith('test-') || lower.startsWith('test_')) return true;
+  if (lower === 'dev' || lower.startsWith('dev-') || lower.startsWith('dev_')) return true;
+  if (lower === 'default' || lower.startsWith('default-') || lower.startsWith('default_')) return true;
+  if (lower === 'example' || lower.startsWith('example-') || lower.startsWith('example_')) return true;
+  return false;
+}
+
 export const RetiredJwtKeySchema = z
   .object({
     kid: z.string().min(1),
@@ -123,6 +135,77 @@ export const EnvSchema = z
     CSRF_RETIRED_KEYS_JSON: parseJsonArray(RetiredCsrfKeySchema),
   })
   .superRefine((data, ctx) => {
+    // R2-01: Keyring collision and duplicate key validation (all environments)
+    if (data.JWT_RETIRED_KEYS_JSON) {
+      const seenJwtKids = new Set<string>();
+      for (const item of data.JWT_RETIRED_KEYS_JSON) {
+        if (item.kid === data.JWT_ACTIVE_KID) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Retired JWT key ID "${item.kid}" collides with active key ID`,
+            path: ['JWT_RETIRED_KEYS_JSON'],
+          });
+        }
+        if (seenJwtKids.has(item.kid)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Duplicate retired JWT key ID "${item.kid}"`,
+            path: ['JWT_RETIRED_KEYS_JSON'],
+          });
+        }
+        seenJwtKids.add(item.kid);
+      }
+    }
+
+    if (data.REFRESH_RETIRED_KEYS_JSON) {
+      const seenRefreshKids = new Set<string>();
+      for (const item of data.REFRESH_RETIRED_KEYS_JSON) {
+        if (item.kid === data.REFRESH_ACTIVE_KID) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Retired refresh key ID "${item.kid}" collides with active key ID`,
+            path: ['REFRESH_RETIRED_KEYS_JSON'],
+          });
+        }
+        if (seenRefreshKids.has(item.kid)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Duplicate retired refresh key ID "${item.kid}"`,
+            path: ['REFRESH_RETIRED_KEYS_JSON'],
+          });
+        }
+        seenRefreshKids.add(item.kid);
+        if (item.hmacSecret === item.digestSecret) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Retired refresh HMAC integrity and digest keys must be distinct for kid "${item.kid}"`,
+            path: ['REFRESH_RETIRED_KEYS_JSON'],
+          });
+        }
+      }
+    }
+
+    if (data.CSRF_RETIRED_KEYS_JSON) {
+      const seenCsrfKids = new Set<string>();
+      for (const item of data.CSRF_RETIRED_KEYS_JSON) {
+        if (item.kid === data.CSRF_ACTIVE_KID) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Retired CSRF key ID "${item.kid}" collides with active key ID`,
+            path: ['CSRF_RETIRED_KEYS_JSON'],
+          });
+        }
+        if (seenCsrfKids.has(item.kid)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Duplicate retired CSRF key ID "${item.kid}"`,
+            path: ['CSRF_RETIRED_KEYS_JSON'],
+          });
+        }
+        seenCsrfKids.add(item.kid);
+      }
+    }
+
     if (data.NODE_ENV === 'production') {
       if (data.MOCK_DATABASE) {
         ctx.addIssue({
@@ -139,12 +222,8 @@ export const EnvSchema = z
         });
       }
 
-      // R5: Explicit approved policy configuration required in production (no placeholders)
-      const isPlaceholderPolicy =
-        !data.POLICY_ID ||
-        data.POLICY_ID === 'roundset-terms-privacy' ||
-        data.POLICY_ID.toLowerCase().includes('placeholder');
-      if (isPlaceholderPolicy) {
+      // R5 / R2-04: Explicit approved policy configuration required in production (no placeholders)
+      if (isDisallowedPolicyPlaceholder(data.POLICY_ID, 'roundset-terms-privacy')) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: 'Explicit approved POLICY_ID is required in production environment (placeholders forbidden)',
@@ -152,11 +231,7 @@ export const EnvSchema = z
         });
       }
 
-      const isPlaceholderConsent =
-        !data.POLICY_CONSENT_VERSION ||
-        data.POLICY_CONSENT_VERSION === '2026-11-22' ||
-        data.POLICY_CONSENT_VERSION.toLowerCase().includes('placeholder');
-      if (isPlaceholderConsent) {
+      if (isDisallowedPolicyPlaceholder(data.POLICY_CONSENT_VERSION, '2026-11-22')) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: 'Explicit approved POLICY_CONSENT_VERSION is required in production environment (placeholders forbidden)',

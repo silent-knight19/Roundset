@@ -68,9 +68,15 @@ export class SessionKeyring {
 
     this.jwtVerificationKeys.set(this.activeJwtKid, pubKey);
 
-    // R4: Restore explicitly configured retired JWT verification keys across restart
+    // R4 / R2-01: Restore explicitly configured retired JWT verification keys across restart
     if (this.config.JWT_RETIRED_KEYS_JSON) {
       for (const item of this.config.JWT_RETIRED_KEYS_JSON) {
+        if (item.kid === this.activeJwtKid) {
+          throw new Error(`Retired JWT key ID "${item.kid}" collides with active key ID`);
+        }
+        if (this.jwtVerificationKeys.has(item.kid)) {
+          throw new Error(`Duplicate or conflicting JWT key ID "${item.kid}"`);
+        }
         await this.registerRetiredJwtKey(item.kid, item.publicKeyPem);
       }
     }
@@ -102,9 +108,15 @@ export class SessionKeyring {
     this.refreshHmacKeys.set(this.activeRefreshKid, refreshHmacBuf);
     this.refreshDigestKeys.set(this.activeRefreshKid, refreshDigestBuf);
 
-    // R4: Restore explicitly configured retired refresh keys across restart
+    // R4 / R2-01: Restore explicitly configured retired refresh keys across restart
     if (this.config.REFRESH_RETIRED_KEYS_JSON) {
       for (const item of this.config.REFRESH_RETIRED_KEYS_JSON) {
+        if (item.kid === this.activeRefreshKid) {
+          throw new Error(`Retired refresh key ID "${item.kid}" collides with active key ID`);
+        }
+        if (this.refreshHmacKeys.has(item.kid) || this.refreshDigestKeys.has(item.kid)) {
+          throw new Error(`Duplicate or conflicting refresh key ID "${item.kid}"`);
+        }
         this.registerRetiredRefreshKeys(item.kid, item.hmacSecret, item.digestSecret);
       }
     }
@@ -122,11 +134,35 @@ export class SessionKeyring {
 
     this.csrfHmacKeys.set(this.activeCsrfKid, Buffer.from(defaultCsrfSecret, 'utf-8'));
 
-    // R4: Restore explicitly configured retired CSRF keys across restart
+    // R4 / R2-01: Restore explicitly configured retired CSRF keys across restart
     if (this.config.CSRF_RETIRED_KEYS_JSON) {
       for (const item of this.config.CSRF_RETIRED_KEYS_JSON) {
+        if (item.kid === this.activeCsrfKid) {
+          throw new Error(`Retired CSRF key ID "${item.kid}" collides with active key ID`);
+        }
+        if (this.csrfHmacKeys.has(item.kid)) {
+          throw new Error(`Duplicate or conflicting CSRF key ID "${item.kid}"`);
+        }
         this.registerRetiredCsrfKey(item.kid, item.hmacSecret);
       }
+    }
+
+    // R2-01: Verify the active signing/verification pair still functions after all retired keys load
+    try {
+      const postInitProbe = await new jose.SignJWT({ postInitTest: true })
+        .setProtectedHeader({ alg: 'EdDSA', kid: this.activeJwtKid })
+        .sign(this.jwtSigningKey);
+      const activePub = this.jwtVerificationKeys.get(this.activeJwtKid);
+      if (!activePub) {
+        throw new Error('Active JWT verification key missing from keyring');
+      }
+      await jose.jwtVerify(postInitProbe, activePub, { algorithms: ['EdDSA'] });
+    } catch (err) {
+      throw new Error(
+        `Active JWT keypair failed post-initialization validation: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
     }
 
     this.initialized = true;
@@ -152,13 +188,39 @@ export class SessionKeyring {
   }
 
   public async registerRetiredJwtKey(kid: string, publicKeyPem: string): Promise<void> {
+    if (kid === this.activeJwtKid) {
+      throw new Error(`Cannot register retired JWT key with active key ID "${kid}"`);
+    }
+    if (this.jwtVerificationKeys.has(kid)) {
+      throw new Error(`JWT key ID "${kid}" is already registered`);
+    }
     const pubKey = await jose.importSPKI(publicKeyPem, 'EdDSA');
     this.jwtVerificationKeys.set(kid, pubKey);
   }
 
-  public async rotateJwtSigningKey(newKid: string, privateKeyPem: string, publicKeyPem: string): Promise<void> {
+  public async rotateJwtSigningKey(
+    newKid: string,
+    privateKeyPem: string,
+    publicKeyPem: string
+  ): Promise<void> {
+    if (newKid === this.activeJwtKid) {
+      throw new Error(`Cannot rotate to existing active JWT key ID "${newKid}"`);
+    }
+    if (this.jwtVerificationKeys.has(newKid)) {
+      throw new Error(`JWT key ID "${newKid}" already exists in keyring`);
+    }
     const privKey = await jose.importPKCS8(privateKeyPem, 'EdDSA');
     const pubKey = await jose.importSPKI(publicKeyPem, 'EdDSA');
+
+    try {
+      const probe = await new jose.SignJWT({ rotateTest: true })
+        .setProtectedHeader({ alg: 'EdDSA', kid: newKid })
+        .sign(privKey);
+      await jose.jwtVerify(probe, pubKey, { algorithms: ['EdDSA'] });
+    } catch {
+      throw new Error(`New JWT key ID "${newKid}" private and public keys do not form a valid cryptographic pair`);
+    }
+
     this.jwtSigningKey = privKey;
     this.activeJwtKid = newKid;
     this.jwtVerificationKeys.set(newKid, pubKey);
@@ -184,13 +246,36 @@ export class SessionKeyring {
   }
 
   public registerRetiredRefreshKeys(kid: string, hmacSecret: string, digestSecret: string): void {
-    this.refreshHmacKeys.set(kid, Buffer.from(hmacSecret, 'utf-8'));
-    this.refreshDigestKeys.set(kid, Buffer.from(digestSecret, 'utf-8'));
+    if (kid === this.activeRefreshKid) {
+      throw new Error(`Cannot register retired refresh key with active key ID "${kid}"`);
+    }
+    if (this.refreshHmacKeys.has(kid) || this.refreshDigestKeys.has(kid)) {
+      throw new Error(`Refresh key ID "${kid}" is already registered`);
+    }
+    const hmacBuf = Buffer.from(hmacSecret, 'utf-8');
+    const digestBuf = Buffer.from(digestSecret, 'utf-8');
+    if (hmacBuf.equals(digestBuf)) {
+      throw new Error('Refresh HMAC integrity key and digest key must be distinct');
+    }
+    this.refreshHmacKeys.set(kid, hmacBuf);
+    this.refreshDigestKeys.set(kid, digestBuf);
   }
 
   public rotateRefreshKeys(newKid: string, hmacSecret: string, digestSecret: string): void {
+    if (newKid === this.activeRefreshKid) {
+      throw new Error(`Cannot rotate to existing active refresh key ID "${newKid}"`);
+    }
+    if (this.refreshHmacKeys.has(newKid) || this.refreshDigestKeys.has(newKid)) {
+      throw new Error(`Refresh key ID "${newKid}" already exists in keyring`);
+    }
+    const hmacBuf = Buffer.from(hmacSecret, 'utf-8');
+    const digestBuf = Buffer.from(digestSecret, 'utf-8');
+    if (hmacBuf.equals(digestBuf)) {
+      throw new Error('Refresh HMAC integrity key and digest key must be distinct');
+    }
     this.activeRefreshKid = newKid;
-    this.registerRetiredRefreshKeys(newKid, hmacSecret, digestSecret);
+    this.refreshHmacKeys.set(newKid, hmacBuf);
+    this.refreshDigestKeys.set(newKid, digestBuf);
   }
 
   // CSRF methods
@@ -206,11 +291,23 @@ export class SessionKeyring {
   }
 
   public registerRetiredCsrfKey(kid: string, hmacSecret: string): void {
+    if (kid === this.activeCsrfKid) {
+      throw new Error(`Cannot register retired CSRF key with active key ID "${kid}"`);
+    }
+    if (this.csrfHmacKeys.has(kid)) {
+      throw new Error(`CSRF key ID "${kid}" is already registered`);
+    }
     this.csrfHmacKeys.set(kid, Buffer.from(hmacSecret, 'utf-8'));
   }
 
   public rotateCsrfKey(newKid: string, hmacSecret: string): void {
+    if (newKid === this.activeCsrfKid) {
+      throw new Error(`Cannot rotate to existing active CSRF key ID "${newKid}"`);
+    }
+    if (this.csrfHmacKeys.has(newKid)) {
+      throw new Error(`CSRF key ID "${newKid}" already exists in keyring`);
+    }
     this.activeCsrfKid = newKid;
-    this.registerRetiredCsrfKey(newKid, hmacSecret);
+    this.csrfHmacKeys.set(newKid, Buffer.from(hmacSecret, 'utf-8'));
   }
 }
