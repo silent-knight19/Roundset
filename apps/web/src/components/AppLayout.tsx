@@ -59,6 +59,18 @@ export function AppLayout() {
               >
                 Admin (Disabled)
               </span>
+
+              <div className="flex items-center gap-1.5 ml-3 pl-3 border-l border-slate-200">
+                <NavLink to="/login" className={navLinkClasses}>
+                  Sign In
+                </NavLink>
+                <NavLink
+                  to="/register"
+                  className="px-3 py-1.5 text-xs font-semibold rounded-md bg-[#2563EB] text-white hover:bg-blue-700 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+                >
+                  Register
+                </NavLink>
+              </div>
             </nav>
 
             {/* Mobile menu button */}
@@ -139,6 +151,22 @@ export function AppLayout() {
               >
                 Admin (Disabled — Requires RBAC)
               </span>
+            </div>
+            <div className="pt-2 border-t border-slate-200 flex flex-col gap-1">
+              <NavLink
+                to="/login"
+                onClick={() => setMobileMenuOpen(false)}
+                className={navLinkClasses}
+              >
+                Sign In
+              </NavLink>
+              <NavLink
+                to="/register"
+                onClick={() => setMobileMenuOpen(false)}
+                className={navLinkClasses}
+              >
+                Register
+              </NavLink>
             </div>
           </nav>
         )}
