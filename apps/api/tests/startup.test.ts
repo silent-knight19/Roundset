@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startServer, type RunningServer } from '../src/server.js';
 import { loadEnv } from '../src/config/env.js';
+import { createLogger } from '../src/core/logging.js';
 import { MongoManager } from '../src/integrations/mongodb.js';
 import type { ReadinessProvider } from '../src/core/readiness.js';
 
@@ -90,7 +91,7 @@ describe('Server Startup & Lifecycle Hardening (R1-02, R2-01, R2-02, R2-03)', ()
 
     expect(exitCode).toBe(0);
     expect(output).toContain('IMPORTED_WITHOUT_STARTING_SERVER');
-    expect(output).not.toContain('API service listening on port');
+    expect(output).not.toContain('API service listening');
   });
 
   it('R2-02 & R3-02: Rejects startup cleanly on EADDRINUSE, cleans up manager-owned listeners, preserves external listeners, and skips database connection', async () => {
@@ -264,5 +265,70 @@ describe('Server Startup & Lifecycle Hardening (R1-02, R2-01, R2-02, R2-03)', ()
 
     // Safe resolution after shutdown without crashing
     delayedManager.completeConnection(false);
+  });
+
+  it('CodeQL: Server startup logs use fixed category and message without leaking environment-derived values', async () => {
+    const capturedLogChunks: string[] = [];
+    const destinationStream = {
+      write(chunk: string) {
+        capturedLogChunks.push(chunk);
+      },
+    };
+
+    const pinoLogger = createLogger(
+      { level: 'trace' },
+      destinationStream as unknown as import('pino').DestinationStream
+    );
+
+    const testWebOrigin = 'https://sensitive-origin-secret.example.com';
+    const testPort = 8999;
+    const env = loadEnv({
+      NODE_ENV: 'development',
+      PORT: testPort,
+      WEB_ORIGIN: testWebOrigin,
+      MOCK_DATABASE: true,
+    });
+
+    runningServer = await startServer({
+      env,
+      logger: pinoLogger,
+      port: 0,
+    });
+
+    const completeLogOutput = capturedLogChunks.join('');
+
+    // Assert safe lifecycle message was logged
+    expect(completeLogOutput).toContain('API service listening');
+    expect(completeLogOutput).toContain('SERVER_LIFECYCLE');
+
+    // Assert environment-derived values do NOT appear anywhere in the captured logs
+    expect(completeLogOutput).not.toContain(testWebOrigin);
+    expect(completeLogOutput).not.toContain('https://sensitive-origin-secret.example.com');
+    expect(completeLogOutput).not.toContain('webOrigin');
+    expect(completeLogOutput).not.toContain('nodeEnv');
+    expect(completeLogOutput).not.toContain('mockDatabase');
+
+    // Parse the JSON log lines to strictly assert the schema of the listening log entry
+    const parsedLogs = capturedLogChunks
+      .join('')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((log): log is Record<string, unknown> => log !== null);
+
+    const listeningLog = parsedLogs.find(
+      (log) => log.category === 'SERVER_LIFECYCLE' && log.msg === 'API service listening'
+    );
+    expect(listeningLog).toBeDefined();
+    expect(listeningLog).not.toHaveProperty('webOrigin');
+    expect(listeningLog).not.toHaveProperty('nodeEnv');
+    expect(listeningLog).not.toHaveProperty('mockDatabase');
+    expect(listeningLog).not.toHaveProperty('port');
   });
 });

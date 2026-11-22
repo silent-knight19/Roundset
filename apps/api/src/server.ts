@@ -124,17 +124,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 
     const onListening = () => {
       s.removeListener('error', onError);
-      const address = s.address();
-      const boundPort = typeof address === 'object' && address ? address.port : listenPort;
       logger.info(
-        {
-          port: boundPort,
-          nodeEnv: config.NODE_ENV,
-          webOrigin: config.WEB_ORIGIN,
-          mockDatabase: config.MOCK_DATABASE,
-          category: 'SERVER_LIFECYCLE',
-        },
-        `API service listening on port ${boundPort}`
+        { category: 'SERVER_LIFECYCLE' },
+        'API service listening'
       );
       resolve(s);
     };
