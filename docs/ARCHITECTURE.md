@@ -1,4 +1,6 @@
 # Roundset — System Architecture
+> **Phase 2 design status:** On owner-approved merge of ADR-028, the [auth architecture](phase2/P2_DESIGN_01_AUTH_ARCHITECTURE.md), [auth.v1 API/data contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) and [execution plan](plan/PHASE_02_IDENTITY_EXECUTION_PLAN.md) are the frozen design baseline. The authentication feature is **not implemented** by this documentation change; Phase 1 code and test evidence remain unchanged.
+
 
 **Version:** 1.0 (Phase 1 Foundation)  
 **Date:** 2026-11-22  

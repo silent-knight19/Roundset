@@ -72,11 +72,14 @@ All Phase 1 foundational engineering tasks (`P1-FND-01` through `P1-FND-08`) hav
 
 ## Phase 2 — Identity
 
+- [x] **P2-DESIGN-01** — independently challenged `auth.v1` design / ADR-028; accepted **only upon owner-approved merge of this documentation PR**. This is design evidence, not implemented auth or tested deployment.
+- [ ] **P2-SPIKE-01** — prove free Atlas transaction/index behavior, Brevo authorized sender and provider quota reset, proxy/cookie integration and Argon2 free-memory capacity before live release.
+
 - [ ] P2-AUTH-01 Users/identities/session models and indexes.
 - [ ] P2-AUTH-02 Firebase Google ID token verification + app session.
 - [ ] P2-AUTH-03 Custom email/password Argon2id registration/login.
 - [ ] P2-AUTH-04 OTP verify/reset/resend, email mock + Brevo HTTP integration test.
-- [ ] P2-AUTH-05 Rotating refresh JWT/session, revocation, CSRF, abuse limits.
+- [ ] P2-AUTH-05 Rotating opaque refresh session, revocation, CSRF, abuse limits (short-lived access JWT).
 - [ ] P2-AUTH-06 Phone OTP provider mock and optional real SMS integration.
 - [ ] P2-AUTH-07 Account linking, profile/privacy/reauth, security tests.
 
