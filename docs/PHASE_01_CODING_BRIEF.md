@@ -1,6 +1,6 @@
 # Phase 1 — Coding Kickoff: Repository, API, Frontend, Database and Engineering Guardrails
 
-**Status:** READY TO IMPLEMENT. This file is the first executable engineering assignment. It should be fed to an IDE coding agent or followed directly by the developer. It does NOT authorize shipping fake auth/payments or ignoring later security gates.
+**Status:** IMPLEMENTED & ACCEPTED (Phase 1 complete). Merged in PR #2 and PR #3; verified in docs/TEST_EVIDENCE/phase-01.md.
 
 ## 0. Objective / working agreement
 
