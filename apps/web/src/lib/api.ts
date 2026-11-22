@@ -28,6 +28,20 @@ export interface HealthCheckOptions {
   signal?: AbortSignal;
 }
 
+export interface AuthMetaData {
+  activePolicyId: string;
+  activeConsentVersion: string;
+  registrationMode: 'PUBLIC' | 'INVITE_ONLY';
+}
+
+export type AuthMetaResult =
+  | { kind: 'success'; data: AuthMetaData; meta?: { requestId?: string } }
+  | { kind: 'unavailable'; status: number; error: string }
+  | { kind: 'offline'; error: string }
+  | { kind: 'timeout'; error: string }
+  | { kind: 'invalid'; error: string }
+  | { kind: 'aborted' };
+
 export const DEFAULT_TIMEOUT_MS = 5000;
 
 interface FetchDeadlineResult {
@@ -264,4 +278,63 @@ export async function fetchHealthOverview(
     fetchReadiness(options),
   ]);
   return { liveness, readiness };
+}
+
+export async function fetchAuthMeta(
+  options?: HealthCheckOptions,
+): Promise<AuthMetaResult> {
+  const result = await fetchJsonWithDeadline('/api/v1/auth/meta', options);
+
+  if (result.kind === 'aborted') {
+    return { kind: 'aborted' };
+  }
+  if (result.kind === 'timeout') {
+    return { kind: 'timeout', error: result.error ?? 'Request timed out' };
+  }
+  if (result.kind === 'offline') {
+    return {
+      kind: 'offline',
+      error: result.error ?? 'Backend offline or unreachable',
+    };
+  }
+
+  const status = result.status ?? 0;
+  if (status !== 200) {
+    return {
+      kind: 'unavailable',
+      status,
+      error: `Auth meta endpoint returned HTTP ${status}`,
+    };
+  }
+
+  if (result.kind === 'json_error') {
+    return {
+      kind: 'invalid',
+      error: 'Malformed JSON response from auth meta endpoint',
+    };
+  }
+
+  const json = result.json as Record<string, unknown> | null;
+  const data = json?.data as Record<string, unknown> | null;
+  if (
+    !data ||
+    typeof data.activePolicyId !== 'string' ||
+    typeof data.activeConsentVersion !== 'string' ||
+    (data.registrationMode !== 'PUBLIC' && data.registrationMode !== 'INVITE_ONLY')
+  ) {
+    return {
+      kind: 'invalid',
+      error: 'Invalid API response schema for auth meta',
+    };
+  }
+
+  return {
+    kind: 'success',
+    data: {
+      activePolicyId: data.activePolicyId,
+      activeConsentVersion: data.activeConsentVersion,
+      registrationMode: data.registrationMode as 'PUBLIC' | 'INVITE_ONLY',
+    },
+    meta: json?.meta as { requestId?: string } | undefined,
+  };
 }
