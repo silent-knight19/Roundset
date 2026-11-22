@@ -15,7 +15,8 @@
     "build": "npm run --workspace=@roundset/contracts build && npm run --workspace=@roundset/api build && npm run --workspace=@roundset/web build",
     "typecheck": "npm run --workspace=@roundset/contracts build && npm run --workspaces --if-present typecheck",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:integration": "RUN_LIVE_MONGODB_TESTS=true vitest run apps/api/tests/identity-live-mongodb.integration.test.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.20.0",

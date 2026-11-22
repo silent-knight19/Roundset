@@ -1,0 +1,856 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import mongoose, { Connection, Types } from 'mongoose';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  getUserModel,
+  getAuthIdentityModel,
+  getSessionModel,
+  getVerificationChallengeModel,
+  ensureIdentityIndexes,
+  verifyIdentityIndexes,
+  REQUIRED_IDENTITY_INDEXES,
+} from '../src/modules/identity/models/index.js';
+
+// Auto-load .env if MONGODB_TEST_URI is not in process.env
+if (!process.env.MONGODB_TEST_URI && typeof process.loadEnvFile === 'function') {
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    try {
+      process.loadEnvFile(envPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+const runLive = process.env.RUN_LIVE_MONGODB_TESTS === 'true';
+
+describe.skipIf(!runLive)(
+  'P2-AUTH-01: Live MongoDB Atlas Integration Suite',
+  { timeout: 30000 },
+  () => {
+  let conn: Connection;
+  let testDbName: string;
+  let mongoVersion: string;
+  const runId = `live_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const createdUserIds: Types.ObjectId[] = [];
+  const createdIdentityIds: Types.ObjectId[] = [];
+  const createdSessionIds: string[] = [];
+  const createdChallengeIds: string[] = [];
+
+  beforeAll(async () => {
+    const uri = process.env.MONGODB_TEST_URI;
+    if (!uri || uri.includes('placeholder_user') || uri.includes('placeholder_pass')) {
+      throw new Error(
+        'Execution halted: Live MongoDB integration tests were explicitly requested (RUN_LIVE_MONGODB_TESTS=true), ' +
+          'but MONGODB_TEST_URI is missing or contains placeholder values.\n' +
+          'Local setup required: Set MONGODB_TEST_URI in .env to a live MongoDB Atlas connection string pointing to a dedicated test database (e.g. roundset_test).'
+      );
+    }
+
+    // Safety guardrail: Ensure the test suite refuses to run against non-test databases
+    try {
+      const parsed = new URL(uri);
+      testDbName = parsed.pathname.replace(/^\//, '');
+    } catch {
+      const match = uri.match(/\/([^/?]+)(\?|$)/);
+      testDbName = match ? match[1] : '';
+    }
+
+    if (!testDbName || !testDbName.toLowerCase().includes('test')) {
+      throw new Error(
+        `Execution refused: Target database "${testDbName}" is not explicitly identified as a test database. ` +
+          `The database name in MONGODB_TEST_URI must contain "test" (e.g. "roundset_test") to protect production and application data.`
+      );
+    }
+
+    conn = await mongoose
+      .createConnection(uri, {
+        serverSelectionTimeoutMS: 15000,
+      })
+      .asPromise();
+
+    const buildInfo = await conn.db!.admin().buildInfo();
+    mongoVersion = buildInfo.version;
+  }, 30000);
+
+  afterAll(async () => {
+    if (!conn) return;
+
+    try {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+      const SessionModel = getSessionModel(conn);
+      const VerificationChallengeModel = getVerificationChallengeModel(conn);
+
+      // Clean up only synthetic records created during this run
+      if (createdUserIds.length > 0) {
+        await UserModel.deleteMany({ _id: { $in: createdUserIds } });
+      }
+      if (createdIdentityIds.length > 0) {
+        await AuthIdentityModel.deleteMany({ _id: { $in: createdIdentityIds } });
+      }
+      if (createdSessionIds.length > 0) {
+        await SessionModel.deleteMany({ sessionId: { $in: createdSessionIds } });
+      }
+      if (createdChallengeIds.length > 0) {
+        await VerificationChallengeModel.deleteMany({ challengeId: { $in: createdChallengeIds } });
+      }
+
+      // Also clean up by runId prefix fallback
+      await UserModel.deleteMany({ emailNormalized: new RegExp(`^${runId}_`) });
+      await SessionModel.deleteMany({ sessionId: new RegExp(`^${runId}_`) });
+      await VerificationChallengeModel.deleteMany({ challengeId: new RegExp(`^${runId}_`) });
+    } catch (cleanupErr: unknown) {
+      console.error('Test cleanup notice:', cleanupErr);
+    } finally {
+      await conn.close();
+    }
+  });
+
+  describe('Connection Verification & Environment Sanity', () => {
+    it('successfully connects to live MongoDB Atlas replica set with valid version and test database isolation', () => {
+      expect(conn.readyState).toBe(1); // 1 = connected
+      expect(testDbName.toLowerCase()).toContain('test');
+      expect(mongoVersion).toBeDefined();
+      expect(typeof mongoVersion).toBe('string');
+    });
+
+    it('preserves existing database collections such as smoke_test without dropping database', async () => {
+      const collections = await conn.db!.listCollections().toArray();
+      const collectionNames = collections.map((c) => c.name);
+      // smoke_test collection created by project owner must remain preserved
+      expect(collectionNames).toContain('smoke_test');
+    });
+  });
+
+  describe('Test Group A — Index Creation and Verification', () => {
+    it(
+      'creates all P2-AUTH-01 indexes and validates compliance via verifyIdentityIndexes()',
+      { timeout: 60000 },
+      async () => {
+        await ensureIdentityIndexes(conn);
+
+        const verification = await verifyIdentityIndexes(conn);
+        expect(verification.issues).toEqual([]);
+        expect(verification.ok).toBe(true);
+
+        // Verify all 10 required identity collections are present in inventory
+        const checkedCollections = Object.keys(verification.details);
+        expect(checkedCollections.length).toBe(REQUIRED_IDENTITY_INDEXES.length);
+        for (const req of REQUIRED_IDENTITY_INDEXES) {
+          expect(checkedCollections).toContain(req.collectionName);
+        }
+      }
+    );
+
+    it('confirms installed unique, partial-filter, and TTL index properties directly from MongoDB', async () => {
+      const verification = await verifyIdentityIndexes(conn);
+      const { details } = verification;
+
+      // 1. users: partial filter on emailNormalized & phoneE164
+      const userIndexes = details['users'];
+      const emailIdx = userIndexes.find((i) => i.key['emailNormalized'] === 1);
+      expect(emailIdx).toBeDefined();
+      expect(emailIdx?.unique).toBe(true);
+      expect(emailIdx?.partialFilterExpression).toEqual({ emailNormalized: { $type: 'string' } });
+
+      const phoneIdx = userIndexes.find((i) => i.key['phoneE164'] === 1);
+      expect(phoneIdx).toBeDefined();
+      expect(phoneIdx?.unique).toBe(true);
+      expect(phoneIdx?.partialFilterExpression).toEqual({ phoneE164: { $type: 'string' } });
+
+      // 2. authIdentities: compound unique indexes
+      const identityIndexes = details['authIdentities'];
+      const provSubIdx = identityIndexes.find(
+        (i) => i.key['provider'] === 1 && i.key['subject'] === 1
+      );
+      expect(provSubIdx).toBeDefined();
+      expect(provSubIdx?.unique).toBe(true);
+
+      const userProvIdx = identityIndexes.find(
+        (i) => i.key['userId'] === 1 && i.key['provider'] === 1
+      );
+      expect(userProvIdx).toBeDefined();
+      expect(userProvIdx?.unique).toBe(true);
+
+      // 3. sessions: partial unique refresh digest and TTL index
+      const sessionIndexes = details['sessions'];
+      const refreshIdx = sessionIndexes.find((i) => i.key['currentRefreshDigest'] === 1);
+      expect(refreshIdx).toBeDefined();
+      expect(refreshIdx?.unique).toBe(true);
+      expect(refreshIdx?.partialFilterExpression).toEqual({
+        status: 'ACTIVE',
+        currentRefreshDigest: { $type: 'string' },
+      });
+
+      const sessionTtlIdx = sessionIndexes.find((i) => i.key['absoluteExpiresAt'] === 1);
+      expect(sessionTtlIdx).toBeDefined();
+      expect(sessionTtlIdx?.expireAfterSeconds).toBe(0);
+
+      // 4. verificationChallenges: unique purpose+subjectDigest and TTL
+      const challengeIndexes = details['verificationChallenges'];
+      const purposeSubIdx = challengeIndexes.find(
+        (i) => i.key['purpose'] === 1 && i.key['subjectDigest'] === 1
+      );
+      expect(purposeSubIdx).toBeDefined();
+      expect(purposeSubIdx?.unique).toBe(true);
+
+      const challengeTtlIdx = challengeIndexes.find((i) => i.key['expiresAt'] === 1);
+      expect(challengeTtlIdx).toBeDefined();
+      expect(challengeTtlIdx?.expireAfterSeconds).toBe(0);
+    });
+  });
+
+  describe('Test Group B — Unique Constraints (E11000)', () => {
+    it('produces E11000 when inserting two users with the same verified canonical email', async () => {
+      const UserModel = getUserModel(conn);
+      const duplicateEmail = `${runId}_dup_user@example.com`;
+
+      const user1 = await UserModel.create({
+        emailNormalized: duplicateEmail,
+        displayName: 'First User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      createdUserIds.push(user1._id);
+
+      let caughtError: unknown;
+      try {
+        await UserModel.create({
+          emailNormalized: duplicateEmail,
+          displayName: 'Second User Colliding',
+          role: 'CANDIDATE',
+          accountStatus: 'ACTIVE',
+          consentVersion: '2026-11-22.1',
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongoErr = caughtError as { code?: number; message?: string };
+      expect(mongoErr.code).toBe(11000);
+      expect(mongoErr.message).toMatch(/E11000 duplicate key error.*emailNormalized/);
+    });
+
+    it('produces E11000 when inserting two Firebase identities with the same provider UID', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+      const duplicateFirebaseUid = `firebase_uid_${runId}`;
+
+      const userA = await UserModel.create({
+        emailNormalized: `${runId}_firebase_a@example.com`,
+        displayName: 'Firebase User A',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      const userB = await UserModel.create({
+        emailNormalized: `${runId}_firebase_b@example.com`,
+        displayName: 'Firebase User B',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      createdUserIds.push(userA._id, userB._id);
+
+      const identA = await AuthIdentityModel.create({
+        userId: userA._id,
+        provider: 'FIREBASE_GOOGLE',
+        subject: duplicateFirebaseUid,
+      });
+      createdIdentityIds.push(identA._id);
+
+      let caughtError: unknown;
+      try {
+        await AuthIdentityModel.create({
+          userId: userB._id,
+          provider: 'FIREBASE_GOOGLE',
+          subject: duplicateFirebaseUid,
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongoErr = caughtError as { code?: number; message?: string };
+      expect(mongoErr.code).toBe(11000);
+      expect(mongoErr.message).toMatch(/E11000 duplicate key error.*provider_1_subject_1/);
+    });
+
+    it('produces E11000 when inserting two identities with the same (userId, provider)', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_single_user@example.com`,
+        displayName: 'Single User Two Passwords',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      createdUserIds.push(user._id);
+
+      const ident1 = await AuthIdentityModel.create({
+        userId: user._id,
+        provider: 'PASSWORD',
+        subject: user.emailNormalized,
+        passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$syntheticHash1',
+      });
+      createdIdentityIds.push(ident1._id);
+
+      let caughtError: unknown;
+      try {
+        await AuthIdentityModel.create({
+          userId: user._id,
+          provider: 'PASSWORD',
+          subject: `${runId}_other_subject@example.com`,
+          passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$syntheticHash2',
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongoErr = caughtError as { code?: number; message?: string };
+      expect(mongoErr.code).toBe(11000);
+      expect(mongoErr.message).toMatch(/E11000 duplicate key error.*userId_1_provider_1/);
+    });
+
+    it('produces E11000 when inserting two OTP challenges with the same (purpose, subjectDigest)', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+      const VerificationChallengeModel = getVerificationChallengeModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_otp_user@example.com`,
+        displayName: 'OTP User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      const ident = await AuthIdentityModel.create({
+        userId: user._id,
+        provider: 'PASSWORD',
+        subject: user.emailNormalized,
+        passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$pwdHash',
+      });
+      createdUserIds.push(user._id);
+      createdIdentityIds.push(ident._id);
+
+      const sharedSubjectDigest = `digest_${runId}_shared`;
+
+      const ch1 = await VerificationChallengeModel.create({
+        challengeId: `${runId}_ch_1`,
+        purpose: 'RESET_PASSWORD',
+        subjectDigest: sharedSubjectDigest,
+        userId: user._id,
+        identityVersionAtIssue: 1,
+        passwordIdentityIdAtIssue: ident._id,
+        otpDigest: `otp_digest_1_${runId}`,
+        expiresAt: new Date(Date.now() + 300000),
+      });
+      createdChallengeIds.push(ch1.challengeId);
+
+      let caughtError: unknown;
+      try {
+        await VerificationChallengeModel.create({
+          challengeId: `${runId}_ch_2`,
+          purpose: 'RESET_PASSWORD',
+          subjectDigest: sharedSubjectDigest,
+          userId: user._id,
+          identityVersionAtIssue: 1,
+          passwordIdentityIdAtIssue: ident._id,
+          otpDigest: `otp_digest_2_${runId}`,
+          expiresAt: new Date(Date.now() + 300000),
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongoErr = caughtError as { code?: number; message?: string };
+      expect(mongoErr.code).toBe(11000);
+      expect(mongoErr.message).toMatch(/E11000 duplicate key error.*purpose_1_subjectDigest_1/);
+    });
+
+    it('allows multiple revoked sessions without an active refresh digest to coexist', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_revoked_user@example.com`,
+        displayName: 'Revoked Session User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      createdUserIds.push(user._id);
+
+      const now = Date.now();
+      const sess1Id = `${runId}_rev_s1`;
+      const sess2Id = `${runId}_rev_s2`;
+      const sess3Id = `${runId}_rev_s3_same_digest`;
+      const sess4Id = `${runId}_rev_s4_same_digest`;
+
+      // Two revoked sessions with undefined refresh digest
+      const sess1 = await SessionModel.create({
+        sessionId: sess1Id,
+        userId: user._id,
+        status: 'REVOKED',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now + 3600000),
+        absoluteExpiresAt: new Date(now + 86400000),
+      });
+      const sess2 = await SessionModel.create({
+        sessionId: sess2Id,
+        userId: user._id,
+        status: 'REVOKED',
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now + 3600000),
+        absoluteExpiresAt: new Date(now + 86400000),
+      });
+
+      // Two revoked sessions sharing the same former refresh digest
+      const formerDigest = `former_digest_${runId}`;
+      const sess3 = await SessionModel.create({
+        sessionId: sess3Id,
+        userId: user._id,
+        status: 'REVOKED',
+        currentRefreshDigest: formerDigest,
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now + 3600000),
+        absoluteExpiresAt: new Date(now + 86400000),
+      });
+      const sess4 = await SessionModel.create({
+        sessionId: sess4Id,
+        userId: user._id,
+        status: 'REVOKED',
+        currentRefreshDigest: formerDigest,
+        epochAtIssue: 1,
+        idleExpiresAt: new Date(now + 3600000),
+        absoluteExpiresAt: new Date(now + 86400000),
+      });
+
+      createdSessionIds.push(sess1Id, sess2Id, sess3Id, sess4Id);
+
+      expect(sess1.sessionId).toBe(sess1Id);
+      expect(sess2.sessionId).toBe(sess2Id);
+      expect(sess3.sessionId).toBe(sess3Id);
+      expect(sess4.sessionId).toBe(sess4Id);
+
+      const count = await SessionModel.countDocuments({
+        sessionId: { $in: [sess1Id, sess2Id, sess3Id, sess4Id] },
+      });
+      expect(count).toBe(4);
+    });
+  });
+
+  describe('Test Group C — Multi-Document Transactions', () => {
+    it('Transaction Commit: atomically writes synthetic user and identity across collections', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+
+      const session = await conn.startSession();
+      session.startTransaction();
+
+      let committedUserId: Types.ObjectId | undefined;
+      let committedIdentityId: Types.ObjectId | undefined;
+
+      try {
+        const [user] = await UserModel.create(
+          [
+            {
+              emailNormalized: `${runId}_tx_commit@example.com`,
+              displayName: 'Tx Commit User',
+              role: 'CANDIDATE',
+              accountStatus: 'ACTIVE',
+              consentVersion: '2026-11-22.1',
+            },
+          ],
+          { session }
+        );
+        committedUserId = user._id;
+
+        const [identity] = await AuthIdentityModel.create(
+          [
+            {
+              userId: user._id,
+              provider: 'PASSWORD',
+              subject: user.emailNormalized,
+              passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$txCommitHash',
+            },
+          ],
+          { session }
+        );
+        committedIdentityId = identity._id;
+
+        await session.commitTransaction();
+      } finally {
+        await session.endSession();
+      }
+
+      expect(committedUserId).toBeDefined();
+      expect(committedIdentityId).toBeDefined();
+      createdUserIds.push(committedUserId!);
+      createdIdentityIds.push(committedIdentityId!);
+
+      // Verify both records exist outside the transaction
+      const persistedUser = await UserModel.findById(committedUserId);
+      const persistedIdentity = await AuthIdentityModel.findById(committedIdentityId);
+
+      expect(persistedUser).not.toBeNull();
+      expect(persistedUser?.emailNormalized).toBe(`${runId}_tx_commit@example.com`);
+      expect(persistedIdentity).not.toBeNull();
+      expect(persistedIdentity?.userId.toString()).toBe(committedUserId!.toString());
+    });
+
+    it('Transaction Rollback: aborts and leaves neither user nor identity persisted', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+
+      const session = await conn.startSession();
+      session.startTransaction();
+
+      let rolledBackUserId: Types.ObjectId | undefined;
+      let rolledBackIdentityId: Types.ObjectId | undefined;
+
+      try {
+        const [user] = await UserModel.create(
+          [
+            {
+              emailNormalized: `${runId}_tx_rollback@example.com`,
+              displayName: 'Tx Rollback User',
+              role: 'CANDIDATE',
+              accountStatus: 'ACTIVE',
+              consentVersion: '2026-11-22.1',
+            },
+          ],
+          { session }
+        );
+        rolledBackUserId = user._id;
+
+        const [identity] = await AuthIdentityModel.create(
+          [
+            {
+              userId: user._id,
+              provider: 'PASSWORD',
+              subject: user.emailNormalized,
+              passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$txRollbackHash',
+            },
+          ],
+          { session }
+        );
+        rolledBackIdentityId = identity._id;
+
+        // Verify both exist inside the active transaction
+        const insideUser = await UserModel.findById(user._id).session(session);
+        const insideIdentity = await AuthIdentityModel.findById(identity._id).session(session);
+        expect(insideUser).not.toBeNull();
+        expect(insideIdentity).not.toBeNull();
+
+        // Intentionally abort transaction
+        await session.abortTransaction();
+      } finally {
+        await session.endSession();
+      }
+
+      expect(rolledBackUserId).toBeDefined();
+      expect(rolledBackIdentityId).toBeDefined();
+
+      // Verify neither record exists in MongoDB afterward
+      const persistedUser = await UserModel.findById(rolledBackUserId);
+      const persistedIdentity = await AuthIdentityModel.findById(rolledBackIdentityId);
+
+      expect(persistedUser).toBeNull();
+      expect(persistedIdentity).toBeNull();
+    });
+
+    it('Transaction Conflict: executes concurrent conflicting transactions and verifies isolation', async () => {
+      const UserModel = getUserModel(conn);
+      const conflictEmail = `${runId}_tx_conflict@example.com`;
+
+      const session1 = await conn.startSession();
+      const session2 = await conn.startSession();
+
+      session1.startTransaction();
+      session2.startTransaction();
+
+      let session1Result: 'COMMITTED' | 'FAILED' = 'FAILED';
+      let session2Result: 'COMMITTED' | 'FAILED' = 'FAILED';
+      let conflictErrorDetails: {
+        code?: number;
+        codeName?: string;
+        errorLabels?: string[];
+        message?: string;
+      } | null = null;
+
+      try {
+        // Transaction 1 writes user with conflictEmail
+        const [user1] = await UserModel.create(
+          [
+            {
+              emailNormalized: conflictEmail,
+              displayName: 'Tx Conflict User 1',
+              role: 'CANDIDATE',
+              accountStatus: 'ACTIVE',
+              consentVersion: '2026-11-22.1',
+            },
+          ],
+          { session: session1 }
+        );
+        createdUserIds.push(user1._id);
+
+        // Transaction 2 attempts to write user with same unique conflictEmail concurrently
+        let tx2FailedOnWrite = false;
+        try {
+          const [user2] = await UserModel.create(
+            [
+              {
+                emailNormalized: conflictEmail,
+                displayName: 'Tx Conflict User 2',
+                role: 'CANDIDATE',
+                accountStatus: 'ACTIVE',
+                consentVersion: '2026-11-22.1',
+              },
+            ],
+            { session: session2 }
+          );
+          createdUserIds.push(user2._id);
+        } catch (err: unknown) {
+          tx2FailedOnWrite = true;
+          const e = err as { code?: number; codeName?: string; errorLabels?: string[]; message?: string };
+          conflictErrorDetails = {
+            code: e.code,
+            codeName: e.codeName,
+            errorLabels: e.errorLabels,
+            message: e.message,
+          };
+          await session2.abortTransaction();
+        }
+
+        // Commit transaction 1
+        await session1.commitTransaction();
+        session1Result = 'COMMITTED';
+
+        // If transaction 2 did not fail during write, attempt commit to catch conflict
+        if (!tx2FailedOnWrite) {
+          try {
+            await session2.commitTransaction();
+            session2Result = 'COMMITTED';
+          } catch (err: unknown) {
+            const e = err as { code?: number; codeName?: string; errorLabels?: string[]; message?: string };
+            conflictErrorDetails = {
+              code: e.code,
+              codeName: e.codeName,
+              errorLabels: e.errorLabels,
+              message: e.message,
+            };
+            await session2.abortTransaction();
+          }
+        }
+      } finally {
+        await session1.endSession();
+        await session2.endSession();
+      }
+
+      // Exactly one transaction should have succeeded; the other must have failed
+      expect(session1Result).toBe('COMMITTED');
+      expect(session2Result).toBe('FAILED');
+      expect(conflictErrorDetails).not.toBeNull();
+
+      // Verify documented MongoDB conflict/duplicate code (11000 duplicate key or 112 WriteConflict)
+      const validConflictCodes = [11000, 112];
+      expect(validConflictCodes).toContain(conflictErrorDetails?.code);
+
+      // Verify no partial or duplicate record survived in MongoDB
+      const survivingUsers = await UserModel.find({ emailNormalized: conflictEmail });
+      expect(survivingUsers.length).toBe(1);
+      expect(survivingUsers[0].displayName).toBe('Tx Conflict User 1');
+    });
+  });
+
+  describe('Test Group D — Model-Level Negative Cases', () => {
+    it('Mongoose Validation: strictly rejects invalid accountStatus enum value before database write', async () => {
+      const UserModel = getUserModel(conn);
+
+      const invalidStatusDoc = new UserModel({
+        emailNormalized: `${runId}_invalid_status@example.com`,
+        displayName: 'Invalid Status User',
+        role: 'CANDIDATE',
+        accountStatus: 'PENDING_EMAIL' as unknown as 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+
+      let caughtError: unknown;
+      try {
+        await invalidStatusDoc.save();
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongooseErr = caughtError as { name: string; errors?: Record<string, { kind: string }> };
+      expect(mongooseErr.name).toBe('ValidationError');
+      expect(mongooseErr.errors?.accountStatus).toBeDefined();
+      expect(mongooseErr.errors?.accountStatus.kind).toBe('enum');
+    });
+
+    it('MongoDB Unique Index: rejects duplicate verified identity ownership (same user, same provider)', async () => {
+      const UserModel = getUserModel(conn);
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_dup_identity_owner@example.com`,
+        displayName: 'Identity Owner',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        consentVersion: '2026-11-22.1',
+      });
+      createdUserIds.push(user._id);
+
+      const firstIdentity = await AuthIdentityModel.create({
+        userId: user._id,
+        provider: 'PASSWORD',
+        subject: user.emailNormalized,
+        passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$firstHash',
+      });
+      createdIdentityIds.push(firstIdentity._id);
+
+      // Mongoose schema validation will PASS (both documents are individually valid schemas),
+      // but MongoDB index userId_1_provider_1 will reject with E11000
+      let caughtError: unknown;
+      try {
+        await AuthIdentityModel.create({
+          userId: user._id,
+          provider: 'PASSWORD',
+          subject: `${runId}_second_attempt@example.com`,
+          passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$secondHash',
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongoErr = caughtError as { name: string; code?: number };
+      expect(mongoErr.code).toBe(11000);
+    });
+
+    it('Mongoose Validation: strictly rejects missing authenticated OTP challenge ownership (missing userId)', async () => {
+      const VerificationChallengeModel = getVerificationChallengeModel(conn);
+
+      const challengeWithoutUser = new VerificationChallengeModel({
+        challengeId: `${runId}_no_user_ch`,
+        purpose: 'RESET_PASSWORD',
+        subjectDigest: `digest_${runId}_no_user`,
+        // userId intentionally omitted
+        identityVersionAtIssue: 1,
+        passwordIdentityIdAtIssue: new Types.ObjectId(),
+        otpDigest: 'otpDigest123',
+        expiresAt: new Date(Date.now() + 300000),
+      });
+
+      let caughtError: unknown;
+      try {
+        await challengeWithoutUser.save();
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongooseErr = caughtError as { name: string; errors?: Record<string, { message: string }> };
+      expect(mongooseErr.name).toBe('ValidationError');
+      expect(mongooseErr.errors?.userId).toBeDefined();
+      expect(mongooseErr.errors?.userId.message).toContain(
+        'userId is required for RESET_PASSWORD, LINK_PASSWORD, and PHONE_VERIFY challenges'
+      );
+    });
+
+    it('Mongoose Validation: strictly rejects invalid provider/password-hash combinations', async () => {
+      const AuthIdentityModel = getAuthIdentityModel(conn);
+      const dummyUserId = new Types.ObjectId();
+
+      // Case A: FIREBASE_GOOGLE identity containing passwordHash
+      const googleWithHash = new AuthIdentityModel({
+        userId: dummyUserId,
+        provider: 'FIREBASE_GOOGLE',
+        subject: `google_uid_${runId}`,
+        passwordHash: '$argon2id$v=19$m=65536,t=3,p=4$prohibitedGoogleHash',
+      });
+
+      let caughtErrorA: unknown;
+      try {
+        await googleWithHash.save();
+      } catch (err: unknown) {
+        caughtErrorA = err;
+      }
+
+      expect(caughtErrorA).toBeDefined();
+      const errA = caughtErrorA as { name: string; errors?: Record<string, { message: string }> };
+      expect(errA.name).toBe('ValidationError');
+      expect(errA.errors?.passwordHash?.message).toContain(
+        'passwordHash must be omitted for FIREBASE_GOOGLE identities'
+      );
+
+      // Case B: PASSWORD identity with missing or empty passwordHash
+      const passwordWithoutHash = new AuthIdentityModel({
+        userId: dummyUserId,
+        provider: 'PASSWORD',
+        subject: `${runId}_pwd_no_hash@example.com`,
+        // passwordHash omitted
+      });
+
+      let caughtErrorB: unknown;
+      try {
+        await passwordWithoutHash.save();
+      } catch (err: unknown) {
+        caughtErrorB = err;
+      }
+
+      expect(caughtErrorB).toBeDefined();
+      const errB = caughtErrorB as { name: string; errors?: Record<string, { message: string }> };
+      expect(errB.name).toBe('ValidationError');
+      expect(errB.errors?.passwordHash?.message).toContain(
+        'passwordHash is required for PASSWORD identity'
+      );
+    });
+
+    it('Mongoose Validation: strictly rejects missing recovery credential-version references', async () => {
+      const VerificationChallengeModel = getVerificationChallengeModel(conn);
+      const dummyUserId = new Types.ObjectId();
+
+      // RESET_PASSWORD challenge with userId, but missing identityVersionAtIssue and passwordIdentityIdAtIssue
+      const resetWithoutVersionRefs = new VerificationChallengeModel({
+        challengeId: `${runId}_no_refs_ch`,
+        purpose: 'RESET_PASSWORD',
+        subjectDigest: `digest_${runId}_no_refs`,
+        userId: dummyUserId,
+        // identityVersionAtIssue and passwordIdentityIdAtIssue intentionally omitted
+        otpDigest: 'otpDigest123',
+        expiresAt: new Date(Date.now() + 300000),
+      });
+
+      let caughtError: unknown;
+      try {
+        await resetWithoutVersionRefs.save();
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeDefined();
+      const mongooseErr = caughtError as { name: string; errors?: Record<string, { message: string }> };
+      expect(mongooseErr.name).toBe('ValidationError');
+      expect(mongooseErr.errors?.identityVersionAtIssue).toBeDefined();
+      expect(mongooseErr.errors?.identityVersionAtIssue.message).toContain(
+        'identityVersionAtIssue is required for RESET_PASSWORD verification challenge'
+      );
+      expect(mongooseErr.errors?.passwordIdentityIdAtIssue).toBeDefined();
+      expect(mongooseErr.errors?.passwordIdentityIdAtIssue.message).toContain(
+        'passwordIdentityIdAtIssue is required for RESET_PASSWORD verification challenge'
+      );
+    });
+  });
+});
