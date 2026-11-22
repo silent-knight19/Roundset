@@ -5,14 +5,19 @@ import {
 } from '@roundset/contracts';
 import type { ReadinessProvider } from '../core/readiness.js';
 import { getRequestId } from '../core/request-id.js';
+import type { SessionService } from '../modules/auth/session/session.service.js';
+import { createAuthRouter } from './auth.js';
 
 export interface RouteOptions {
   readinessProvider: ReadinessProvider;
   version?: string;
+  sessionService?: SessionService;
+  allowedOrigin?: string;
+  isProduction?: boolean;
 }
 
 /**
- * Creates the API v1 router containing health and core endpoints.
+ * Creates the API v1 router containing health, auth and core endpoints.
  */
 export function createV1Router(options: RouteOptions): Router {
   const router = Router();
@@ -50,6 +55,18 @@ export function createV1Router(options: RouteOptions): Router {
 
     res.status(isReady ? 200 : 503).json(body);
   });
+
+  // Mount auth routes if sessionService is provided
+  if (options.sessionService && options.allowedOrigin) {
+    router.use(
+      '/auth',
+      createAuthRouter({
+        sessionService: options.sessionService,
+        allowedOrigin: options.allowedOrigin,
+        isProduction: options.isProduction,
+      })
+    );
+  }
 
   return router;
 }

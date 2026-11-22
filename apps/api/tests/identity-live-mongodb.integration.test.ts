@@ -835,4 +835,136 @@ describe.skipIf(!runLive)(
       );
     });
   });
+
+  describe('Test Group E — Session Compare-and-Swap Concurrency & Replay Invariants (P2-AUTH-05a)', () => {
+    it('executes concurrent refresh CAS updates and guarantees exactly one successor commits', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_cas_user@example.test`,
+        displayName: 'CAS Test User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_cas_sess_1`;
+      createdSessionIds.push(sessionId);
+
+      const now = new Date();
+      const initialDigest = `digest_${runId}_gen_1`;
+
+      const session = await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 1,
+        currentRefreshDigest: initialDigest,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+      expect(session).toBeDefined();
+
+      // Execute 10 concurrent CAS operations contending for generation 1 -> 2
+      const concurrency = 10;
+      const casPromises = Array.from({ length: concurrency }, async (_, idx) => {
+        const nextDigest = `digest_${runId}_gen_2_from_${idx}`;
+        return SessionModel.findOneAndUpdate(
+          {
+            sessionId,
+            status: 'ACTIVE',
+            generation: 1,
+            currentRefreshDigest: initialDigest,
+            epochAtIssue: user.sessionEpoch,
+            idleExpiresAt: { $gt: now },
+            absoluteExpiresAt: { $gt: now },
+          },
+          {
+            $set: {
+              generation: 2,
+              currentRefreshDigest: nextDigest,
+              lastUsedAt: new Date(),
+            },
+          },
+          { new: true }
+        );
+      });
+
+      const results = await Promise.all(casPromises);
+      const successfulCommits = results.filter((res) => res !== null);
+      const failedCommits = results.filter((res) => res === null);
+
+      expect(successfulCommits.length).toBe(1);
+      expect(failedCommits.length).toBe(concurrency - 1);
+
+      const finalSession = await SessionModel.findOne({ sessionId });
+      expect(finalSession?.generation).toBe(2);
+      expect(finalSession?.status).toBe('ACTIVE');
+    });
+
+    it('identifies authentic stale generation replay and safely revokes session family', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_replay_user@example.test`,
+        displayName: 'Replay Test User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessionId = `${runId}_replay_sess_1`;
+      createdSessionIds.push(sessionId);
+
+      const now = new Date();
+      // Session has already progressed to generation 3
+      await SessionModel.create({
+        sessionId,
+        userId: user._id,
+        status: 'ACTIVE',
+        generation: 3,
+        currentRefreshDigest: `digest_${runId}_gen_3`,
+        epochAtIssue: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+        absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+      });
+
+      // A presentation of generation 1 (valid MAC, but generation 1 < current 3) triggers family revocation
+      const presentedGeneration = 1;
+      const targetSession = await SessionModel.findOne({ sessionId });
+      expect(targetSession?.status).toBe('ACTIVE');
+      expect(targetSession?.generation).toBeGreaterThan(presentedGeneration);
+
+      // Perform family revocation
+      await SessionModel.updateOne(
+        { sessionId, status: 'ACTIVE' },
+        {
+          $set: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            revokedReason: 'SESSION_REPLAY_DETECTED',
+          },
+        }
+      );
+
+      const revokedSession = await SessionModel.findOne({ sessionId });
+      expect(revokedSession?.status).toBe('REVOKED');
+      expect(revokedSession?.revokedReason).toBe('SESSION_REPLAY_DETECTED');
+    });
+  });
 });

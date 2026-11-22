@@ -53,7 +53,7 @@ export function createCorsMiddleware(allowedOrigin: string): RequestHandler {
     origin: allowedOrigin,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-CSRF-Token'],
     exposedHeaders: ['X-Request-ID'],
   });
 }
