@@ -10,16 +10,65 @@
 - [x] Product requirements consolidated in legacy files and roadmap.
 - [x] Initial official vendor research + ADRs documented.
 
-## Phase 1 — Foundation (START NOW)
+## Phase 1 — Foundation (COMPLETED & ACCEPTED)
 
-- [ ] P1-FND-01 Monorepo, npm workspaces, TS strict, ESLint, lockfile.
-- [ ] P1-FND-02 Express API factory, health/live+ready, errors, request IDs.
-- [ ] P1-FND-03 Zod shared contracts package.
-- [ ] P1-FND-04 Mongoose connection manager and readiness.
-- [ ] P1-FND-05 React/Vite route/UI shell and dev proxy.
-- [ ] P1-FND-06 API/frontend tests, build/lint/typecheck and CI.
-- [ ] P1-FND-07 Validated config, env/redaction, session-origin ADR.
-- [ ] P1-FND-08 README, architecture docs, evidence, reviewed first commit.
+All Phase 1 foundational engineering tasks (`P1-FND-01` through `P1-FND-08`) have been implemented, verified with automated tests, reviewed by the Principal Architect, and merged into `main` via PR #2 and PR #3.
+
+- [x] **P1-FND-01 — Monorepo, npm workspaces, TS strict, ESLint, lockfile.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Initial bootstrap merged at commit `653f1c5`; lockfile and full-stack dependencies reconciled in commit `1c9be95`.
+  - **Evidence:** [`docs/TEST_EVIDENCE/P1-FND-01.md`](TEST_EVIDENCE/P1-FND-01.md) and [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md).
+  - **Verification:** Native npm workspaces (`packages/contracts`, `apps/api`, `apps/web`), Node.js 22 LTS runtime enforcement, strict TypeScript (`noUncheckedIndexedAccess`), ESLint 9 flat config, reproducible `npm ci`, and `npm audit` reporting 0 vulnerabilities.
+  - **Limitations:** None for repository foundation.
+
+- [x] **P1-FND-02 — Express API factory, health/live+ready, errors, request IDs.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Implemented under Agent A (`P1-BE-01`), merged via PR #2 at commit `2754ef1` with remediations R1–R3 and CodeQL compliance commit `2105542`.
+  - **Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](TEST_EVIDENCE/P1-BE-01.md).
+  - **Verification:** Pure Express application factory (`createApp`) decoupled from HTTP listener; `GET /api/v1/health/live` returning HTTP 200 with minimal version info; `GET /api/v1/health/ready` checking dependency readiness; centralized error handler mapping 400 (`INVALID_INPUT`), 404 (`NOT_FOUND`), 413 (`PAYLOAD_TOO_LARGE`), 403 (`FORBIDDEN`), and 500 (`INTERNAL_ERROR`) with masked error details; unforgeable `crypto.randomUUID()` request IDs attached via `X-Request-ID`. Tested in `apps/api/tests/health.test.ts`, `errors.test.ts`, and `security.test.ts`.
+  - **Limitations:** No business endpoints mounted yet; live endpoints restricted to `/health/live` and `/health/ready`.
+
+- [x] **P1-FND-03 — Zod shared contracts package.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Bootstrapped in PR #1 (`653f1c5`), expanded in PR #2 (`2754ef1`), and integrated in PR #3 (`65a2782`).
+  - **Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](TEST_EVIDENCE/P1-BE-01.md) and [`apps/web/TEST_EVIDENCE/P1-FE-01.md`](../apps/web/TEST_EVIDENCE/P1-FE-01.md).
+  - **Verification:** Shared `@roundset/contracts` package exporting runtime Zod schemas and inferred TypeScript types for `LivenessResponseSchema`, `ReadinessResponseSchema`, `ApiErrorResponseSchema`, `PlanCodeSchema`, and `InterviewStatusSchema`. Enforces strict request ID validation and rejects malformed payloads. Tested in `packages/contracts/tests/contracts.test.ts` (11/11 tests pass) and `apps/api/tests/contracts-integration.test.ts` (3/3 tests pass).
+  - **Limitations:** Contracts cover foundational health, error, plan enum, and interview status shapes; domain entity schemas (users, sessions, questions) deferred to Phase 2+.
+
+- [x] **P1-FND-04 — Mongoose connection manager and readiness.**
+  - **Status:** Complete (local mock & disconnected verified; cloud cluster deferred).
+  - **PR & Merge Commit:** Implemented under `P1-BE-01`, merged via PR #2 (`2754ef1`).
+  - **Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](TEST_EVIDENCE/P1-BE-01.md).
+  - **Verification:** `MongoManager` with 5s bounded server selection timeout; asynchronous non-blocking startup connection; sanitized logging emitting only connection state and fixed diagnostic categories (zero URIs, passwords, or driver exceptions in logs); listener cleanup on error and shutdown; `MOCK_DATABASE=true` permits mock readiness for local testing with visible warning banner; production guardrail strictly rejects `MOCK_DATABASE=true` in `NODE_ENV=production`.
+  - **Distinction / Outstanding Limitations:** Local offline mode (HTTP 503) and development mock readiness (HTTP 200) verified. Real MongoDB Atlas cloud cluster provisioning is deferred to deployment phases (no Atlas cluster provisioned in Phase 1; development mock mode does NOT demonstrate real MongoDB connectivity).
+
+- [x] **P1-FND-05 — React/Vite route/UI shell and dev proxy.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Implemented under Agent B (`P1-FE-01`), merged via PR #3 at commit `65a2782` with remediation R1.
+  - **Evidence:** [`apps/web/TEST_EVIDENCE/P1-FE-01.md`](../apps/web/TEST_EVIDENCE/P1-FE-01.md) and [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md).
+  - **Verification:** React 19 + Vite 8 + Tailwind CSS v4 frontend shell in `apps/web`. Responsive down to 375px mobile viewport. Accessible route scaffold with placeholders for Home (`/`), Interview (`/interview`), Dashboard (`/dashboard`), Pricing (`/pricing`), and accessible 404. Admin access strictly disabled (`aria-disabled="true"`, 404 on direct `/admin` access). Bounded API client with 5-second deadline, cancellation, and unmount cleanup. `<HealthStatus />` component rendering distinct states: Checking, Online, Offline, Ready, Not Ready (HTTP 503), Unavailable (HTTP 502/500), Timeout, and Invalid API Response. Tested in `apps/web/src/tests/` (29/29 tests pass).
+  - **Limitations:** Public navigation pages display honest roadmap placeholders; no simulated sessions, mock users, or fake billing checkouts.
+
+- [x] **P1-FND-06 — API/frontend tests, build/lint/typecheck and CI.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Merged via PR #2 (`2754ef1`), PR #3 (`65a2782`), and integration commit `1c9be95`.
+  - **Evidence:** [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md) and [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+  - **Verification:** 75/75 automated tests passing across 11 test suites (11 contracts, 35 API, 29 web). Full monorepo build (`npm run build`), strict typecheck (`npm run typecheck`), linting (`npm run lint`), and audit (`npm audit`) passing with exit code 0. GitHub Actions CI workflow running on `ubuntu-latest`, Node.js 22, with `contents: read` permissions. CodeQL security scanning passing with 0 alerts.
+  - **Limitations:** End-to-end browser automation (Playwright) deferred to Phase 11; current testing combines Vitest, Supertest, React Testing Library, and live smoke testing.
+
+- [x] **P1-FND-07 — Validated config, env/redaction, session-origin ADR.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Implemented under `P1-BE-01`, merged via PR #2 (`2754ef1`).
+  - **Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](TEST_EVIDENCE/P1-BE-01.md) and [`docs/ENGINEERING_RESEARCH_AND_ADRS.md`](ENGINEERING_RESEARCH_AND_ADRS.md).
+  - **Verification:** Strict Zod environment schema in `apps/api/src/config/env.ts` rejecting invalid or unknown options; production guardrails; sensitive data redaction in Pino operational logs (`apps/api/src/core/logging.ts`); Helmet CSP defaults; CORS rejection of unapproved browser origins; ADR-001 (Cookie/Origin Architecture) and ADR-002 (Provider Strategy) approved and documented.
+  - **Limitations:** Optional provider credentials (Firebase, Groq, Cloudflare, Brevo) defined in `.env.example` as placeholders but not connected in Phase 1.
+
+- [x] **P1-FND-08 — README, architecture docs, evidence, reviewed first commit.**
+  - **Status:** Complete.
+  - **PR & Merge Commit:** Executed under `P1-CLOSE-01` on branch `chore/phase-1-closure`.
+  - **Evidence:** [`README.md`](../README.md) and [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md).
+  - **Verification:** Consolidated developer README with accurate Node 22 setup, local startup instructions for API and web, health/readiness documentation, mock database mode explanations, links to test evidence, and explicit disclosures of unimplemented Phase 2–11 features.
+  - **Limitations:** Full system deployment deferred to Phase 11.
 
 ## Phase 2 — Identity
 
@@ -96,3 +145,8 @@
 | 2026-11-22 | Voice scripted POC | User manual test + screenshot archived | Validated scripted mode only |
 | 2026-11-22 | Qwen short-turn metrics | CSV with 16 successes (4,690 tokens) | Partial inference validation only |
 | 2026-11-22 | Roadmap/research/specification | Markdown documents | Docs complete, code not started |
+| 2026-11-22 | P1-FND-01 (Bootstrap) | PR #1 (commit `653f1c5`) | Monorepo scaffold & governance verified |
+| 2026-11-22 | P1-BE-01 (Backend API & Readiness) | PR #2 (merge `2754ef1`, commit `2105542`) | Express API, Mongoose readiness, CI, 35 tests pass |
+| 2026-11-22 | P1-FE-01 (Frontend Shell & Health UI) | PR #3 (merge `65a2782`, commit `a468fcf`) | React 19 / Vite 8 UI shell, health matrix, 29 tests pass |
+| 2026-11-22 | P1-INT-01 (Full-Stack Monorepo Integration) | Commit `1c9be95`, `docs/TEST_EVIDENCE/phase-01.md` | Monorepo reconciled, 75/75 tests pass, smoke verified |
+| 2026-11-22 | P1-CLOSE-01 (Phase 1 Repository Closure) | Branch `chore/phase-1-closure` | Documentation & tracker closed; ready for Phase 2 |
