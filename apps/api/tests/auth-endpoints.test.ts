@@ -391,7 +391,7 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       expect(res.status).toBe(204);
       expect(res.headers['cache-control']).toBe('no-store');
       expect(updateSpy).toHaveBeenCalledWith(
-        { sessionId },
+        { sessionId, status: 'ACTIVE' },
         expect.objectContaining({
           $set: expect.objectContaining({
             status: 'REVOKED',
@@ -527,11 +527,118 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
 
       expect(res.status).toBe(204);
       expect(updateSpy).toHaveBeenCalledWith(
-        { sessionId },
+        { sessionId, status: 'ACTIVE' },
         expect.objectContaining({
           $set: expect.objectContaining({ status: 'REVOKED' }),
         })
       );
+    });
+
+    it('preserves revokedReason LOGOUT_ALL and terminal status when single-session logout follows logout-all', async () => {
+      const sessionId = 'sess_already_logout_all';
+      const bearer = await signAccessToken(keyring, {
+        userId: '507f1f77bcf86cd799439011',
+        sessionId,
+        epoch: 2,
+      });
+
+      // Session is already in terminal state with revokedReason: 'LOGOUT_ALL'
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        status: 'REVOKED',
+        revokedReason: 'LOGOUT_ALL',
+        revokedAt: new Date(Date.now() - 10000),
+      } as unknown as SessionDocument);
+
+      const updateSpy = vi.spyOn(SessionModel, 'updateOne');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(204);
+      // Terminal metadata must NOT be overwritten
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('cannot erase SESSION_REPLAY_DETECTED or other previously persisted security reason', async () => {
+      const sessionId = 'sess_replay_detected_terminal';
+      const bearer = await signAccessToken(keyring, {
+        userId: '507f1f77bcf86cd799439011',
+        sessionId,
+        epoch: 1,
+      });
+
+      // Session has security replay detected
+      vi.spyOn(SessionModel, 'findOne').mockResolvedValue({
+        sessionId,
+        status: 'REVOKED',
+        revokedReason: 'SESSION_REPLAY_DETECTED',
+        revokedAt: new Date(Date.now() - 5000),
+      } as unknown as SessionDocument);
+
+      const updateSpy = vi.spyOn(SessionModel, 'updateOne');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(204);
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('remains idempotent on repeated logout calls without overwriting terminal status', async () => {
+      const sessionId = 'sess_idempotent_logout';
+      const { rawToken: rawRefresh } = createRefreshToken(keyring, {
+        sessionId,
+        generation: 1,
+      });
+      const csrfToken = createCsrfToken(keyring, { sessionId });
+
+      // First call finds ACTIVE session; second call finds REVOKED session
+      vi.spyOn(SessionModel, 'findOne')
+        .mockResolvedValueOnce({
+          sessionId,
+          status: 'ACTIVE',
+        } as unknown as SessionDocument)
+        .mockResolvedValueOnce({
+          sessionId,
+          status: 'REVOKED',
+          revokedReason: 'USER_LOGOUT',
+        } as unknown as SessionDocument);
+
+      const updateSpy = vi
+        .spyOn(SessionModel, 'updateOne')
+        .mockResolvedValue({ modifiedCount: 1, acknowledged: true, matchedCount: 1, upsertedCount: 0, upsertedId: null });
+
+      // Call 1
+      const res1 = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .set('Cookie', `roundset_refresh=${rawRefresh}; roundset_csrf=${csrfToken}`)
+        .set('X-CSRF-Token', csrfToken)
+        .send({});
+
+      expect(res1.status).toBe(204);
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+
+      // Call 2
+      const res2 = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Origin', allowedOrigin)
+        .set('Cookie', `roundset_refresh=${rawRefresh}; roundset_csrf=${csrfToken}`)
+        .set('X-CSRF-Token', csrfToken)
+        .send({});
+
+      expect(res2.status).toBe(204);
+      // updateOne must NOT be called again
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      // Cookies are still cleared
+      expect(res2.headers['set-cookie']).toBeDefined();
     });
   });
 
@@ -1344,6 +1451,8 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
         .send({});
 
       expect(resLogout.status).toBe(204);
+      // updateOne must NOT be called during single logout, preserving revokedReason: 'LOGOUT_ALL'
+      expect(sessionUpdateSpy).toHaveBeenCalledTimes(1);
     });
 
     it('handles unknown commit followed by successful commit retry', async () => {

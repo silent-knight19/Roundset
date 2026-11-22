@@ -1363,6 +1363,11 @@ describe.skipIf(!runLive)(
 
       const userAfter = await UserModel.findById(user._id);
       expect(userAfter?.sessionEpoch).toBe(2);
+
+      // Terminal revocation reason LOGOUT_ALL must NOT be overwritten by single-session logout
+      const s1FinalAfter = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1FinalAfter?.status).toBe('REVOKED');
+      expect(s1FinalAfter?.revokedReason).toBe('LOGOUT_ALL');
     });
 
     it('demonstrates genuinely overlapping concurrent race between single-session logout and logout-all in real MongoDB', async () => {
@@ -1385,6 +1390,22 @@ describe.skipIf(!runLive)(
       const sessId2 = `${runId}_srv_ol_s2`;
       createdSessionIds.push(sessId1, sessId2);
 
+      // Foreign user to verify isolation: foreign session must never be modified
+      const foreignUser = await UserModel.create({
+        emailNormalized: `${runId}_srv_foreign_isolation@example.test`,
+        displayName: 'Foreign Isolation User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(foreignUser._id);
+
+      const foreignSessId = `${runId}_srv_foreign_s1`;
+      createdSessionIds.push(foreignSessId);
+
       const now = new Date();
       await SessionModel.create([
         {
@@ -1401,6 +1422,17 @@ describe.skipIf(!runLive)(
         {
           sessionId: sessId2,
           userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: foreignSessId,
+          userId: foreignUser._id,
           status: 'ACTIVE',
           generation: 1,
           epochAtIssue: 1,
@@ -1429,24 +1461,52 @@ describe.skipIf(!runLive)(
         }),
       ]);
 
-      // The session sessId1 MUST be revoked in all cases
+      // The targeted session sessId1 MUST be revoked in all cases
       const s1Final = await SessionModel.findOne({ sessionId: sessId1 });
       expect(s1Final?.status).toBe('REVOKED');
+      expect(['LOGOUT_ALL', 'USER_LOGOUT']).toContain(s1Final?.revokedReason);
 
       const freshUser = await UserModel.findById(user._id);
-      // Epoch must either be 1 (single logout won fence) or 2 (logout-all won), never corrupted or duplicated (>2)
+      // Epoch must either be 1 (single logout won) or 2 (logout-all won), never corrupted or duplicated (>2)
       expect([1, 2]).toContain(freshUser?.sessionEpoch);
 
       if (resAll.status === 'fulfilled') {
-        // If logout-all won, epoch was bumped to 2 and sessId2 was also revoked
+        // If logout-all won, exactly one global epoch increment occurred
         expect(freshUser?.sessionEpoch).toBe(2);
         const s2Final = await SessionModel.findOne({ sessionId: sessId2 });
         expect(s2Final?.status).toBe('REVOKED');
+        expect(s2Final?.revokedReason).toBe('LOGOUT_ALL');
       } else {
-        // If single logout won before logout-all's fence, logout-all was rejected with UnauthorizedError
-        expect(resAll.reason).toBeInstanceOf(UnauthorizedError);
+        // If single logout won before logout-all's fence, or MongoDB raised a write-conflict:
+        // Epoch must NOT be incremented
         expect(freshUser?.sessionEpoch).toBe(1);
+        const s2Final = await SessionModel.findOne({ sessionId: sessId2 });
+        // Unrelated session s2 must remain ACTIVE
+        expect(s2Final?.status).toBe('ACTIVE');
+
+        // Documented error classification check: must NEVER silently accept arbitrary database errors
+        const err = resAll.reason;
+        const isUnauthorized = err instanceof UnauthorizedError;
+        const isWriteConflict =
+          err &&
+          typeof err === 'object' &&
+          ((err as { code?: unknown }).code === 112 ||
+            (err as { codeName?: unknown }).codeName === 'WriteConflict' ||
+            (typeof (err as { hasErrorLabel?: unknown }).hasErrorLabel === 'function' &&
+              (err as { hasErrorLabel: (l: string) => boolean }).hasErrorLabel('TransientTransactionError')) ||
+            (Array.isArray((err as { errorLabels?: unknown }).errorLabels) &&
+              (err as { errorLabels: string[] }).errorLabels.includes('TransientTransactionError')) ||
+            (typeof (err as { message?: unknown }).message === 'string' &&
+              (err as { message: string }).message.includes('WriteConflict')));
+
+        expect(isUnauthorized || isWriteConflict).toBe(true);
       }
+
+      // Foreign user and foreign session must NEVER be modified regardless of race scheduling
+      const freshForeignUser = await UserModel.findById(foreignUser._id);
+      expect(freshForeignUser?.sessionEpoch).toBe(1);
+      const foreignSessionFinal = await SessionModel.findOne({ sessionId: foreignSessId });
+      expect(foreignSessionFinal?.status).toBe('ACTIVE');
     });
   });
 });

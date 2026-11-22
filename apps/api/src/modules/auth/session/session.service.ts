@@ -353,23 +353,25 @@ export class SessionService {
       throw new UnauthorizedError('Authentication credentials required for logout');
     }
 
-    // Revoke target session
+    // Revoke target session only if currently ACTIVE to preserve terminal status and revokedReason
     const session = await this.sessionModel.findOne({ sessionId: targetSessionId });
     if (!session) {
       // Nonexistent target session returns 404
       throw new NotFoundError('Session not found');
     }
 
-    await this.sessionModel.updateOne(
-      { sessionId: targetSessionId },
-      {
-        $set: {
-          status: 'REVOKED',
-          revokedAt: new Date(),
-          revokedReason: 'USER_LOGOUT',
-        },
-      }
-    );
+    if (session.status === 'ACTIVE') {
+      await this.sessionModel.updateOne(
+        { sessionId: targetSessionId, status: 'ACTIVE' },
+        {
+          $set: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            revokedReason: 'USER_LOGOUT',
+          },
+        }
+      );
+    }
 
     return { clearCookies: Boolean(rawRefreshToken) };
   }
