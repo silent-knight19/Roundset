@@ -11,6 +11,37 @@ export function sanitizeUri(rawUri?: string): string {
 }
 
 /**
+ * Strict schema for MOCK_DATABASE:
+ * Accepts only boolean true/false, string "true"/"false", or string "1"/"0".
+ * Rejects any other explicitly supplied value (such as "tru", "enabled", or "").
+ * Defaults to false when unset (undefined).
+ */
+const MockDatabaseSchema = z
+  .preprocess(
+    (val) => {
+      if (val === undefined) {
+        return false;
+      }
+      if (typeof val === 'string') {
+        return val.trim().toLowerCase();
+      }
+      return val;
+    },
+    z.union([
+      z.boolean(),
+      z.literal('true'),
+      z.literal('false'),
+      z.literal('1'),
+      z.literal('0'),
+    ], {
+      error: 'MOCK_DATABASE must be a boolean (true/false) or string ("true"/"false"/"1"/"0")',
+    })
+  )
+  .transform((val) => {
+    return val === true || val === 'true' || val === '1';
+  });
+
+/**
  * Zod schema for environment variables.
  */
 export const EnvSchema = z
@@ -20,14 +51,7 @@ export const EnvSchema = z
       .default('development'),
     PORT: z.coerce.number().int().min(1).max(65535).default(8787),
     WEB_ORIGIN: z.string().url().default('http://localhost:5173'),
-    MOCK_DATABASE: z
-      .preprocess((val) => {
-        if (typeof val === 'string') {
-          return val.toLowerCase() === 'true' || val === '1';
-        }
-        return Boolean(val);
-      }, z.boolean())
-      .default(false),
+    MOCK_DATABASE: MockDatabaseSchema,
     MONGODB_URI: z.string().min(1).optional(),
     TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
   })

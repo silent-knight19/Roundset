@@ -1,7 +1,6 @@
 import mongoose, { Connection } from 'mongoose';
 import type { Logger } from 'pino';
 import type { ReadinessProvider } from '../core/readiness.js';
-import { sanitizeUri } from '../config/env.js';
 
 export class MongoReadinessProvider implements ReadinessProvider {
   public readonly isMock = false;
@@ -15,8 +14,11 @@ export class MongoReadinessProvider implements ReadinessProvider {
 
 export class MongoManager {
   private isConnecting = false;
+  private listenersAttached = false;
 
-  constructor(private logger?: Logger) {}
+  constructor(private logger?: Logger) {
+    this.attachConnectionListeners();
+  }
 
   public get connection(): Connection {
     return mongoose.connection;
@@ -26,54 +28,81 @@ export class MongoManager {
     return new MongoReadinessProvider(mongoose.connection);
   }
 
+  private attachConnectionListeners(): void {
+    if (this.listenersAttached) return;
+    this.listenersAttached = true;
+
+    mongoose.connection.on('disconnected', () => {
+      this.logger?.warn(
+        { state: 'disconnected', category: 'DATABASE_LIFECYCLE' },
+        'Database disconnected; dependency readiness is false'
+      );
+    });
+
+    mongoose.connection.on('reconnected', () => {
+      this.logger?.info(
+        { state: 'reconnected', category: 'DATABASE_LIFECYCLE' },
+        'Database reconnected; dependency readiness is true'
+      );
+    });
+
+    mongoose.connection.on('error', () => {
+      this.logger?.error(
+        { state: 'error', category: 'DATABASE_RUNTIME_ERROR' },
+        'Database runtime error occurred'
+      );
+    });
+  }
+
   public async connect(uri: string): Promise<boolean> {
     if (this.isConnecting || mongoose.connection.readyState === 1) {
       return mongoose.connection.readyState === 1;
     }
 
-    const sanitized = sanitizeUri(uri);
     this.isConnecting = true;
 
     try {
-      this.logger?.info({ uri: sanitized }, 'Connecting to MongoDB...');
+      this.logger?.info(
+        { state: 'connecting', category: 'DATABASE_LIFECYCLE' },
+        'Database connection attempt initiated'
+      );
+
       await mongoose.connect(uri, {
         serverSelectionTimeoutMS: 5000,
         connectTimeoutMS: 5000,
       });
 
-      this.logger?.info('MongoDB connected successfully');
-
-      mongoose.connection.on('disconnected', () => {
-        this.logger?.warn('MongoDB disconnected; dependency readiness is false');
-      });
-
-      mongoose.connection.on('reconnected', () => {
-        this.logger?.info('MongoDB reconnected; dependency readiness is true');
-      });
-
-      mongoose.connection.on('error', (err) => {
-        this.logger?.error({ err }, 'MongoDB connection error');
-      });
+      this.logger?.info(
+        { state: 'connected', category: 'DATABASE_LIFECYCLE' },
+        'Database connection established'
+      );
 
       this.isConnecting = false;
       return true;
-    } catch (err) {
+    } catch {
       this.isConnecting = false;
       this.logger?.error(
-        { err: err instanceof Error ? err.message : String(err), uri: sanitized },
-        'Failed to connect to MongoDB within bounded timeout'
+        { state: 'failed', category: 'DATABASE_CONNECTION_TIMEOUT' },
+        'Database connection attempt failed within bounded timeout'
       );
       return false;
     }
   }
 
   public async disconnect(): Promise<void> {
+    this.isConnecting = false;
     if (mongoose.connection.readyState !== 0) {
       try {
         await mongoose.disconnect();
-        this.logger?.info('MongoDB disconnected cleanly');
-      } catch (err) {
-        this.logger?.error({ err }, 'Error during MongoDB disconnect');
+        this.logger?.info(
+          { state: 'disconnected', category: 'DATABASE_LIFECYCLE' },
+          'Database disconnected cleanly'
+        );
+      } catch {
+        this.logger?.error(
+          { state: 'disconnect_error', category: 'DATABASE_DISCONNECT_ERROR' },
+          'Error during database disconnect'
+        );
       }
     }
   }

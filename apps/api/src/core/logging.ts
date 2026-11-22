@@ -22,6 +22,12 @@ export const REDACTED_PATHS = [
   '*.mongodbUri',
   'uri',
   '*.uri',
+  'connectionString',
+  '*.connectionString',
+  'MONGODB_URI',
+  '*.MONGODB_URI',
+  'databaseUri',
+  '*.databaseUri',
 ];
 
 /**

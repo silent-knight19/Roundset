@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { loadEnv, sanitizeUri } from '../src/config/env.js';
 import { createLogger, REDACTED_PATHS } from '../src/core/logging.js';
 
-describe('Configuration & Security Guardrails (P1-T10, P1-T11)', () => {
+describe('Configuration & Security Guardrails (P1-T10, P1-T11, R1-03)', () => {
   it('P1-T10: Production environment rejects MOCK_DATABASE=true', () => {
     expect(() => {
       loadEnv({
@@ -39,6 +39,45 @@ describe('Configuration & Security Guardrails (P1-T10, P1-T11)', () => {
     expect(devConfig.TRUST_PROXY_HOPS).toBe(0);
   });
 
+  it('R1-03: MOCK_DATABASE accepts only approved boolean and string variants', () => {
+    // Boolean true/false
+    expect(loadEnv({ MOCK_DATABASE: true }).MOCK_DATABASE).toBe(true);
+    expect(loadEnv({ MOCK_DATABASE: false }).MOCK_DATABASE).toBe(false);
+
+    // String "true"/"false"
+    expect(loadEnv({ MOCK_DATABASE: 'true' }).MOCK_DATABASE).toBe(true);
+    expect(loadEnv({ MOCK_DATABASE: 'false' }).MOCK_DATABASE).toBe(false);
+
+    // String "1"/"0"
+    expect(loadEnv({ MOCK_DATABASE: '1' }).MOCK_DATABASE).toBe(true);
+    expect(loadEnv({ MOCK_DATABASE: '0' }).MOCK_DATABASE).toBe(false);
+
+    // Unset defaults to false
+    expect(loadEnv({}).MOCK_DATABASE).toBe(false);
+  });
+
+  it('R1-03: MOCK_DATABASE strictly rejects invalid explicitly supplied values', () => {
+    // "tru"
+    expect(() => loadEnv({ MOCK_DATABASE: 'tru' })).toThrow(
+      /MOCK_DATABASE must be a boolean \(true\/false\) or string \("true"\/"false"\/"1"\/"0"\)/
+    );
+
+    // "enabled"
+    expect(() => loadEnv({ MOCK_DATABASE: 'enabled' })).toThrow(
+      /MOCK_DATABASE must be a boolean \(true\/false\) or string \("true"\/"false"\/"1"\/"0"\)/
+    );
+
+    // empty string ""
+    expect(() => loadEnv({ MOCK_DATABASE: '' })).toThrow(
+      /MOCK_DATABASE must be a boolean \(true\/false\) or string \("true"\/"false"\/"1"\/"0"\)/
+    );
+
+    // Other non-approved strings
+    expect(() => loadEnv({ MOCK_DATABASE: 'yes' })).toThrow(/MOCK_DATABASE/);
+    expect(() => loadEnv({ MOCK_DATABASE: '2' })).toThrow(/MOCK_DATABASE/);
+    expect(() => loadEnv({ MOCK_DATABASE: null })).toThrow(/MOCK_DATABASE/);
+  });
+
   it('P1-T11: sanitizeUri redacts user credentials from connection strings', () => {
     const rawUri = 'mongodb+srv://admin_user:SuperSecretPassword123@cluster0.mongodb.net/roundset_db';
     const sanitized = sanitizeUri(rawUri);
@@ -55,6 +94,8 @@ describe('Configuration & Security Guardrails (P1-T10, P1-T11)', () => {
     expect(REDACTED_PATHS).toContain('*.password');
     expect(REDACTED_PATHS).toContain('*.token');
     expect(REDACTED_PATHS).toContain('*.secret');
+    expect(REDACTED_PATHS).toContain('connectionString');
+    expect(REDACTED_PATHS).toContain('MONGODB_URI');
 
     const logger = createLogger();
     expect(logger).toBeDefined();
