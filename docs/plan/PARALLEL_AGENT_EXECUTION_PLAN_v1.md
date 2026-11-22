@@ -118,4 +118,4 @@ Next integration dependency:
 - Reduce integration from large end-of-phase merges to small reviewed PRs.
 - Preserve sequential gates for auth security, billing and session correctness; **two agents does not guarantee 2× speed**.
 
-**NEXT ACTION:** Put the engineering pack in the new application repository's `docs/plan/`, run bootstrap as one small task, then launch Agent A (`P1-BE-01`) and Agent B (`P1-FE-01`) concurrently in separate worktrees. The prompts alongside this document are ready to paste into the two IDE agents.
+**NEXT ACTION (Phase 2):** Phase 1 is closed. Once the owner approves and merges the ADR-028 documentation-only D3 PR, the Principal Architect may authorize exactly one `P2-AUTH-01` database-model/index contract task on a separate branch. See [`PHASE_02_IDENTITY_EXECUTION_PLAN.md`](PHASE_02_IDENTITY_EXECUTION_PLAN.md). Until then no auth implementation is authorized.

@@ -2,6 +2,9 @@
 
 **Version:** 1.0 · **Status:** Implementation baseline, to be refined with versioned ADRs after tests. No API endpoints described here are claimed already implemented.
 
+
+> **Phase 2 auth contract precedence (ADR-028):** For all Phase 2 identity, registration, OTP, reauthentication, sessions, Google linking, password recovery and self-privacy endpoints, [`docs/phase2/P2_AUTH_API_CONTRACTS_v1.md`](phase2/P2_AUTH_API_CONTRACTS_v1.md) is authoritative. Legacy auth field names and route entries below are historical planning context, not implementation authorization. No Phase 2 auth routes are implemented as part of this documentation merge.
+
 ## 1. API conventions
 
 - Base `/api/v1`; HTTPS in deployment; JSON request/response; `Content-Type: application/json` except authorized upload and signed raw webhook endpoints.
@@ -20,19 +23,32 @@
 |---|---|---|---|
 | `/health/live` | GET | Public | `{ status:'ok', build }`, never credentials |
 | `/health/ready` | GET | Public-minimal or admin | `{ ready:boolean }`, no sensitive connection strings |
-| `/auth/register` | POST | Public/allowlist | Email+password creates unverified identity, starts email challenge |
-| `/auth/verify-email` | POST | Challenge | OTP proof, verify email, activate app account |
-| `/auth/login` | POST | Public | Email/password → app session |
-| `/auth/google/exchange` | POST | Firebase ID token | Server verifies Firebase ID token; maps/provisions identity; app session |
-| `/auth/otp/resend` | POST | Challenge/limited | Rotate challenge, throttle; no old OTP reuse |
-| `/auth/password/forgot` | POST | Public | Uniform success message to prevent enumeration |
-| `/auth/password/reset` | POST | Challenge | Verify reset token, set new Argon2id hash, revoke sessions |
-| `/auth/password/change` | POST | Auth | Current password/reauth proof required |
-| `/auth/refresh` | POST | Refresh cookie | Rotate session, issue access; replay revokes family |
-| `/auth/logout` | POST | Auth/refresh | Revoke this session and clear cookie |
-| `/auth/logout-all` | POST | Auth | Revoke all user sessions |
-| `/auth/identities/link-google` | POST | Auth+reauth | Verified identity linking, no email-only auto-merge |
-| `/auth/phone/start`, `/auth/phone/verify` | POST | Public/limited | Provider-neutral SMS OTP; dev mock vs real carefully differentiated |
+| `/auth/meta` | GET | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/register` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/verify-email` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/otp/resend` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/login` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/google/exchange` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/password/forgot` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/password/reset` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/reauth` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/password/change` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/refresh` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/logout` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/logout-all` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/identities/link-google` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/identities/link-password/start` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/identities/link-password` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/identities/:provider/unlink` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/sessions` | GET | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/sessions/:sessionId/revoke` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/phone/start` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/auth/phone/verify` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/me` | GET | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/me` | PATCH | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/me/consent` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/me/data-export` | GET | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
+| `/me/account/delete` | POST | See Phase 2 v1 | [Authoritative request/response and security contract](phase2/P2_AUTH_API_CONTRACTS_v1.md) — planned, not yet implemented |
 | `/me` | GET/PATCH | Auth | Self profile and allowed preferences only |
 | `/me/data-export` | POST/GET | Auth | Personal-data export independent of premium paywall |
 | `/me/account` | DELETE | Auth+reauth | Controlled deletion/anonymization; reversible stages per retention policy |
