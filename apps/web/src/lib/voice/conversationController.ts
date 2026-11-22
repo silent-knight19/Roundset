@@ -196,17 +196,26 @@ export class ConversationController {
         if (recOk) {
           const vadOk = await this.vadAdapter.initialize();
           if (!this.isRunning || currentSession !== this.sessionId) {
-            // Obsolete or stopped session: clean up immediately and ignore
-            await this.vadAdapter.cleanup();
-            this.recognitionAdapter.cleanup();
+            // Obsolete or stopped session: do not touch resources owned by subsequent sessions
             return;
           }
 
           if (vadOk) {
-            await this.vadAdapter.start();
-            this.microphoneActive = true;
-            voiceInputAvailable = true;
-            this.logEvent('Silero VAD initialized · microphone active');
+            const currentVadGen = this.vadAdapter.getStatus().generation;
+            const started = await this.vadAdapter.start(currentVadGen);
+            if (!this.isRunning || currentSession !== this.sessionId) {
+              return;
+            }
+
+            if (started) {
+              this.microphoneActive = true;
+              voiceInputAvailable = true;
+              this.logEvent('Silero VAD initialized · microphone active');
+            } else {
+              this.microphoneActive = false;
+              voiceInputAvailable = false;
+              this.logEvent('Silero VAD start failed; falling back to typed-only mode');
+            }
           } else {
             this.logEvent('VAD initialization returned false; falling back to typed-only mode');
           }
@@ -242,13 +251,14 @@ export class ConversationController {
   }
 
   public stopSession(): void {
+    const stoppingVadGen = this.vadAdapter.getStatus().generation;
     ++this.sessionId;
     this.isRunning = false;
     this.clearPendingAsync();
     this.clearTimers();
     this.recognitionAdapter.stop(false);
     this.recognitionAdapter.cleanup();
-    void this.vadAdapter.cleanup();
+    void this.vadAdapter.cleanup(stoppingVadGen);
     this.vadSpeech = false;
     this.microphoneActive = false;
     this.setStage('stopped');
@@ -484,12 +494,23 @@ export class ConversationController {
 
   private handleRecognitionError(error: string, isPermissionDenied: boolean): void {
     if (isPermissionDenied) {
+      const currentVadGen = this.vadAdapter.getStatus().generation;
       this.inputMode = 'typed_only';
       this.microphoneActive = false;
+      this.vadSpeech = false;
+
+      // Stop speech recognition and release recognition resources
+      this.recognitionAdapter.stop(false);
+      this.recognitionAdapter.cleanup();
+
+      // Dispose active microphone/VAD resources scoped to this generation
+      void this.vadAdapter.destroy(currentVadGen);
+
       this.setStatus(
         'Microphone/SpeechRecognition permission was denied. Switched to typed-answer mode.',
       );
-      this.logEvent('Microphone permission denied; switched to typed-only mode');
+      this.logEvent('Microphone permission denied; voice pipeline disposed; switched to typed-only mode');
+      this.emitState();
     } else if (error !== 'aborted' && error !== 'no-speech') {
       this.logEvent(`Speech recognition warning: ${error}`);
     }
@@ -497,6 +518,7 @@ export class ConversationController {
 
   public cleanup(): void {
     this.stopSession();
+    void this.vadAdapter.destroy();
     this.onStateChange = undefined;
   }
 }

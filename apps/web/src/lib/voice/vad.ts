@@ -20,6 +20,7 @@ export interface VADAdapterOptions {
 
 export class VADAdapter {
   private detector: VADInstance | null = null;
+  private detectorGeneration = 0;
   private currentGeneration = 0;
   private isInitializing = false;
   private isRunning = false;
@@ -38,10 +39,11 @@ export class VADAdapter {
   public async initialize(options?: VADAdapterOptions): Promise<boolean> {
     const sessionGeneration = ++this.currentGeneration;
 
-    // Dispose any previous instance permanently
+    // Dispose any previous instance permanently before creating a new one
     if (this.detector) {
       const prev = this.detector;
       this.detector = null;
+      this.detectorGeneration = 0;
       this.isRunning = false;
       try {
         await prev.destroy();
@@ -66,17 +68,17 @@ export class VADAdapter {
         redemptionMs: options?.redemptionMs ?? 950,
         preSpeechPadMs: options?.preSpeechPadMs ?? 450,
         onSpeechStart: () => {
-          if (this.isRunning && this.currentGeneration === sessionGeneration) {
+          if (this.isRunning && this.detectorGeneration === sessionGeneration) {
             this.callbacks.onSpeechStart?.();
           }
         },
         onSpeechEnd: () => {
-          if (this.isRunning && this.currentGeneration === sessionGeneration) {
+          if (this.isRunning && this.detectorGeneration === sessionGeneration) {
             this.callbacks.onSpeechEnd?.();
           }
         },
         onVADMisfire: () => {
-          if (this.currentGeneration === sessionGeneration) {
+          if (this.detectorGeneration === sessionGeneration) {
             this.callbacks.onVADMisfire?.();
           }
         },
@@ -93,10 +95,12 @@ export class VADAdapter {
       }
 
       this.detector = detector;
+      this.detectorGeneration = sessionGeneration;
       return true;
     } catch (error) {
       if (this.currentGeneration === sessionGeneration) {
         this.detector = null;
+        this.detectorGeneration = 0;
         this.isRunning = false;
         throw error;
       }
@@ -108,13 +112,34 @@ export class VADAdapter {
     }
   }
 
-  public async start(): Promise<void> {
-    if (!this.detector) return;
+  public async start(generation?: number): Promise<boolean> {
+    const targetGeneration = generation ?? this.detectorGeneration;
+    if (!this.detector || (targetGeneration !== 0 && this.detectorGeneration !== targetGeneration)) {
+      return false;
+    }
+
     try {
       await this.detector.start();
+      // Re-validate that ownership has not changed during asynchronous startup
+      if (!this.detector || (targetGeneration !== 0 && this.detectorGeneration !== targetGeneration)) {
+        return false;
+      }
       this.isRunning = true;
+      return true;
     } catch {
       this.isRunning = false;
+      // If startup fails, destroy the failed detector to prevent audio context / mic resource leaks
+      if (this.detector && (targetGeneration === 0 || this.detectorGeneration === targetGeneration)) {
+        const failedInstance = this.detector;
+        this.detector = null;
+        this.detectorGeneration = 0;
+        try {
+          await failedInstance.destroy();
+        } catch {
+          // Safe disposal
+        }
+      }
+      return false;
     }
   }
 
@@ -129,8 +154,28 @@ export class VADAdapter {
     }
   }
 
-  public async destroy(): Promise<void> {
-    // Invalidate any in-flight initialization
+  public async destroy(generation?: number): Promise<void> {
+    if (generation !== undefined) {
+      // Scoped destruction: only dispose if active detector belongs to specified generation
+      if (this.detector && this.detectorGeneration === generation) {
+        const instance = this.detector;
+        this.detector = null;
+        this.detectorGeneration = 0;
+        this.isRunning = false;
+        try {
+          await instance.destroy();
+        } catch {
+          // Safe disposal
+        }
+      }
+      if (this.currentGeneration === generation) {
+        ++this.currentGeneration;
+        this.isInitializing = false;
+      }
+      return;
+    }
+
+    // Unscoped destruction: permanently dispose active detector and advance generation
     ++this.currentGeneration;
     this.isRunning = false;
     this.isInitializing = false;
@@ -138,6 +183,7 @@ export class VADAdapter {
     if (this.detector) {
       const instance = this.detector;
       this.detector = null;
+      this.detectorGeneration = 0;
       try {
         await instance.destroy();
       } catch {
@@ -146,8 +192,8 @@ export class VADAdapter {
     }
   }
 
-  public async cleanup(): Promise<void> {
-    await this.destroy();
+  public async cleanup(generation?: number): Promise<void> {
+    await this.destroy(generation);
   }
 
   public getStatus(): {
@@ -155,12 +201,14 @@ export class VADAdapter {
     isInitializing: boolean;
     hasInstance: boolean;
     generation: number;
+    detectorGeneration: number;
   } {
     return {
       isRunning: this.isRunning,
       isInitializing: this.isInitializing,
       hasInstance: Boolean(this.detector),
       generation: this.currentGeneration,
+      detectorGeneration: this.detectorGeneration,
     };
   }
 }

@@ -223,4 +223,97 @@ describe('VADAdapter (Silero VAD Web Adapter - R1 Lifecycle & Race Invalidation)
     expect(adapter.getStatus().isRunning).toBe(false);
     expect(adapter.getStatus().hasInstance).toBe(false);
   });
+
+  describe('R2-01 & R2-02: Scoped Destruction and Reliable Start Activation Reporting', () => {
+    it('returns true from start() when detector starts successfully (R2-02)', async () => {
+      const adapter = new VADAdapter();
+      await adapter.initialize();
+
+      const started = await adapter.start();
+      expect(started).toBe(true);
+      expect(adapter.getStatus().isRunning).toBe(true);
+      expect(mockVADInstance.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns false and destroys failed detector when detector.start() throws synchronously (R2-02)', async () => {
+      mockVADInstance.start.mockImplementationOnce(() => {
+        throw new Error('AudioContext failed to start synchronously');
+      });
+
+      const adapter = new VADAdapter();
+      await adapter.initialize();
+
+      const started = await adapter.start();
+      expect(started).toBe(false);
+      expect(adapter.getStatus().isRunning).toBe(false);
+      expect(adapter.getStatus().hasInstance).toBe(false);
+      expect(mockVADInstance.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns false and destroys failed detector when detector.start() rejects asynchronously (R2-02)', async () => {
+      mockVADInstance.start.mockRejectedValueOnce(
+        new Error('Asynchronous audio pipeline startup failure'),
+      );
+
+      const adapter = new VADAdapter();
+      await adapter.initialize();
+
+      const started = await adapter.start();
+      expect(started).toBe(false);
+      expect(adapter.getStatus().isRunning).toBe(false);
+      expect(adapter.getStatus().hasInstance).toBe(false);
+      expect(mockVADInstance.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not destroy new detector when scoped destroy(olderGen) is invoked from obsolete session (R2-01)', async () => {
+      const detectorA = {
+        start: vi.fn().mockResolvedValue(undefined),
+        pause: vi.fn().mockResolvedValue(undefined),
+        destroy: vi.fn().mockResolvedValue(undefined),
+      };
+      const detectorB = {
+        start: vi.fn().mockResolvedValue(undefined),
+        pause: vi.fn().mockResolvedValue(undefined),
+        destroy: vi.fn().mockResolvedValue(undefined),
+      };
+
+      vi.mocked(MicVAD.new)
+        .mockResolvedValueOnce(detectorA as unknown as Awaited<ReturnType<typeof MicVAD.new>>)
+        .mockResolvedValueOnce(detectorB as unknown as Awaited<ReturnType<typeof MicVAD.new>>);
+
+      const adapter = new VADAdapter();
+      await adapter.initialize();
+      const genA = adapter.getStatus().generation;
+
+      // Initialize session B
+      await adapter.initialize();
+      const genB = adapter.getStatus().generation;
+      expect(genB).toBeGreaterThan(genA);
+      expect(detectorA.destroy).toHaveBeenCalledTimes(1); // detectorA was cleanly destroyed during initialize B
+
+      // Session A calls scoped destroy(genA) late
+      await adapter.destroy(genA);
+
+      // Detector B must NOT be destroyed
+      expect(detectorB.destroy).not.toHaveBeenCalled();
+      expect(adapter.getStatus().hasInstance).toBe(true);
+
+      // Scoped destroy for genB properly disposes detector B
+      await adapter.destroy(genB);
+      expect(detectorB.destroy).toHaveBeenCalledTimes(1);
+      expect(adapter.getStatus().hasInstance).toBe(false);
+    });
+
+    it('returns false from start(olderGen) if generation is already superseded (R2-02)', async () => {
+      const adapter = new VADAdapter();
+      await adapter.initialize();
+      const genA = adapter.getStatus().generation;
+
+      await adapter.initialize(); // Advances generation to B
+
+      const started = await adapter.start(genA);
+      expect(started).toBe(false);
+      expect(adapter.getStatus().isRunning).toBe(false);
+    });
+  });
 });

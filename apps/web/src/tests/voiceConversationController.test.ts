@@ -19,6 +19,7 @@ describe('ConversationController', () => {
     initialize: ReturnType<typeof vi.fn>;
     start: ReturnType<typeof vi.fn>;
     pause: ReturnType<typeof vi.fn>;
+    destroy: ReturnType<typeof vi.fn>;
     cleanup: ReturnType<typeof vi.fn>;
     getStatus: ReturnType<typeof vi.fn>;
     callbacks?: vadModule.VADCallbacks;
@@ -53,10 +54,17 @@ describe('ConversationController', () => {
 
     mockVADAdapter = {
       initialize: vi.fn().mockResolvedValue(true),
-      start: vi.fn(),
-      pause: vi.fn(),
-      cleanup: vi.fn(),
-      getStatus: vi.fn().mockReturnValue({ isRunning: false, isInitializing: false, hasInstance: true }),
+      start: vi.fn().mockResolvedValue(true),
+      pause: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      getStatus: vi.fn().mockReturnValue({
+        isRunning: false,
+        isInitializing: false,
+        hasInstance: true,
+        generation: 1,
+        detectorGeneration: 1,
+      }),
     };
 
     vi.spyOn(vadModule, 'VADAdapter').mockImplementation(
@@ -418,6 +426,139 @@ describe('ConversationController', () => {
     audioCallbacks.onEnded?.();
     expect(controller.getState().stage).toBe('listening');
     expect(controller.getState().status).toContain('Type your answer');
+  });
+
+  it('R2-01: Session A initialization resolution never destroys Session B detector', async () => {
+    let resolveSessionAInit: (val: boolean) => void = () => {};
+    const pendingSessionAPromise = new Promise<boolean>((resolve) => {
+      resolveSessionAInit = resolve;
+    });
+
+    mockVADAdapter.initialize
+      .mockReturnValueOnce(pendingSessionAPromise)
+      .mockResolvedValueOnce(true);
+
+    const controller = new ConversationController();
+
+    // 1. Begin Session A with VAD initialization pending
+    const sessionAPromise = controller.startSession();
+    expect(controller.getState().stage).toBe('setup');
+
+    // 2. Stop A
+    controller.stopSession();
+    expect(controller.getState().stage).toBe('stopped');
+
+    // 3. Start Session B and successfully initialize its detector
+    const sessionBPromise = controller.startSession();
+    await vi.waitFor(() => {
+      expect(controller.getState().stage).toBe('generating');
+    });
+
+    // Reset destroy mock call history after session A's stop
+    mockVADAdapter.destroy.mockClear();
+    mockVADAdapter.cleanup.mockClear();
+
+    // 4. Resolve A's initialization
+    resolveSessionAInit(false);
+    await sessionAPromise;
+
+    // 5. Assert B's detector remains active, destruction was not called on B, and B continues
+    expect(mockVADAdapter.destroy).not.toHaveBeenCalled();
+    expect(mockVADAdapter.cleanup).not.toHaveBeenCalled();
+    expect(controller.getState().stage).toBe('generating');
+    expect(controller.getState().microphoneActive).toBe(true);
+
+    // B continues receiving speech callbacks
+    audioCallbacks.onPlaying?.();
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+
+    mockVADAdapter.callbacks?.onSpeechStart?.();
+    expect(controller.getState().vadSpeech).toBe(true);
+
+    await sessionBPromise;
+  });
+
+  it('R2-02: handles VAD startup failure when start() throws or rejects', async () => {
+    mockVADAdapter.start.mockRejectedValueOnce(new Error('AudioContext failed to start'));
+
+    const controller = new ConversationController();
+    await controller.startSession();
+
+    // Must fall back to typed-only mode with microphoneActive = false
+    expect(controller.getState().inputMode).toBe('typed_only');
+    expect(controller.getState().microphoneActive).toBe(false);
+    expect(controller.getState().stage).toBe('generating');
+
+    // Speaks initial question
+    audioCallbacks.onPlaying?.();
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+
+    // Candidate submits typed answer and receives follow-up
+    await controller.submitAnswer('Typed fallback response after start failure');
+    expect(controller.getState().messages[1]?.text).toBe(
+      'Typed fallback response after start failure',
+    );
+  });
+
+  it('R2-02: does not mark session active if stopped during pending VAD start', async () => {
+    let resolveStart: (val: boolean) => void = () => {};
+    mockVADAdapter.start.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+
+    const controller = new ConversationController();
+    const startPromise = controller.startSession();
+    expect(controller.getState().stage).toBe('setup');
+
+    // Stop while start() is in flight
+    controller.stopSession();
+    expect(controller.getState().stage).toBe('stopped');
+
+    // Late start resolution
+    resolveStart(true);
+    await startPromise;
+
+    // Must remain stopped; microphoneActive must be false
+    expect(controller.getState().stage).toBe('stopped');
+    expect(controller.getState().microphoneActive).toBe(false);
+  });
+
+  it('R2-03: releases VAD detector and recognition on runtime permission denial while preserving typed flow and draft', async () => {
+    const controller = new ConversationController();
+    await controller.startSession();
+
+    audioCallbacks.onPlaying?.();
+    audioCallbacks.onEnded?.();
+    expect(controller.getState().stage).toBe('listening');
+    expect(controller.getState().microphoneActive).toBe(true);
+
+    // Candidate entered draft text before permission error
+    controller.updateDraft('Candidate partially typed text');
+
+    // Trigger runtime permission denial
+    mockRecognitionAdapter.callbacks?.onError?.('not-allowed', true);
+
+    // Assert typed-only mode is entered
+    expect(controller.getState().inputMode).toBe('typed_only');
+    expect(controller.getState().microphoneActive).toBe(false);
+
+    // Assert user-entered draft text is preserved
+    expect(controller.getState().draft).toBe('Candidate partially typed text');
+
+    // Assert VAD destruction and recognition cleanup occurred
+    expect(mockVADAdapter.destroy).toHaveBeenCalled();
+    expect(mockRecognitionAdapter.cleanup).toHaveBeenCalled();
+
+    // Confirm candidate can still submit answer and receive scripted follow-up
+    await controller.submitAnswer('Candidate partially typed text');
+    const msgs = controller.getState().messages;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[1]?.text).toBe('Candidate partially typed text');
+    expect(msgs[2]?.role).toBe('interviewer');
   });
 
   it('resets session metrics and state cleanly', async () => {

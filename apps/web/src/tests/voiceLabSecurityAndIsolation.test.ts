@@ -64,11 +64,11 @@ describe('Voice Lab Security, Privacy & Production Isolation (R4)', () => {
         function (this: unknown, cbs?: vadModule.VADCallbacks) {
           return {
             initialize: vi.fn().mockResolvedValue(true),
-            start: vi.fn().mockResolvedValue(undefined),
+            start: vi.fn().mockResolvedValue(true),
             pause: vi.fn().mockResolvedValue(undefined),
             destroy: vi.fn().mockResolvedValue(undefined),
             cleanup: vi.fn().mockResolvedValue(undefined),
-            getStatus: vi.fn().mockReturnValue({ isRunning: false, isInitializing: false, hasInstance: true, generation: 1 }),
+            getStatus: vi.fn().mockReturnValue({ isRunning: false, isInitializing: false, hasInstance: true, generation: 1, detectorGeneration: 1 }),
             callbacks: cbs,
           } as unknown as vadModule.VADAdapter;
         },
