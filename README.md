@@ -15,7 +15,7 @@ Phase 1 (Monorepo Foundation, Express API, React/Vite UI Shell, Shared Zod Contr
 - **Frontend PR:** [PR #3](https://github.com/silent-knight19/Roundset/pull/3) (merged at `65a2782`)
 - **Integration & Lockfile Reconciliation:** Merged at `1c9be95`
 - **Total Test Coverage:** 75/75 tests passing across 11 test suites
-- **Security & CodeQL:** 0 vulnerabilities, 0 CodeQL alerts
+- **Security & CodeQL:** CodeQL automated scanning workflows completed successfully on GitHub Actions, and the repository's Code Scanning tab independently reports **0 open security alerts**.
 
 Subsequent phases (Phase 2 Identity through Phase 11 Deployment) are scheduled and pending architectural kickoff. See [Unimplemented Features & Next Phases](#unimplemented-features--next-phases).
 
@@ -33,20 +33,22 @@ Roundset/
 ├── packages/
 │   └── contracts/       # @roundset/contracts (Shared Zod runtime schemas & DTO types)
 ├── docs/
-│   ├── ADR/             # Approved Architecture Decision Records
-│   ├── TEST_EVIDENCE/   # Executed test logs, verification records, and screenshots
+│   ├── ADR/             # ADR process and guidelines
+│   ├── TEST_EVIDENCE/   # Executed test logs and verification records
 │   ├── tasks/           # Architect-authored atomic task specifications
 │   ├── plan/            # Agent planning and execution roadmaps
+│   ├── ARCHITECTURE.md  # System architecture specification
 │   └── IMPLEMENTATION_TRACKER.md # Live phase-by-phase completion tracker
-├── legacy/              # Historical research and Phase 0 discovery records
-└── reference-prototypes/# Validated voice/audio prototypes and baseline metrics
+└── legacy/              # Historical research and Phase 0 discovery records
 ```
+
+> **Note on Voice Prototype Archives:** The feasibility voice prototype (Kokoro WebGPU TTS, Silero VAD, Web Speech STT) and historical Groq Qwen inference metrics from Phase 0 are preserved in external project feasibility archives (`ai-interviewer-conversation-poc.zip`). They are kept separate from the application codebase and are not committed source assets.
 
 ---
 
 ## Prerequisites
 
-- **Node.js**: `v22.x` LTS (enforced via `.nvmrc` and `.node-version`)
+- **Node.js**: `v22.x` LTS (enforced via `.nvmrc`)
 - **npm**: `10.x` or higher (native npm workspaces only; pnpm, Yarn, Turborepo, and Nx are prohibited)
 - **Git**: Isolated atomic task branching per [`AGENTS.md`](AGENTS.md)
 
@@ -96,12 +98,16 @@ Roundset implements strict, independent HTTP liveness and dependency readiness e
 
 ### Development-Only Mock Mode
 
-When developing locally without a running MongoDB instance:
+When developing locally without a running MongoDB instance, start the API service with the `MOCK_DATABASE` environment variable set:
 
-- Set `MOCK_DATABASE=true` in `apps/api/.env` (or via environment).
+```bash
+MOCK_DATABASE=true npm run dev:api
+```
+
 - The API will log a visible warning banner: `[DEVELOPMENT MOCK] MOCK_DATABASE=true is active. Mock readiness enabled.` and report `ready: true` on `/api/v1/health/ready`.
 - **Production Guardrail:** `MOCK_DATABASE=true` is strictly rejected by Zod environment schema validation when `NODE_ENV=production`.
 - **Note on Connectivity:** Development mock readiness serves exclusively for frontend contract testing. It does **not** demonstrate real MongoDB connectivity.
+- **Environment Invariant:** The application loads configuration directly from `process.env`. Do not rely on unapproved environment-loading packages or uncommitted `.env` files.
 
 ---
 
@@ -124,6 +130,7 @@ All commands are executed from the monorepo root:
 
 ## Canonical Architecture Documents & Evidence
 
+- **System Architecture:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Master Roadmap:** [`AI_INTERVIEWER_MASTER_ENGINEERING_ROADMAP_v1.md`](AI_INTERVIEWER_MASTER_ENGINEERING_ROADMAP_v1.md)
 - **Phase 1 Coding Brief:** [`docs/PHASE_01_CODING_BRIEF.md`](docs/PHASE_01_CODING_BRIEF.md)
 - **API & Data Contracts:** [`docs/API_AND_DATA_CONTRACTS.md`](docs/API_AND_DATA_CONTRACTS.md)
@@ -132,7 +139,7 @@ All commands are executed from the monorepo root:
 - **Governance Agreement:** [`AGENTS.md`](AGENTS.md)
 
 ### Phase 1 Verification Evidence:
-- **Full-Stack Integration Evidence:** [`docs/TEST_EVIDENCE/phase-01.md`](docs/TEST_EVIDENCE/phase-01.md)
+- **Full-Stack Integration Evidence:** [`docs/TEST_EVIDENCE/phase-01.md`](docs/TEST_EVIDENCE/phase-01.md) *(Note: Visual smoke-test screenshots referenced in reports were captured locally during browser verification and are not committed repository assets)*
 - **Backend Test Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](docs/TEST_EVIDENCE/P1-BE-01.md)
 - **Frontend Test Evidence:** [`apps/web/TEST_EVIDENCE/P1-FE-01.md`](apps/web/TEST_EVIDENCE/P1-FE-01.md)
 - **Bootstrap Evidence:** [`docs/TEST_EVIDENCE/P1-FND-01.md`](docs/TEST_EVIDENCE/P1-FND-01.md)
@@ -146,7 +153,7 @@ In accordance with [`AGENTS.md`](AGENTS.md), Phase 1 established foundational pl
 - **Phase 2 — Identity & Authentication:** No user accounts, Google Sign-In token verification, Argon2id password registration, email OTP, or session JWT refresh rotation exist yet.
 - **Phase 3 & 10 — Entitlements, Quotas & Billing:** No payment gateways, credit reservation ledgers, or checkout flows exist. The `/pricing` page renders an informative placeholder.
 - **Phase 4 — AI & Interview Orchestration:** No LLM providers (Groq Qwen / Cloudflare AI), interview state machine, prompts, or dynamic question generation exist. The `/interview` route displays a roadmap placeholder.
-- **Phase 5 — Voice & Audio:** Voice models (Kokoro WebGPU TTS, Silero VAD, Web Speech STT) remain archived in `reference-prototypes/` and are not connected to the application shell.
+- **Phase 5 — Voice & Audio:** Voice models (Kokoro WebGPU TTS, Silero VAD, Web Speech STT) remain archived in external feasibility prototypes and are not connected to the application shell.
 - **Phase 6 — Integrity & Proctoring:** MediaPipe face detection, fullscreen monitoring, and clipboard violation reducers are not mounted.
 - **Phase 7 — Evaluation & Scoring:** Automated rubrics, candidate scoring algorithms, and PDF report generators are not implemented.
 - **Phase 8 — Coding & Personalization:** Monaco coding editor and resume parsing are not implemented.

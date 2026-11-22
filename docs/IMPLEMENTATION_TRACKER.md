@@ -53,22 +53,22 @@ All Phase 1 foundational engineering tasks (`P1-FND-01` through `P1-FND-08`) hav
   - **Status:** Complete.
   - **PR & Merge Commit:** Merged via PR #2 (`2754ef1`), PR #3 (`65a2782`), and integration commit `1c9be95`.
   - **Evidence:** [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md) and [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-  - **Verification:** 75/75 automated tests passing across 11 test suites (11 contracts, 35 API, 29 web). Full monorepo build (`npm run build`), strict typecheck (`npm run typecheck`), linting (`npm run lint`), and audit (`npm audit`) passing with exit code 0. GitHub Actions CI workflow running on `ubuntu-latest`, Node.js 22, with `contents: read` permissions. CodeQL security scanning passing with 0 alerts.
+  - **Verification:** 75/75 automated tests passing across 11 test suites (11 contracts, 35 API, 29 web). Full monorepo build (`npm run build`), strict typecheck (`npm run typecheck`), linting (`npm run lint`), and audit (`npm audit`) passing with exit code 0. GitHub Actions CI workflow running on `ubuntu-latest`, Node.js 22, with `contents: read` permissions. GitHub CodeQL analysis workflows passing, with the repository's security tab independently verified with 0 open security alerts.
   - **Limitations:** End-to-end browser automation (Playwright) deferred to Phase 11; current testing combines Vitest, Supertest, React Testing Library, and live smoke testing.
 
 - [x] **P1-FND-07 — Validated config, env/redaction, session-origin ADR.**
   - **Status:** Complete.
   - **PR & Merge Commit:** Implemented under `P1-BE-01`, merged via PR #2 (`2754ef1`).
   - **Evidence:** [`docs/TEST_EVIDENCE/P1-BE-01.md`](TEST_EVIDENCE/P1-BE-01.md) and [`docs/ENGINEERING_RESEARCH_AND_ADRS.md`](ENGINEERING_RESEARCH_AND_ADRS.md).
-  - **Verification:** Strict Zod environment schema in `apps/api/src/config/env.ts` rejecting invalid or unknown options; production guardrails; sensitive data redaction in Pino operational logs (`apps/api/src/core/logging.ts`); Helmet CSP defaults; CORS rejection of unapproved browser origins; ADR-001 (Cookie/Origin Architecture) and ADR-002 (Provider Strategy) approved and documented.
+  - **Verification:** Strict Zod environment schema in `apps/api/src/config/env.ts` validating required configuration and coercion, rejecting invalid values (such as malformed URLs, non-integer ports, or invalid MOCK_DATABASE representations), and enforcing production guardrails; sensitive data redaction in Pino operational logs (`apps/api/src/core/logging.ts`); Helmet CSP defaults; CORS rejection of unapproved browser origins; and alignment with established architectural research decisions (ADR-017 for modular architecture, ADR-023 for same-origin proxy, and ADR-027 for origin/session protections documented in [`docs/ENGINEERING_RESEARCH_AND_ADRS.md`](ENGINEERING_RESEARCH_AND_ADRS.md)).
   - **Limitations:** Optional provider credentials (Firebase, Groq, Cloudflare, Brevo) defined in `.env.example` as placeholders but not connected in Phase 1.
 
 - [x] **P1-FND-08 — README, architecture docs, evidence, reviewed first commit.**
   - **Status:** Complete.
-  - **PR & Merge Commit:** Executed under `P1-CLOSE-01` on branch `chore/phase-1-closure`.
-  - **Evidence:** [`README.md`](../README.md) and [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md).
-  - **Verification:** Consolidated developer README with accurate Node 22 setup, local startup instructions for API and web, health/readiness documentation, mock database mode explanations, links to test evidence, and explicit disclosures of unimplemented Phase 2–11 features.
-  - **Limitations:** Full system deployment deferred to Phase 11.
+  - **PR & Merge Commit:** Executed under `P1-CLOSE-01` on branch `chore/phase-1-closure` (PR #4).
+  - **Evidence:** [`docs/ARCHITECTURE.md`](ARCHITECTURE.md), [`README.md`](../README.md), and [`docs/TEST_EVIDENCE/phase-01.md`](TEST_EVIDENCE/phase-01.md).
+  - **Verification:** Delivered comprehensive system architecture specification in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md), updated developer [`README.md`](../README.md) with accurate Node 22 setup, local startup instructions (`npm run dev:api` and `npm run dev:web`), explicit `MOCK_DATABASE=true` environment command without unapproved `.env` loading dependencies, health/readiness documentation, links to test evidence, and honest disclosures of unimplemented Phase 2–11 features.
+  - **Limitations:** Production cloud deployment deferred to Phase 11.
 
 ## Phase 2 — Identity
 
@@ -149,4 +149,4 @@ All Phase 1 foundational engineering tasks (`P1-FND-01` through `P1-FND-08`) hav
 | 2026-11-22 | P1-BE-01 (Backend API & Readiness) | PR #2 (merge `2754ef1`, commit `2105542`) | Express API, Mongoose readiness, CI, 35 tests pass |
 | 2026-11-22 | P1-FE-01 (Frontend Shell & Health UI) | PR #3 (merge `65a2782`, commit `a468fcf`) | React 19 / Vite 8 UI shell, health matrix, 29 tests pass |
 | 2026-11-22 | P1-INT-01 (Full-Stack Monorepo Integration) | Commit `1c9be95`, `docs/TEST_EVIDENCE/phase-01.md` | Monorepo reconciled, 75/75 tests pass, smoke verified |
-| 2026-11-22 | P1-CLOSE-01 (Phase 1 Repository Closure) | Branch `chore/phase-1-closure` | Documentation & tracker closed; ready for Phase 2 |
+| 2026-11-22 | P1-CLOSE-01 (Phase 1 Repository Closure) | PR #4, `docs/ARCHITECTURE.md` | Documentation, architecture, and tracker closed; ready for Phase 2 |
