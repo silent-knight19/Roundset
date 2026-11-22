@@ -124,4 +124,61 @@ describe('Shared Contracts Smoke Tests', () => {
     const result = LivenessResponseSchema.safeParse(malformedLiveness);
     expect(result.success).toBe(false);
   });
+
+  // Targeted compatibility regression tests for Zod 4 migration
+  it('validates API error when optional details field is omitted', () => {
+    const errorWithoutDetails = {
+      error: {
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'Internal error occurred',
+        requestId: 'req_no_details_123',
+      },
+    };
+
+    const result = ApiErrorResponseSchema.safeParse(errorWithoutDetails);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.error.details).toBeUndefined();
+    }
+  });
+
+  it('rejects empty string requestId under strict validation', () => {
+    const emptyRequestIdPayload = {
+      data: {
+        status: 'ok' as const,
+        version: '0.1.0',
+      },
+      meta: {
+        requestId: '',
+      },
+    };
+
+    const result = LivenessResponseSchema.safeParse(emptyRequestIdPayload);
+    expect(result.success).toBe(false);
+  });
+
+  it('validates record details structure in API error', () => {
+    const errorWithNestedDetails = {
+      error: {
+        code: 'VALIDATION_FAILED',
+        message: 'Invalid payload submitted',
+        requestId: 'req_val_456',
+        details: {
+          field: 'email',
+          issues: ['format', 'domain'],
+          attempt: 1,
+        },
+      },
+    };
+
+    const result = ApiErrorResponseSchema.safeParse(errorWithNestedDetails);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.error.details).toEqual({
+        field: 'email',
+        issues: ['format', 'domain'],
+        attempt: 1,
+      });
+    }
+  });
 });
