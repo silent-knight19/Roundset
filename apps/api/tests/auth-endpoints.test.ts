@@ -1018,6 +1018,145 @@ describe('P2-AUTH-05a: Auth HTTP Endpoints Suite', () => {
       expect(sessionUpdateManySpy).not.toHaveBeenCalled();
     });
 
+    it('sanitizes public database errors without exposing sensitive connection strings or internal details', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_sensitive_error_leak_test';
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      const sensitiveInternalError = new Error(
+        'MongoServerSelectionError: connection failed to mongodb://admin_user:SuperSecretPassword123@internal-db-node-01.corp.roundset.internal:27017/roundset_prod?authSource=admin&replicaSet=rs0'
+      );
+      vi.spyOn(mongoose.connection, 'startSession').mockRejectedValue(sensitiveInternalError);
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
+      expect(res.body.error.message).toBe('Database transactions are unavailable');
+
+      // Assert that no sensitive substring appears anywhere in the HTTP response
+      const responseText = JSON.stringify(res.body) + (res.text ?? '');
+      expect(responseText).not.toContain('SuperSecretPassword123');
+      expect(responseText).not.toContain('internal-db-node-01');
+      expect(responseText).not.toContain('roundset.internal');
+      expect(responseText).not.toContain('roundset_prod');
+      expect(responseText).not.toContain('27017');
+      expect(responseText).not.toContain('mongodb://');
+      expect(responseText).not.toContain('admin_user');
+      expect(responseText).not.toContain('MongoServerSelectionError');
+    });
+
+    it('returns 503 SERVICE_UNAVAILABLE and zero writes when standalone topology rejects first transactional operation', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_standalone_first_op_fail';
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      let inTx = false;
+      let aborted = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => { inTx = false; }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+
+      // Standalone MongoDB accepted startTransaction() locally, but rejects the first transactional write
+      const standaloneError = new Error('Transaction numbers are only allowed on a replica set member or mongos');
+      (standaloneError as unknown as { code: number; codeName: string }).code = 20;
+      (standaloneError as unknown as { code: number; codeName: string }).codeName = 'IllegalOperation';
+
+      // First transactional operation is initiating session write-fence: SessionModel.updateOne
+      const sessionFenceSpy = vi.spyOn(SessionModel, 'updateOne').mockRejectedValue(standaloneError);
+      const userUpdateSpy = vi.spyOn(UserModel, 'updateOne');
+      const sessionUpdateManySpy = vi.spyOn(SessionModel, 'updateMany');
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
+      expect(res.body.error.message).toBe('Database transactions are not supported');
+      expect(sessionFenceSpy).toHaveBeenCalled();
+      expect(mockClientSession.abortTransaction).toHaveBeenCalled();
+      expect(aborted).toBe(true);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
+
+      // Zero successful state mutations: user epoch CAS and updateMany must NOT be executed
+      expect(userUpdateSpy).not.toHaveBeenCalled();
+      expect(sessionUpdateManySpy).not.toHaveBeenCalled();
+    });
+
+    it('preserves ordinary unexpected database errors during first transactional operation as 500 server error', async () => {
+      const userId = new Types.ObjectId();
+      const sessionId = 'sess_ordinary_db_error';
+      const bearer = await signAccessToken(keyring, {
+        userId: String(userId),
+        sessionId,
+        epoch: 1,
+      });
+
+      vi.spyOn(UserModel, 'findById').mockResolvedValue({
+        _id: userId,
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+      } as unknown as UserDocument);
+
+      let inTx = false;
+      let aborted = false;
+      const mockClientSession = {
+        startTransaction: vi.fn(() => { inTx = true; }),
+        commitTransaction: vi.fn(async () => { inTx = false; }),
+        abortTransaction: vi.fn(async () => { inTx = false; aborted = true; }),
+        endSession: vi.fn(async () => {}),
+        inTransaction: vi.fn(() => inTx),
+      };
+
+      vi.spyOn(mongoose.connection, 'startSession').mockResolvedValue(mockClientSession as unknown as mongoose.ClientSession);
+
+      // Ordinary unexpected database error (e.g. disk or connection dropped), NOT an unsupported transaction error
+      const diskError = new Error('I/O error reading database catalog');
+      vi.spyOn(SessionModel, 'updateOne').mockRejectedValue(diskError);
+
+      const res = await request(app)
+        .post('/api/v1/auth/logout-all')
+        .set('Origin', allowedOrigin)
+        .set('Authorization', `Bearer ${bearer}`)
+        .send({});
+
+      // Ordinary unexpected failure must be preserved as 500 server error, not 503
+      expect(res.status).toBe(500);
+      expect(res.body.error.code).toBe('INTERNAL_ERROR');
+      expect(mockClientSession.abortTransaction).toHaveBeenCalled();
+      expect(aborted).toBe(true);
+      expect(mockClientSession.endSession).toHaveBeenCalled();
+    });
+
     it('rolls back all mutations if session revocation fails after epoch update', async () => {
       const userId = new Types.ObjectId();
       const sessionId = 'sess_tx_rollback_test';

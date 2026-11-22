@@ -399,23 +399,19 @@ export class SessionService {
     let clientSession: ClientSession;
     try {
       clientSession = await connection.startSession();
-    } catch (startErr) {
-      throw new ServiceUnavailableError(
-        `Database transaction session unavailable: ${startErr instanceof Error ? startErr.message : String(startErr)}`
-      );
+    } catch {
+      throw new ServiceUnavailableError('Database transactions are unavailable');
     }
 
     try {
       clientSession.startTransaction();
-    } catch (txErr) {
+    } catch {
       try {
         await clientSession.endSession();
       } catch {
         // Ignore secondary cleanup error
       }
-      throw new ServiceUnavailableError(
-        `Database transactions are not supported: ${txErr instanceof Error ? txErr.message : String(txErr)}`
-      );
+      throw new ServiceUnavailableError('Database transactions are not supported');
     }
 
     try {
@@ -549,6 +545,9 @@ export class SessionService {
           // Ignore secondary abort failure
         }
       }
+      if (this.isTransactionNotSupportedError(err)) {
+        throw new ServiceUnavailableError('Database transactions are not supported');
+      }
       throw err;
     } finally {
       try {
@@ -557,6 +556,35 @@ export class SessionService {
         // Ignore secondary endSession failure
       }
     }
+  }
+
+  private isTransactionNotSupportedError(err: unknown): boolean {
+    if (err && typeof err === 'object') {
+      const code = (err as { code?: unknown }).code;
+      const codeName = (err as { codeName?: unknown }).codeName;
+      const message =
+        typeof (err as { message?: unknown }).message === 'string'
+          ? (err as { message: string }).message
+          : '';
+
+      // Documented MongoDB code 20 (IllegalOperation) for standalone instances attempting transactions
+      if (
+        (code === 20 || codeName === 'IllegalOperation') &&
+        message.includes('Transaction numbers are only allowed on a replica set member or mongos')
+      ) {
+        return true;
+      }
+
+      // MongoDB code 263 (OperationNotSupportedInTransaction)
+      if (code === 263 || codeName === 'OperationNotSupportedInTransaction') {
+        return true;
+      }
+
+      if (message.includes('Transaction numbers are only allowed on a replica set member or mongos')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private isUnknownTransactionCommitResult(err: unknown): boolean {

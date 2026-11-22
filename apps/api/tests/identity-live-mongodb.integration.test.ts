@@ -1364,5 +1364,89 @@ describe.skipIf(!runLive)(
       const userAfter = await UserModel.findById(user._id);
       expect(userAfter?.sessionEpoch).toBe(2);
     });
+
+    it('demonstrates genuinely overlapping concurrent race between single-session logout and logout-all in real MongoDB', async () => {
+      const UserModel = getUserModel(conn);
+      const SessionModel = getSessionModel(conn);
+
+      const user = await UserModel.create({
+        emailNormalized: `${runId}_srv_overlap_race@example.test`,
+        displayName: 'Overlapping Race User',
+        role: 'CANDIDATE',
+        accountStatus: 'ACTIVE',
+        sessionEpoch: 1,
+        identityVersion: 1,
+        consentVersion: '2026-11-22',
+        consentAt: new Date(),
+      });
+      createdUserIds.push(user._id);
+
+      const sessId1 = `${runId}_srv_ol_s1`;
+      const sessId2 = `${runId}_srv_ol_s2`;
+      createdSessionIds.push(sessId1, sessId2);
+
+      const now = new Date();
+      await SessionModel.create([
+        {
+          sessionId: sessId1,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+        {
+          sessionId: sessId2,
+          userId: user._id,
+          status: 'ACTIVE',
+          generation: 1,
+          epochAtIssue: 1,
+          createdAt: now,
+          lastUsedAt: now,
+          idleExpiresAt: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+          absoluteExpiresAt: new Date(now.getTime() + 30 * 24 * 3600 * 1000),
+        },
+      ]);
+
+      const bearerToken = await signAccessToken(serviceKeyring, {
+        userId: String(user._id),
+        sessionId: sessId1,
+        epoch: 1,
+      });
+
+      // Genuinely overlapping concurrent dispatch of single-session logout and logout-all
+      const [_resSingle, resAll] = await Promise.allSettled([
+        liveSessionService.logout({
+          bearerToken,
+          requestId: `${runId}_ol_single_req`,
+        }),
+        liveSessionService.logoutAll({
+          bearerToken,
+          requestId: `${runId}_ol_all_req`,
+        }),
+      ]);
+
+      // The session sessId1 MUST be revoked in all cases
+      const s1Final = await SessionModel.findOne({ sessionId: sessId1 });
+      expect(s1Final?.status).toBe('REVOKED');
+
+      const freshUser = await UserModel.findById(user._id);
+      // Epoch must either be 1 (single logout won fence) or 2 (logout-all won), never corrupted or duplicated (>2)
+      expect([1, 2]).toContain(freshUser?.sessionEpoch);
+
+      if (resAll.status === 'fulfilled') {
+        // If logout-all won, epoch was bumped to 2 and sessId2 was also revoked
+        expect(freshUser?.sessionEpoch).toBe(2);
+        const s2Final = await SessionModel.findOne({ sessionId: sessId2 });
+        expect(s2Final?.status).toBe('REVOKED');
+      } else {
+        // If single logout won before logout-all's fence, logout-all was rejected with UnauthorizedError
+        expect(resAll.reason).toBeInstanceOf(UnauthorizedError);
+        expect(freshUser?.sessionEpoch).toBe(1);
+      }
+    });
   });
 });
