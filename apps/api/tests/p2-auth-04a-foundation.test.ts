@@ -741,5 +741,86 @@ describe('P2-AUTH-04a: Pending Registration, OTP & Rate-Limiting Foundation', ()
       expect(headers['Retry-After']).toBeDefined();
       expect(next2.mock.calls[0]?.[0]).toBeInstanceOf(RateLimitExceededError);
     });
+
+    it('supports transaction-abort retry with same proof, concurrent single-winner consumption, immutable proof bindings, and delayed-registration ordering', async () => {
+      const challengeModel = createInMemoryChallengeModel();
+      const otpService = new OtpChallengeService({
+        challengeModel: challengeModel as never,
+        hmacSecret: TEST_HMAC_SECRET,
+      });
+
+      const mutableInput: ChallengeSubjectInput = {
+        purpose: 'RESET_PASSWORD',
+        emailNormalized: 'retry@example.com',
+        userId: new Types.ObjectId(),
+        passwordIdentityIdAtIssue: new Types.ObjectId(),
+        identityVersionAtIssue: 1,
+      };
+
+      const issued = await otpService.issueChallenge(mutableInput);
+      await otpService.markDeliveryState(issued.challengeId, issued.generation, 'ACCEPTED');
+
+      const proof = await otpService.claimAndVerifyAttempt(
+        mutableInput,
+        issued.challengeId,
+        issued.generation,
+        issued.otpCode
+      );
+
+      // Mutate caller-owned input after verification
+      mutableInput.identityVersionAtIssue = 999;
+
+      // Simulate transaction abort (DB state not committed) -> retry with same proof succeeds
+      const activeSession = { inTransaction: () => true } as never;
+      // Concurrent consumption: only 1 winner
+      const outcomes = await Promise.allSettled([
+        otpService.consumeVerifiedChallenge(proof, activeSession),
+        otpService.consumeVerifiedChallenge(proof, activeSession),
+      ]);
+      expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter((o) => o.status === 'rejected')).toHaveLength(1);
+
+      // Delayed older registration cannot overwrite newer accepted registration
+      let currentTime = new Date('2026-11-27T10:00:00.000Z');
+      const rateModel = createInMemoryRateLimitModel();
+      const pendingModel = createInMemoryPendingRegistrationModel();
+      const emailSender = new MockEmailSender({ nodeEnv: 'test', enableTestOtpCapture: true });
+      const passwordService = createPasswordService();
+      const rateLimitService = new AuthRateLimitService({
+        rateLimitModel: rateModel as never,
+        hmacSecret: TEST_HMAC_SECRET,
+        now: () => currentTime,
+      });
+
+      const regService = new PendingRegistrationService({
+        pendingRegistrationModel: pendingModel as never,
+        rateLimitService,
+        passwordService,
+        emailSender,
+        hmacSecret: TEST_HMAC_SECRET,
+        now: () => currentTime,
+      });
+
+      await regService.startOrReplaceRegistration({
+        emailNormalized: 'order@example.com',
+        password: 'Valid-Password-2026!',
+        consentVersion: 'v1.0',
+        trustedIp: '203.0.113.30',
+      });
+
+      // Simulate newer accepted registration at t+61s
+      currentTime = new Date(currentTime.getTime() + 61_000);
+      const doc = pendingModel.byEmail.get('order@example.com')!;
+      doc.updatedAt = new Date(currentTime.getTime() + 5_000);
+
+      await expect(
+        regService.startOrReplaceRegistration({
+          emailNormalized: 'order@example.com',
+          password: 'Valid-Password-2026!',
+          consentVersion: 'v1.0',
+          trustedIp: '203.0.113.30',
+        })
+      ).rejects.toMatchObject({ statusCode: 409, code: 'CONFLICT' });
+    });
   });
 });

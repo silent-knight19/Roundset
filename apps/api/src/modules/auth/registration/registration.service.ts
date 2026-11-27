@@ -28,7 +28,18 @@ export interface VerifiedRegistrationProof {
   readonly expiresAt: Date;
 }
 
-const issuedRegistrationProofs = new WeakSet<VerifiedRegistrationProof>();
+interface ImmutableRegistrationProofMetadata {
+  readonly registrationId: string;
+  readonly version: number;
+  readonly emailNormalized: string;
+  readonly nonceDigest: string;
+  readonly expiresAtMs: number;
+}
+
+const issuedRegistrationProofs = new WeakMap<
+  VerifiedRegistrationProof,
+  ImmutableRegistrationProofMetadata
+>();
 
 export interface PendingRegistrationServiceOptions {
   pendingRegistrationModel: Model<IPendingRegistration>;
@@ -107,6 +118,7 @@ export class PendingRegistrationService {
       input.emailNormalized
     );
 
+    const admissionTime = this.now();
     const passwordHash = await this.passwordService.hashPassword(input.password);
 
     const registrationId = crypto
@@ -172,6 +184,10 @@ export class PendingRegistrationService {
         }
       }
 
+      if (existing.updatedAt && existing.updatedAt > admissionTime) {
+        throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
+      }
+
       const nextVersion = existing.version + 1;
       const otpDigest = computeDomainHmac(this.hmacSecret, [
         'REG_OTP',
@@ -185,6 +201,7 @@ export class PendingRegistrationService {
           {
             _id: existing._id,
             version: existing.version,
+            ...(existing.updatedAt ? { updatedAt: existing.updatedAt } : {}),
           },
           {
             $set: {
@@ -384,21 +401,30 @@ export class PendingRegistrationService {
       version: claimed.version,
       emailNormalized: claimed.emailNormalized,
       nonceDigest: claimed.nonceDigest,
-      expiresAt: claimed.expiresAt,
+      expiresAt: new Date(claimed.expiresAt.getTime()),
     });
-    issuedRegistrationProofs.add(proof);
+    issuedRegistrationProofs.set(proof, {
+      registrationId: claimed.registrationId,
+      version: claimed.version,
+      emailNormalized: claimed.emailNormalized,
+      nonceDigest: claimed.nonceDigest,
+      expiresAtMs: claimed.expiresAt.getTime(),
+    });
     return proof;
   }
 
   /**
    * Transaction-aware consumption primitive requiring an unforgeable
    * `VerifiedRegistrationProof` and an active `ClientSession` transaction.
+   * Database CAS (`state: 'SENT' -> 'CONSUMED'`) is the durable single-use
+   * authority, so aborted transactions can be safely retried with the same proof.
    */
   async consumePendingRegistration(
     proof: VerifiedRegistrationProof,
     session: ClientSession
   ): Promise<IPendingRegistration> {
-    if (!proof || !issuedRegistrationProofs.has(proof)) {
+    const metadata = proof ? issuedRegistrationProofs.get(proof) : undefined;
+    if (!metadata) {
       throw new OtpInvalidError();
     }
     if (!session || typeof session.inTransaction !== 'function' || !session.inTransaction()) {
@@ -408,16 +434,16 @@ export class PendingRegistrationService {
     }
 
     const currentNow = this.now();
-    if (proof.expiresAt <= currentNow) {
+    if (metadata.expiresAtMs <= currentNow.getTime()) {
       throw new OtpInvalidError();
     }
 
     const consumed = await this.pendingModel
       .findOneAndUpdate(
         {
-          registrationId: proof.registrationId,
-          version: proof.version,
-          nonceDigest: proof.nonceDigest,
+          registrationId: metadata.registrationId,
+          version: metadata.version,
+          nonceDigest: metadata.nonceDigest,
           state: 'SENT',
           deliveryState: 'ACCEPTED',
           otpExpiresAt: { $gt: currentNow },
@@ -434,7 +460,6 @@ export class PendingRegistrationService {
       throw new OtpInvalidError();
     }
 
-    issuedRegistrationProofs.delete(proof);
     return consumed;
   }
 

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { ClientSession, Model, Types } from 'mongoose';
+import { Types, type ClientSession, type Model } from 'mongoose';
 import type { IVerificationChallenge } from '../../identity/models/verification-challenge.model.js';
 import type { IUser } from '../../identity/models/user.model.js';
 import type { IAuthIdentity } from '../../identity/models/auth-identity.model.js';
@@ -17,12 +17,21 @@ import {
   type VerifiedOtpChallengeProof,
 } from './types.js';
 
+interface ImmutableOtpProofMetadata {
+  readonly challengeId: string;
+  readonly purpose: ChallengeSubjectInput['purpose'];
+  readonly subjectDigest: string;
+  readonly generation: number;
+  readonly expiresAtMs: number;
+  readonly bindingFilter: Readonly<Record<string, unknown>>;
+}
+
 /**
- * Private runtime capability registry. Only `claimAndVerifyAttempt` may
- * register a `VerifiedOtpChallengeProof`, preventing caller-constructed objects
- * from authorizing consumption.
+ * Private runtime capability registry mapping each issued proof to its
+ * immutable server-captured binding snapshot. Only `claimAndVerifyAttempt`
+ * may register a proof; mutating caller-owned input objects has no effect.
  */
-const issuedOtpProofs = new WeakSet<VerifiedOtpChallengeProof>();
+const issuedOtpProofs = new WeakMap<VerifiedOtpChallengeProof, ImmutableOtpProofMetadata>();
 
 export interface OtpChallengeServiceOptions {
   challengeModel: Model<IVerificationChallenge>;
@@ -261,15 +270,45 @@ export class OtpChallengeService {
       throw new OtpInvalidError();
     }
 
+function cloneBindingFilter(input: ChallengeSubjectInput): Readonly<Record<string, unknown>> {
+  switch (input.purpose) {
+    case 'RESET_PASSWORD':
+      return Object.freeze({
+        userId: new Types.ObjectId(input.userId.toHexString()),
+        passwordIdentityIdAtIssue: new Types.ObjectId(
+          input.passwordIdentityIdAtIssue.toHexString()
+        ),
+        identityVersionAtIssue: input.identityVersionAtIssue,
+      });
+    case 'LINK_PASSWORD':
+      return Object.freeze({
+        userId: new Types.ObjectId(input.userId.toHexString()),
+        sessionId: String(input.sessionId),
+        reauthTicketDigest: String(input.reauthTicketDigest),
+      });
+    case 'PHONE_VERIFY':
+      return Object.freeze({
+        userId: new Types.ObjectId(input.userId.toHexString()),
+      });
+  }
+}
+
     const proof: VerifiedOtpChallengeProof = Object.freeze({
       challengeId: claimed.challengeId,
       purpose: input.purpose,
       subjectDigest,
       generation: claimed.generation,
-      expiresAt: claimed.expiresAt,
+      expiresAt: new Date(claimed.expiresAt.getTime()),
       input,
     });
-    issuedOtpProofs.add(proof);
+    issuedOtpProofs.set(proof, {
+      challengeId: claimed.challengeId,
+      purpose: input.purpose,
+      subjectDigest,
+      generation: claimed.generation,
+      expiresAtMs: claimed.expiresAt.getTime(),
+      bindingFilter: cloneBindingFilter(input),
+    });
     return proof;
   }
 
@@ -322,12 +361,18 @@ export class OtpChallengeService {
   /**
    * Transaction-aware consumption primitive requiring an unforgeable
    * `VerifiedOtpChallengeProof` and an active `ClientSession` transaction.
+   * Database CAS (`state: 'ISSUED' -> 'CONSUMED'`) is the durable single-use
+   * authority, so aborted transactions can be safely retried with the same proof.
+   *
+   * For `RESET_PASSWORD`, `P2-AUTH-03b` must also call `verifyAuthoritativeRecoveryBinding`
+   * and perform the guarded `users` version/epoch write inside this same transaction.
    */
   async consumeVerifiedChallenge(
     proof: VerifiedOtpChallengeProof,
     session: ClientSession
   ): Promise<void> {
-    if (!proof || !issuedOtpProofs.has(proof)) {
+    const metadata = proof ? issuedOtpProofs.get(proof) : undefined;
+    if (!metadata) {
       throw new OtpInvalidError();
     }
     if (!session || typeof session.inTransaction !== 'function' || !session.inTransaction()) {
@@ -335,23 +380,21 @@ export class OtpChallengeService {
     }
 
     const currentNow = this.now();
-    if (proof.expiresAt <= currentNow) {
+    if (metadata.expiresAtMs <= currentNow.getTime()) {
       throw new OtpInvalidError();
     }
-
-    const bindingFilter = buildBindingFilter(proof.input);
 
     const consumed = await this.challengeModel
       .findOneAndUpdate(
         {
-          challengeId: proof.challengeId,
-          purpose: proof.purpose,
-          subjectDigest: proof.subjectDigest,
-          generation: proof.generation,
+          challengeId: metadata.challengeId,
+          purpose: metadata.purpose,
+          subjectDigest: metadata.subjectDigest,
+          generation: metadata.generation,
           state: 'ISSUED',
           deliveryState: 'ACCEPTED',
           expiresAt: { $gt: currentNow },
-          ...bindingFilter,
+          ...metadata.bindingFilter,
         },
         {
           $set: {
@@ -366,7 +409,5 @@ export class OtpChallengeService {
     if (!consumed) {
       throw new OtpInvalidError();
     }
-
-    issuedOtpProofs.delete(proof);
   }
 }
