@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import {
   PASSWORD_CONCURRENCY_LIMITS,
   PasswordCapacityError,
@@ -9,6 +10,7 @@ interface QueueEntry {
   grant: () => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  deadlineMs: number;
   settled: boolean;
 }
 
@@ -17,12 +19,14 @@ interface QueueEntry {
  * Enforces:
  * - maxConcurrent active operations (default: 2)
  * - maxQueueSize queued operations (default: 8)
- * - queueTimeoutMs max wait in queue (default: 3,000 ms)
+ * - queueTimeoutMs max wait in queue (default: 3,000 ms), checked against
+ *   an absolute monotonic deadline before granting execution.
  */
 export class BoundedPasswordLimiter {
   private readonly maxConcurrent: number;
   private readonly maxQueueSize: number;
   private readonly queueTimeoutMs: number;
+  private readonly now: () => number;
   private activeCount = 0;
   private readonly queue: QueueEntry[] = [];
 
@@ -33,6 +37,7 @@ export class BoundedPasswordLimiter {
       options.maxQueueSize ?? PASSWORD_CONCURRENCY_LIMITS.maxQueueSize;
     this.queueTimeoutMs =
       options.queueTimeoutMs ?? PASSWORD_CONCURRENCY_LIMITS.queueTimeoutMs;
+    this.now = options.now ?? (() => performance.now());
 
     if (this.maxConcurrent < 1) {
       throw new RangeError('maxConcurrent must be at least 1');
@@ -81,10 +86,13 @@ export class BoundedPasswordLimiter {
       );
     }
 
+    const deadlineMs = this.now() + this.queueTimeoutMs;
+
     return new Promise<void>((resolve, reject) => {
       const entry: QueueEntry = {
         grant: resolve,
         reject,
+        deadlineMs,
         timer: setTimeout(() => {
           if (entry.settled) {
             return;
@@ -111,14 +119,28 @@ export class BoundedPasswordLimiter {
   }
 
   private releaseSlot(): void {
+    const currentNow = this.now();
+
     while (this.queue.length > 0) {
       const next = this.queue.shift();
       if (!next || next.settled) {
         continue;
       }
+
       next.settled = true;
       clearTimeout(next.timer);
-      // Transfer the active slot directly to the dequeued waiter
+
+      if (currentNow >= next.deadlineMs) {
+        next.reject(
+          new PasswordCapacityError(
+            'QUEUE_TIMEOUT',
+            'Password service queue wait timed out'
+          )
+        );
+        continue;
+      }
+
+      // Transfer the active slot directly to the eligible waiter
       next.grant();
       return;
     }

@@ -50,6 +50,8 @@ export interface PasswordLimiterOptions {
   maxConcurrent?: number;
   maxQueueSize?: number;
   queueTimeoutMs?: number;
+  /** Optional monotonic clock in milliseconds (defaults to `performance.now()`). */
+  now?: () => number;
 }
 
 export interface Argon2Driver {

@@ -24,6 +24,14 @@ const defaultDriver: Argon2Driver = {
  * Asynchronous Argon2id password-security service with bounded concurrency,
  * strict input/hash validation, sanitized error handling, and shared-limiter
  * dummy verification.
+ *
+ * Integration contract for subsequent authentication phases:
+ * - One shared `PasswordService` instance must serve all authentication paths
+ *   (registration, login, password reset/change, reauth, and dummy verification)
+ *   so the 2-active / 8-queued resource ceiling is enforced globally.
+ * - Initialize the dummy credential before accepting login traffic (for example
+ *   by warming `verifyDummy` during application startup) so the first unknown-account
+ *   login attempt does not incur one-time dummy hash generation latency.
  */
 export class PasswordService {
   private readonly limiter: BoundedPasswordLimiter;

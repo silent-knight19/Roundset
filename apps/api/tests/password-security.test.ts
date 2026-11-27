@@ -295,6 +295,57 @@ describe('P2-AUTH-03a: Password Security Foundation', () => {
       }
     });
 
+    it('rejects an expired waiter in releaseSlot() even before its setTimeout callback fires and grants the next eligible waiter', async () => {
+      let currentTime = 1_000;
+      const limiter = new BoundedPasswordLimiter({
+        maxConcurrent: 2,
+        maxQueueSize: 8,
+        queueTimeoutMs: 3_000,
+        now: () => currentTime,
+      });
+
+      const d1 = createDeferred<void>();
+      const d2 = createDeferred<void>();
+      const expiredTaskSpy = vi.fn(async () => 'expired-should-not-run');
+      const freshTaskSpy = vi.fn(async () => 'fresh-ran');
+
+      // Occupy both active slots
+      const p1 = limiter.run(() => d1.promise);
+      const p2 = limiter.run(() => d2.promise);
+
+      // Enqueue waiter A at t=1000 (deadline=4000)
+      const pExpired = limiter.run(expiredTaskSpy);
+
+      // Advance monotonic clock by 2,500 ms (t=3500) and enqueue waiter B (deadline=6500)
+      currentTime = 3_500;
+      const pFresh = limiter.run(freshTaskSpy);
+
+      expect(limiter.getStats()).toMatchObject({ active: 2, queued: 2 });
+
+      // Advance monotonic clock past waiter A's deadline (t=4001) WITHOUT firing setTimeout callbacks
+      currentTime = 4_001;
+
+      // Release slot 1 -> releaseSlot() must reject waiter A as timed out and grant waiter B
+      d1.resolve();
+      await expect(pExpired).rejects.toSatisfy((err: unknown) => {
+        return (
+          err instanceof PasswordCapacityError &&
+          err.statusCode === 503 &&
+          err.code === 'CAPACITY_UNAVAILABLE' &&
+          err.reason === 'QUEUE_TIMEOUT'
+        );
+      });
+      await expect(pFresh).resolves.toBe('fresh-ran');
+
+      d2.resolve();
+      await p1;
+      await p2;
+
+      expect(expiredTaskSpy).not.toHaveBeenCalled();
+      expect(freshTaskSpy).toHaveBeenCalledTimes(1);
+      expect(limiter.getStats()).toMatchObject({ active: 0, queued: 0 });
+    });
+
     it('releases capacity and recovers after a hashing or verification failure', async () => {
       let shouldFail = true;
       const driver: Argon2Driver = {
