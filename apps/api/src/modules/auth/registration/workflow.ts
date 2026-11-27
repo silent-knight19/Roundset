@@ -12,7 +12,7 @@ export interface RegistrationWorkflowOptions {
   connection: Connection;
   policy: Pick<AppConfig, 'POLICY_CONSENT_VERSION' | 'REGISTRATION_MODE'>;
   pending: PendingRegistrationService;
-  activation: RegistrationActivationService;
+  activation: Pick<RegistrationActivationService, 'activate'>;
   rateLimits: AuthRateLimitService;
   /** Must be global, not dependent on a recipient or account lookup. */
   emailAvailable: () => boolean | Promise<boolean>;

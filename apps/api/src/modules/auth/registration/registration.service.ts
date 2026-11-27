@@ -329,11 +329,16 @@ export class PendingRegistrationService {
       };
     }
 
+    // The asynchronous rate/eligibility checks may have consumed time.
+    // Never extend the original pending registration's lifetime.
+    const resendNow = this.now();
+    if (existing.expiresAt <= resendNow) throw new OtpInvalidError();
     const nextVersion = existing.version + 1;
     const otpCode = generateOtpCode();
-    const otpExpiresAt = new Date(
-      currentNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs
-    );
+    const otpExpiresAt = new Date(Math.min(
+      resendNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs,
+      existing.expiresAt.getTime()
+    ));
     const otpDigest = computeDomainHmac(this.hmacSecret, [
       'REG_OTP',
       existing.registrationId,
@@ -349,7 +354,7 @@ export class PendingRegistrationService {
           nonceDigest: expectedNonceDigest,
           version: existing.version,
           state: { $in: ['PENDING_DELIVERY', 'SENT'] },
-          expiresAt: { $gt: currentNow },
+          expiresAt: { $gt: resendNow },
         },
         {
           $set: {
@@ -521,21 +526,27 @@ export class PendingRegistrationService {
       accepted = false;
     }
 
-    await this.pendingModel
-      .findOneAndUpdate(
-        {
-          registrationId,
-          version,
-          deliveryState: 'PENDING',
-        },
-        {
-          $set: accepted
-            ? { deliveryState: 'ACCEPTED', state: 'SENT' }
-            : { deliveryState: 'FAILED' },
-        }
-      )
-      .exec();
-
-    return accepted;
+    try {
+      const recorded = await this.pendingModel
+        .findOneAndUpdate(
+          {
+            registrationId,
+            version,
+            deliveryState: 'PENDING',
+          },
+          {
+            $set: accepted
+              ? { deliveryState: 'ACCEPTED', state: 'SENT' }
+              : { deliveryState: 'FAILED' },
+          }
+        )
+        .exec();
+      return accepted && Boolean(recorded);
+    } catch {
+      // The message may have been sent, but an unconfirmed persistence
+      // result cannot authorize verification. Keep the public response
+      // generic; the stored generation governs a later proof or resend.
+      return false;
+    }
   }
 }
