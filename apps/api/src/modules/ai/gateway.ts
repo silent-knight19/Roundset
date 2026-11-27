@@ -221,9 +221,26 @@ export function executeOfflineGeneration(
           minViableCallMs,
         );
 
+  // The immutable intent deadline is an additional ceiling, not a substitute
+  // for the state-specific READY/lease/reservation or interview deadlines.
+  const intentDeadlineMs =
+    typeof request.intent.absoluteDeadlineAt === 'string'
+      ? Date.parse(request.intent.absoluteDeadlineAt)
+      : NaN;
+  if (!Number.isFinite(intentDeadlineMs)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid intent absolute deadline');
+  }
+  const remainingMs = Math.min(
+    deadlineResult.remainingMs,
+    intentDeadlineMs - request.nowMs - safetyMarginMs,
+  );
+  if (remainingMs <= 0 || remainingMs < minViableCallMs) {
+    throw new SanitizedAiError('AI_TIMEOUT', 'Intent absolute deadline window exhausted');
+  }
+
   computeEffectiveProviderTimeoutMs(
     request.providerTimeoutMs ?? 10_000,
-    deadlineResult.remainingMs,
+    remainingMs,
   );
 
   const outcome = request.mockOutcome ?? 'SUCCESS';

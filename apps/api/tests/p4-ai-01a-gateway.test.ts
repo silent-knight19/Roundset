@@ -94,7 +94,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['resp-a-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
       ],
       content: 'Synthetic summary context',
     });
@@ -1145,7 +1145,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['anc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
       ],
       content: 'Summary of document',
     });
@@ -1210,7 +1210,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['anc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
       ],
       content: 'Summary of v1',
     });
@@ -1378,8 +1378,8 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['resp-1', 'doc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
-        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
       ],
       content: 'Mixed summary',
     });
@@ -1603,7 +1603,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['resp-1', 'doc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-a-1', kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
       ],
       content: 'Incomplete coverage summary',
     });
@@ -1662,5 +1662,105 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
         resolver,
       ),
     ).toThrowError(SanitizedAiError);
+  });
+});
+
+describe('P4-AI-01a: deadline and authoritative scope regressions', () => {
+  it.each(['PRE_START', 'POST_START'] as const)(
+    '%s rejects invalid, expired and insufficient intent deadlines even with live state deadlines',
+    (cutoffMode) => {
+      const resolver = new DeterministicFakeSourceResolver();
+      resolver.registerUserInterviewSource({
+        userId: 'user-a',
+        interviewId: 'int-a-1',
+        recordId: 'rec-resp-1',
+        recordVersion: 'v1',
+        kind: 'CANDIDATE_RESPONSE',
+        ancestorRefs: [],
+        content: 'Synthetic candidate answer',
+      });
+      const run = (absoluteDeadlineAt: string) => executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent({ absoluteDeadlineAt }),
+          provider: 'MOCK',
+          cutoffMode,
+          deadlineInput: cutoffMode === 'PRE_START' ? makePreStartDeadlines() : makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          safetyMarginMs: 100,
+          minViableCallMs: 1_000,
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      );
+
+      expect(() => run('invalid')).toThrowError('Invalid intent absolute deadline');
+      expect(() => run(new Date(NOW_MS - 1).toISOString())).toThrowError('Intent absolute deadline window exhausted');
+      expect(() => run(new Date(NOW_MS + 1_000).toISOString())).toThrowError('Intent absolute deadline window exhausted');
+      expect(run(new Date(NOW_MS + 1_100).toISOString()).provider).toBe('MOCK');
+    },
+  );
+
+  it.each([
+    { userId: 'user-b', interviewId: 'int-a-1' },
+    { userId: 'user-a', interviewId: 'int-other' },
+  ])('rejects a summary with a foreign ancestor identity despite a matching local record', (foreignScope) => {
+    const resolver = new DeterministicFakeSourceResolver();
+    const base = createBaseIntent();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Synthetic candidate answer',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'summary-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-a-1'],
+      authoritativeAncestors: [{
+        ...foreignScope,
+        kind: 'CANDIDATE_RESPONSE',
+        recordId: 'rec-resp-1',
+        recordVersion: 'v1',
+      }],
+      content: 'Synthetic summary from a different scope',
+    });
+
+    const eligibility = vi.fn(() => true);
+    expect(() => executeOfflineGeneration(
+      {
+        authenticatedUserId: 'user-a',
+        intent: createBaseIntent({
+          purpose: 'FOLLOW_UP',
+          sourceManifest: [...base.sourceManifest, {
+            ref: 'summary',
+            kind: 'DERIVED_SUMMARY',
+            inheritedClasses: ['USER_TRANSCRIPT'],
+            ancestorRefs: ['resp-a-1'],
+            scope: {
+              type: 'USER_INTERVIEW',
+              userId: 'user-a',
+              interviewId: 'int-a-1',
+              recordId: 'summary-1',
+              recordVersion: 'v1',
+            },
+          }],
+          messages: [{ role: 'user', parts: [
+            { text: 'Synthetic summary from a different scope', sourceRef: 'summary' },
+          ] }],
+        }),
+        provider: 'MOCK',
+        cutoffMode: 'POST_START',
+        deadlineInput: makePostStartDeadlines(),
+        nowMs: NOW_MS,
+      },
+      { resolver, eligibilityPolicy: { isEligible: eligibility } },
+    )).toThrowError('Authoritative ancestor scope does not match current interview');
+    expect(eligibility).not.toHaveBeenCalled();
   });
 });

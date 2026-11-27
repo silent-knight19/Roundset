@@ -880,7 +880,7 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['doc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_DOCUMENT', recordId: 'doc-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-1', kind: 'CANDIDATE_DOCUMENT', recordId: 'doc-1', recordVersion: 'v1' },
       ],
       content: 'Short summary.',
     });
@@ -974,7 +974,7 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['anc-1'],
       authoritativeAncestors: [
-        { kind: 'CANDIDATE_DOCUMENT', recordId: 'doc-1', recordVersion: 'v1' },
+        { userId: 'user-a', interviewId: 'int-1', kind: 'CANDIDATE_DOCUMENT', recordId: 'doc-1', recordVersion: 'v1' },
       ],
       content: 'Summary',
     });
