@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { reportAuthFailure } from '../diagnostics.js';
 import type { ClientSession, Model } from 'mongoose';
 import { HttpError } from '../../../core/errors.js';
 import type { IPendingRegistration } from '../../identity/models/pending-registration.model.js';
@@ -272,7 +273,7 @@ export class PendingRegistrationService {
     } catch (error) {
       // Public workflow failures after rate admission must not distinguish
       // pending/eligible addresses from decoys. Internal primitives still throw.
-      if (checkEligibility) return genericResult;
+      if (checkEligibility) { reportAuthFailure('REGISTRATION_WORK_FAILED'); return genericResult; }
       throw error;
     }
   }
@@ -389,7 +390,7 @@ export class PendingRegistrationService {
       };
     } catch (error) {
       // Rate limits and receipt authentication above still fail explicitly.
-      if (checkEligibility) return genericResult;
+      if (checkEligibility) { reportAuthFailure('RESEND_WORK_FAILED'); return genericResult; }
       throw error;
     }
   }
@@ -530,6 +531,7 @@ export class PendingRegistrationService {
       accepted = false;
     }
 
+    if (!accepted) reportAuthFailure('REGISTRATION_DELIVERY_FAILED');
     try {
       const recorded = await this.pendingModel
         .findOneAndUpdate(
@@ -545,8 +547,10 @@ export class PendingRegistrationService {
           }
         )
         .exec();
+      if (!recorded) reportAuthFailure('REGISTRATION_DELIVERY_RECORD_FAILED');
       return accepted && Boolean(recorded);
     } catch {
+      reportAuthFailure('REGISTRATION_DELIVERY_RECORD_FAILED');
       // The message may have been sent, but an unconfirmed persistence
       // result cannot authorize verification. Keep the public response
       // generic; the stored generation governs a later proof or resend.

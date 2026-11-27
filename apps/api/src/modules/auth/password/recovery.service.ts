@@ -1,4 +1,5 @@
 import type { Connection } from 'mongoose';
+import { reportAuthFailure } from '../diagnostics.js';
 import type { PasswordForgotRequest, PasswordResetRequest } from '@roundset/contracts';
 import { HttpError, ServiceUnavailableError } from '../../../core/errors.js';
 import {
@@ -72,8 +73,16 @@ export class PasswordRecoveryService {
         // Provider failure is recipient-independent at the HTTP boundary.
       }
       // A failed or superseded delivery never authorizes OTP consumption.
-      await otp.markDeliveryState(issued.challengeId, issued.generation, accepted ? 'ACCEPTED' : 'FAILED');
+      if (!accepted) reportAuthFailure('RECOVERY_DELIVERY_FAILED');
+      try {
+        if (!(await otp.markDeliveryState(issued.challengeId, issued.generation, accepted ? 'ACCEPTED' : 'FAILED'))) {
+          reportAuthFailure('RECOVERY_DELIVERY_RECORD_FAILED');
+        }
+      } catch {
+        reportAuthFailure('RECOVERY_DELIVERY_RECORD_FAILED');
+      }
     } catch {
+      reportAuthFailure('RECOVERY_WORK_FAILED');
       // Post-admission lookup, issuance and recording failures must not
       // become an account oracle. An unconfirmed challenge fails closed.
     }

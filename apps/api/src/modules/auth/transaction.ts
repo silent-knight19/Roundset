@@ -1,8 +1,10 @@
 import type { ClientSession, Connection } from 'mongoose';
+import { performance } from 'node:perf_hooks';
 import { HttpError, ServiceUnavailableError } from '../../core/errors.js';
 
 const MAX_TRANSACTION_ATTEMPTS = 3;
 const MAX_COMMIT_ATTEMPTS = 3;
+const TRANSACTION_DEADLINE_MS = 15_000;
 
 function hasLabel(error: unknown, label: string): boolean {
   if (!error || typeof error !== 'object') return false;
@@ -40,6 +42,10 @@ export async function runAuthTransaction<T>(
     throw new ServiceUnavailableError('Database transactions are unavailable');
   }
 
+  const deadline = performance.now() + TRANSACTION_DEADLINE_MS;
+  function checkDeadline(): void {
+    if (performance.now() >= deadline) throw new ServiceUnavailableError('Authentication transaction deadline exceeded');
+  }
   let session: ClientSession;
   try {
     session = await connection.startSession();
@@ -51,6 +57,7 @@ export async function runAuthTransaction<T>(
     for (let attempt = 0; attempt < MAX_TRANSACTION_ATTEMPTS; attempt += 1) {
       let commitAmbiguous = false;
       try {
+        checkDeadline();
         session.startTransaction({
           readConcern: { level: 'snapshot' },
           writeConcern: { w: 'majority' },
@@ -61,6 +68,7 @@ export async function runAuthTransaction<T>(
 
         for (let commitAttempt = 0; commitAttempt < MAX_COMMIT_ATTEMPTS; commitAttempt += 1) {
           try {
+            checkDeadline();
             await session.commitTransaction();
             return result;
           } catch (error) {

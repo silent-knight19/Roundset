@@ -86,6 +86,9 @@ export class MongoManager {
       await mongoose.connect(uri, {
         serverSelectionTimeoutMS: 5000,
         connectTimeoutMS: 5000,
+        // Driver-enforced operation/socket deadlines; no detached Promise.race writes.
+        socketTimeoutMS: 5000,
+        waitQueueTimeoutMS: 5000,
       });
 
       this.logger?.info(
