@@ -58,21 +58,57 @@ export interface OfflineGatewayRequest {
   mockOutcome?: MockOutcomeMode;
 }
 
-function assertValidGenerationIntent(intent: GenerationIntent): void {
+const VALID_PROVIDERS: ReadonlySet<string> = new Set<ProviderId>(['GROQ', 'CLOUDFLARE', 'MOCK']);
+const VALID_REASONING_PROFILES: ReadonlySet<string> = new Set(['NO_REASONING', 'LOW']);
+
+function assertValidGatewayRequest(request: OfflineGatewayRequest): void {
+  if (!request || typeof request !== 'object') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Gateway request must be an object');
+  }
+  if (!VALID_PROVIDERS.has(request.provider)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid provider identifier');
+  }
+  if (request.cutoffMode !== 'PRE_START' && request.cutoffMode !== 'POST_START') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid cutoffMode');
+  }
+
+  const intent = request.intent;
   if (!intent || typeof intent !== 'object') {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'GenerationIntent must be an object');
   }
   if (!PHASE4_ALLOWED_PURPOSES.has(intent.purpose)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Purpose is not permitted in Phase 4');
+  }
+  if (
+    typeof intent.operationId !== 'string' ||
+    intent.operationId.length === 0 ||
+    typeof intent.attemptId !== 'string' ||
+    intent.attemptId.length === 0 ||
+    typeof intent.interviewId !== 'string' ||
+    intent.interviewId.length === 0 ||
+    typeof intent.promptVersion !== 'string' ||
+    intent.promptVersion.length === 0 ||
+    typeof intent.outputSchemaVersion !== 'string' ||
+    intent.outputSchemaVersion.length === 0
+  ) {
     throw new SanitizedAiError(
       'AI_CONFIGURATION_INVALID',
-      'Purpose is not permitted in Phase 4',
+      'GenerationIntent is missing required string identifiers',
     );
   }
-  if (!intent.operationId || !intent.attemptId || !intent.interviewId) {
+  if (
+    !Number.isInteger(intent.generationEpoch) ||
+    intent.generationEpoch < 0 ||
+    !Number.isInteger(intent.attemptNo) ||
+    intent.attemptNo < 1
+  ) {
     throw new SanitizedAiError(
       'AI_CONFIGURATION_INVALID',
-      'GenerationIntent is missing required identifiers',
+      'GenerationIntent epoch or attemptNo is invalid',
     );
+  }
+  if (!VALID_REASONING_PROFILES.has(intent.reasoningProfile)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid reasoningProfile');
   }
   if (!Array.isArray(intent.messages) || intent.messages.length === 0) {
     throw new SanitizedAiError(
@@ -80,16 +116,21 @@ function assertValidGenerationIntent(intent: GenerationIntent): void {
       'GenerationIntent must contain at least one message',
     );
   }
-  if (!Array.isArray(intent.sourceManifest)) {
+  if (!Array.isArray(intent.sourceManifest) || !Array.isArray(intent.dataClasses)) {
     throw new SanitizedAiError(
       'AI_CONFIGURATION_INVALID',
-      'GenerationIntent must contain sourceManifest',
+      'GenerationIntent must contain sourceManifest and dataClasses arrays',
     );
   }
-  if (!Number.isFinite(intent.maxOutputTokens) || intent.maxOutputTokens <= 0) {
+  if (
+    !Number.isFinite(intent.maxOutputTokens) ||
+    intent.maxOutputTokens <= 0 ||
+    !Number.isFinite(intent.estimatedInputTokens) ||
+    intent.estimatedInputTokens < 0
+  ) {
     throw new SanitizedAiError(
       'AI_CONFIGURATION_INVALID',
-      'maxOutputTokens must be a positive finite number',
+      'GenerationIntent token bounds are invalid',
     );
   }
 }
@@ -105,7 +146,10 @@ export function executeOfflineGeneration(
     eligibilityPolicy: ProviderEligibilityPolicy;
   },
 ): NormalizedGenerationResult<Record<string, unknown>> {
-  assertValidGenerationIntent(request.intent);
+  assertValidGatewayRequest(request);
+  if (!deps || typeof deps !== 'object' || !deps.resolver || !deps.eligibilityPolicy) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Gateway dependencies are required');
+  }
 
   const provenance = resolveAndAuthorizeSourceManifest(
     {
@@ -114,6 +158,16 @@ export function executeOfflineGeneration(
       messages: request.intent.messages,
       descriptors: request.intent.sourceManifest,
       declaredDataClasses: request.intent.dataClasses,
+      requestBinding: {
+        operationId: request.intent.operationId,
+        generationEpoch: request.intent.generationEpoch,
+        attemptId: request.intent.attemptId,
+        attemptNo: request.intent.attemptNo,
+        provider: request.provider,
+        purpose: request.intent.purpose,
+        promptVersion: request.intent.promptVersion,
+        outputSchemaVersion: request.intent.outputSchemaVersion,
+      },
     },
     deps.resolver,
   );
@@ -127,7 +181,7 @@ export function executeOfflineGeneration(
     ) {
       throw new SanitizedAiError(
         'AI_PRIVACY_INELIGIBLE',
-        'Stale or mismatched admission permit for canonical data classes',
+        'Stale or mismatched admission permit for canonical request',
       );
     }
   }

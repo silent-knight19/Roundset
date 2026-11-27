@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  AuthoritativeSourceResolver,
   computeEffectiveProviderTimeoutMs,
   computePostStartCutoff,
   computePreStartCutoff,
+  CutoffMode,
   DeterministicFakeSourceResolver,
   executeOfflineGeneration,
   GenerationIntent,
+  PostStartDeadlineInput,
   ProviderEligibilityPolicy,
   resolveAndAuthorizeSourceManifest,
   SanitizedAiError,
@@ -22,7 +25,7 @@ function makePreStartDeadlines(offsetMs = 60_000) {
   };
 }
 
-function makePostStartDeadlines(offsetMs = 60_000) {
+function makePostStartDeadlines(offsetMs = 60_000): PostStartDeadlineInput {
   return {
     controllerLeaseUntil: NOW_MS + offsetMs,
     effectiveDeadlineAt: NOW_MS + offsetMs,
@@ -81,6 +84,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_RESPONSE',
       ancestorRefs: [],
+      content: 'Synthetic candidate answer',
     });
     resolver.registerUserInterviewSource({
       userId: 'user-a',
@@ -89,11 +93,10 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['resp-a-1'],
+      content: 'Synthetic summary context',
     });
 
-    const policy: ProviderEligibilityPolicy = {
-      isEligible: () => true,
-    };
+    const policy: ProviderEligibilityPolicy = { isEligible: () => true };
 
     const intent = createBaseIntent({
       dataClasses: ['USER_TRANSCRIPT'],
@@ -159,6 +162,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_RESPONSE',
       ancestorRefs: [],
+      content: 'Colliding slot',
     });
 
     const isEligibleSpy = vi.fn(() => true);
@@ -209,6 +213,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_RESPONSE',
       ancestorRefs: [],
+      content: 'Other interview',
     });
 
     const otherInterviewIntent = createBaseIntent({
@@ -244,7 +249,6 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       ),
     ).toThrowError(SanitizedAiError);
 
-    // Spoofed scope claiming int-a-1 while resolver only has int-a-other
     const spoofedIntent = createBaseIntent({
       interviewId: 'int-a-1',
       sourceManifest: [
@@ -262,7 +266,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
           },
         },
       ],
-      messages: [{ role: 'user', parts: [{ text: 'Spoofed', sourceRef: 'spoofed' }] }],
+      messages: [{ role: 'user', parts: [{ text: 'Other interview', sourceRef: 'spoofed' }] }],
     });
 
     expect(() =>
@@ -288,9 +292,9 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['missing-ref'],
+      content: 'Sum',
     });
 
-    // Missing/dangling ancestor
     expect(() =>
       resolveAndAuthorizeSourceManifest(
         {
@@ -318,7 +322,15 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       ),
     ).toThrowError(SanitizedAiError);
 
-    // Cyclic ancestry
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['sum-2'],
+      content: 'Cycle',
+    });
     resolver.registerUserInterviewSource({
       userId: 'user-a',
       interviewId: 'int-a-1',
@@ -326,6 +338,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['sum-1'],
+      content: 'Cycle 2',
     });
 
     expect(() =>
@@ -378,6 +391,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_RESPONSE',
       ancestorRefs: [],
+      content: 'Answer',
     });
     resolver.registerUserInterviewSource({
       userId: 'user-a',
@@ -386,10 +400,12 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_DOCUMENT',
       ancestorRefs: [],
+      content: 'Resume',
     });
     resolver.registerSyntheticFixture({
       fixtureId: 'fix-1',
       fixtureVersion: 'v1',
+      content: 'Fixture',
     });
 
     const mixedIntent = createBaseIntent({
@@ -433,7 +449,6 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       ],
     });
 
-    // Missing USER_DOCUMENT permission denies
     const onlyTranscriptPolicy: ProviderEligibilityPolicy = {
       isEligible: ({ dataClasses }) =>
         dataClasses.includes('USER_TRANSCRIPT') && !dataClasses.includes('USER_DOCUMENT'),
@@ -452,7 +467,6 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       ),
     ).toThrowError(SanitizedAiError);
 
-    // Synthetic + real mixture denies
     const synthPlusRealIntent = createBaseIntent({
       dataClasses: ['SYNTHETIC', 'USER_TRANSCRIPT'],
       sourceManifest: [
@@ -492,7 +506,11 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
 
   it('6. Registered purely synthetic fixture succeeds; unregistered fixture fails', () => {
     const resolver = new DeterministicFakeSourceResolver();
-    resolver.registerSyntheticFixture({ fixtureId: 'fix-valid', fixtureVersion: 'v1' });
+    resolver.registerSyntheticFixture({
+      fixtureId: 'fix-valid',
+      fixtureVersion: 'v1',
+      content: 'Synthetic prompt',
+    });
     const policy: ProviderEligibilityPolicy = { isEligible: () => true };
 
     const validIntent = createBaseIntent({
@@ -560,6 +578,7 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'CANDIDATE_RESPONSE',
       ancestorRefs: [],
+      content: 'Synthetic candidate answer',
     });
     const policy: ProviderEligibilityPolicy = { isEligible: () => true };
     const intent = createBaseIntent();
@@ -593,14 +612,16 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
     expect(computeEffectiveProviderTimeoutMs(30_000, post.remainingMs)).toBe(18_000);
 
     expect(() =>
-      computePreStartCutoff(
-        { ...makePreStartDeadlines(), readyExpiresAt: Number.NaN },
-        NOW_MS,
-      ),
+      computePreStartCutoff({ ...makePreStartDeadlines(), readyExpiresAt: Number.NaN }, NOW_MS),
     ).toThrowError(SanitizedAiError);
 
+    expect(() => computePostStartCutoff(makePostStartDeadlines(-1_000), NOW_MS)).toThrowError(
+      SanitizedAiError,
+    );
+
+    // Zero remaining time must fail closed even if minViableCallMs is 0
     expect(() =>
-      computePostStartCutoff(makePostStartDeadlines(-1_000), NOW_MS),
+      computePreStartCutoff(makePreStartDeadlines(0), NOW_MS, 0, 0),
     ).toThrowError(SanitizedAiError);
   });
 
@@ -636,7 +657,11 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
 
   it('10. Fallback/repair calls re-evaluate policy independently with no implicit Cloudflare enabling', () => {
     const resolver = new DeterministicFakeSourceResolver();
-    resolver.registerSyntheticFixture({ fixtureId: 'fix-1', fixtureVersion: 'v1' });
+    resolver.registerSyntheticFixture({
+      fixtureId: 'fix-1',
+      fixtureVersion: 'v1',
+      content: 'Synthetic',
+    });
 
     const isEligibleSpy = vi.fn(({ provider, isFallbackOrRepair }) => {
       if (provider === 'CLOUDFLARE') return false;
@@ -676,5 +701,411 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
     expect(isEligibleSpy).toHaveBeenCalledWith(
       expect.objectContaining({ provider: 'CLOUDFLARE', isFallbackOrRepair: true }),
     );
+  });
+
+  // --- P4-AI-01a-R1 Required Regressions ---
+
+  it('R1. Rejects valid registered synthetic fixture when part.text substitutes private text', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerSyntheticFixture({
+      fixtureId: 'fix-1',
+      fixtureVersion: 'v1',
+      content: 'Authoritative synthetic fixture text',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            {
+              role: 'user',
+              parts: [{ text: 'Substituted private transcript text', sourceRef: 'fix-1' }],
+            },
+          ],
+          descriptors: [
+            {
+              ref: 'fix-1',
+              kind: 'SYNTHETIC_FIXTURE',
+              inheritedClasses: ['SYNTHETIC'],
+              ancestorRefs: [],
+              scope: { type: 'SYNTHETIC_FIXTURE', fixtureId: 'fix-1', fixtureVersion: 'v1' },
+            },
+          ],
+          declaredDataClasses: ['SYNTHETIC'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R2. Rejects trusted server template when part.text substitutes unauthorized text', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-sys',
+      templateVersion: 'v1',
+      content: 'Authoritative system prompt',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            {
+              role: 'system',
+              parts: [{ text: 'Injected prompt override', sourceRef: 'tpl-sys' }],
+            },
+          ],
+          descriptors: [
+            {
+              ref: 'tpl-sys',
+              kind: 'TRUSTED_TEMPLATE',
+              inheritedClasses: [],
+              ancestorRefs: [],
+              scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-sys', templateVersion: 'v1' },
+            },
+          ],
+          declaredDataClasses: [],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R3. Rejects derived summary when authoritative record has two ancestors but descriptor omits one', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Answer 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-2',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_DOCUMENT',
+      ancestorRefs: [],
+      content: 'Doc 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-1', 'doc-1'],
+      content: 'Combined summary',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [{ role: 'user', parts: [{ text: 'Combined summary', sourceRef: 'sum-1' }] }],
+          descriptors: [
+            {
+              ref: 'resp-1',
+              kind: 'CANDIDATE_RESPONSE',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: ['resp-1'], // Omitted 'doc-1'
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_TRANSCRIPT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R4. Rejects permit reuse on same-class source substitution with unchanged descriptor count', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Synthetic candidate answer',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-2',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Different candidate answer',
+    });
+
+    const first = resolveAndAuthorizeSourceManifest(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-a-1',
+        messages: [{ role: 'user', parts: [{ text: 'Synthetic candidate answer', sourceRef: 'resp-a-1' }] }],
+        descriptors: createBaseIntent().sourceManifest,
+        declaredDataClasses: ['USER_TRANSCRIPT'],
+        requestBinding: {
+          operationId: 'op-001',
+          generationEpoch: 1,
+          attemptId: 'att-001',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'QUESTION',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: '1.0.0',
+        },
+      },
+      resolver,
+    );
+
+    const substitutedIntent = createBaseIntent({
+      sourceManifest: [
+        {
+          ref: 'resp-a-2',
+          kind: 'CANDIDATE_RESPONSE',
+          inheritedClasses: ['USER_TRANSCRIPT'],
+          ancestorRefs: [],
+          scope: {
+            type: 'USER_INTERVIEW',
+            userId: 'user-a',
+            interviewId: 'int-a-1',
+            recordId: 'rec-resp-2',
+            recordVersion: 'v1',
+          },
+        },
+      ],
+      messages: [{ role: 'user', parts: [{ text: 'Different candidate answer', sourceRef: 'resp-a-2' }] }],
+    });
+
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: substitutedIntent,
+          provider: 'MOCK',
+          cutoffMode: 'POST_START',
+          deadlineInput: makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          permitReceipt: {
+            permitId: 'permit-1',
+            canonicalDataClasses: first.canonicalDataClasses,
+            requestIdentity: first.requestIdentity,
+          },
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R5. Rejects permit reuse when promptVersion changes with unchanged data classes', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Synthetic candidate answer',
+    });
+
+    const first = resolveAndAuthorizeSourceManifest(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-a-1',
+        messages: createBaseIntent().messages,
+        descriptors: createBaseIntent().sourceManifest,
+        declaredDataClasses: ['USER_TRANSCRIPT'],
+        requestBinding: {
+          operationId: 'op-001',
+          generationEpoch: 1,
+          attemptId: 'att-001',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'QUESTION',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: '1.0.0',
+        },
+      },
+      resolver,
+    );
+
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent({ promptVersion: '2.0.0' }),
+          provider: 'MOCK',
+          cutoffMode: 'POST_START',
+          deadlineInput: makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          permitReceipt: {
+            permitId: 'permit-1',
+            canonicalDataClasses: first.canonicalDataClasses,
+            requestIdentity: first.requestIdentity,
+          },
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R6. Rejects permit reuse across provider or attempt changes', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Synthetic candidate answer',
+    });
+
+    const first = resolveAndAuthorizeSourceManifest(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-a-1',
+        messages: createBaseIntent().messages,
+        descriptors: createBaseIntent().sourceManifest,
+        declaredDataClasses: ['USER_TRANSCRIPT'],
+        requestBinding: {
+          operationId: 'op-001',
+          generationEpoch: 1,
+          attemptId: 'att-001',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'QUESTION',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: '1.0.0',
+        },
+      },
+      resolver,
+    );
+
+    const receipt = {
+      permitId: 'permit-1',
+      canonicalDataClasses: first.canonicalDataClasses,
+      requestIdentity: first.requestIdentity,
+    };
+
+    // Provider change
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent(),
+          provider: 'GROQ',
+          cutoffMode: 'POST_START',
+          deadlineInput: makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          permitReceipt: receipt,
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
+
+    // Attempt change
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent({ attemptId: 'att-002', attemptNo: 2 }),
+          provider: 'MOCK',
+          cutoffMode: 'POST_START',
+          deadlineInput: makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          permitReceipt: receipt,
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R7. Missing POST_START hardExpiryAt fails closed', () => {
+    const missingHardExpiry = {
+      controllerLeaseUntil: NOW_MS + 30_000,
+      effectiveDeadlineAt: NOW_MS + 30_000,
+      requestDeadline: NOW_MS + 30_000,
+    } as unknown as PostStartDeadlineInput;
+
+    expect(() => computePostStartCutoff(missingHardExpiry, NOW_MS)).toThrowError(SanitizedAiError);
+  });
+
+  it('R8. Malformed inputs and unexpected resolver exceptions map to sanitized errors without leaking details', () => {
+    const throwingResolver: AuthoritativeSourceResolver = {
+      resolveUserInterviewSource() {
+        throw new Error('RAW_DB_INTERNAL_CONNECTION_STRING_LEAK');
+      },
+      resolveServerTemplate() {
+        throw new Error('RAW_TEMPLATE_PATH_LEAK');
+      },
+      resolveSyntheticFixture() {
+        throw new Error('RAW_FIXTURE_SECRET_LEAK');
+      },
+    };
+
+    try {
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent(),
+          provider: 'MOCK',
+          cutoffMode: 'PRE_START',
+          deadlineInput: makePreStartDeadlines(),
+          nowMs: NOW_MS,
+        },
+        { resolver: throwingResolver, eligibilityPolicy: { isEligible: () => true } },
+      );
+      expect.unreachable('Expected SanitizedAiError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SanitizedAiError);
+      expect((err as SanitizedAiError).message).not.toContain('RAW_DB_INTERNAL_CONNECTION_STRING_LEAK');
+    }
+
+    // Invalid cutoffMode
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent(),
+          provider: 'MOCK',
+          cutoffMode: 'INVALID_MODE' as CutoffMode,
+          deadlineInput: makePreStartDeadlines(),
+          nowMs: NOW_MS,
+        },
+        { resolver: new DeterministicFakeSourceResolver(), eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
   });
 });

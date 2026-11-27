@@ -139,7 +139,7 @@ export interface PostStartDeadlineInput {
   controllerLeaseUntil: Date | string | number;
   effectiveDeadlineAt: Date | string | number;
   requestDeadline: Date | string | number;
-  hardExpiryAt?: Date | string | number;
+  hardExpiryAt: Date | string | number;
   policyCutoffAt?: Date | string | number;
 }
 

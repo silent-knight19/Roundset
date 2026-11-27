@@ -60,6 +60,9 @@ export function computePreStartCutoff(
   safetyMarginMs = 0,
   minViableCallMs = 1,
 ): DeadlineComputationResult {
+  if (!input || typeof input !== 'object') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Missing PRE_START deadline input');
+  }
   validateClockParams(nowMs, safetyMarginMs, minViableCallMs);
 
   const readyMs = parseValidTimestampMs(input.readyExpiresAt, 'readyExpiresAt');
@@ -70,7 +73,7 @@ export function computePreStartCutoff(
   const cutoffAtMs = Math.min(readyMs, reservationMs, leaseMs, requestMs);
   const remainingMs = Math.max(0, cutoffAtMs - nowMs - safetyMarginMs);
 
-  if (remainingMs < minViableCallMs) {
+  if (remainingMs <= 0 || remainingMs < minViableCallMs) {
     throw new SanitizedAiError(
       'AI_TIMEOUT',
       'Pre-start deadline window exhausted or below minimum viable call threshold',
@@ -82,7 +85,7 @@ export function computePreStartCutoff(
 
 /**
  * Computes POST_START cutoff from lease, effectiveDeadlineAt, requestDeadline,
- * and optional stricter hard-expiry or policy cutoffs.
+ * required hardExpiryAt, and optional stricter policy cutoff.
  */
 export function computePostStartCutoff(
   input: PostStartDeadlineInput,
@@ -90,20 +93,18 @@ export function computePostStartCutoff(
   safetyMarginMs = 0,
   minViableCallMs = 1,
 ): DeadlineComputationResult {
+  if (!input || typeof input !== 'object') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Missing POST_START deadline input');
+  }
   validateClockParams(nowMs, safetyMarginMs, minViableCallMs);
 
   const leaseMs = parseValidTimestampMs(input.controllerLeaseUntil, 'controllerLeaseUntil');
   const effectiveMs = parseValidTimestampMs(input.effectiveDeadlineAt, 'effectiveDeadlineAt');
   const requestMs = parseValidTimestampMs(input.requestDeadline, 'requestDeadline');
+  const hardExpiryMs = parseValidTimestampMs(input.hardExpiryAt, 'hardExpiryAt');
 
-  let cutoffAtMs = Math.min(leaseMs, effectiveMs, requestMs);
+  let cutoffAtMs = Math.min(leaseMs, effectiveMs, requestMs, hardExpiryMs);
 
-  if (input.hardExpiryAt !== undefined) {
-    cutoffAtMs = Math.min(
-      cutoffAtMs,
-      parseValidTimestampMs(input.hardExpiryAt, 'hardExpiryAt'),
-    );
-  }
   if (input.policyCutoffAt !== undefined) {
     cutoffAtMs = Math.min(
       cutoffAtMs,
@@ -113,7 +114,7 @@ export function computePostStartCutoff(
 
   const remainingMs = Math.max(0, cutoffAtMs - nowMs - safetyMarginMs);
 
-  if (remainingMs < minViableCallMs) {
+  if (remainingMs <= 0 || remainingMs < minViableCallMs) {
     throw new SanitizedAiError(
       'AI_TIMEOUT',
       'Post-start deadline window exhausted or below minimum viable call threshold',

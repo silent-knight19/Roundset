@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import {
   DataClass,
   GenerationMessage,
@@ -9,6 +9,9 @@ import {
   SourceKind,
 } from './contracts.js';
 
+/** Process-scoped ephemeral key for privacy-safe internal request/permit binding. */
+const EPHEMERAL_PERMIT_HMAC_KEY = randomBytes(32);
+
 export interface AuthoritativeUserInterviewRecord {
   userId: string;
   interviewId: string;
@@ -16,16 +19,19 @@ export interface AuthoritativeUserInterviewRecord {
   recordVersion: string;
   kind: SourceKind;
   ancestorRefs: ReadonlyArray<string>;
+  content: string;
 }
 
 export interface AuthoritativeServerTemplateRecord {
   templateId: string;
   templateVersion: string;
+  content: string;
 }
 
 export interface AuthoritativeSyntheticFixtureRecord {
   fixtureId: string;
   fixtureVersion: string;
+  content: string;
 }
 
 export interface AuthoritativeSourceResolver {
@@ -56,12 +62,24 @@ export interface ProviderEligibilityPolicy {
   }): boolean;
 }
 
+export interface RequestBindingMetadata {
+  operationId: string;
+  generationEpoch: number;
+  attemptId: string;
+  attemptNo: number;
+  provider: ProviderId;
+  purpose: Purpose;
+  promptVersion: string;
+  outputSchemaVersion: string;
+}
+
 export interface ResolveManifestInput {
   authenticatedUserId: string;
   interviewId: string;
   messages: ReadonlyArray<GenerationMessage>;
   descriptors: ReadonlyArray<SourceDescriptor>;
   declaredDataClasses: ReadonlyArray<DataClass>;
+  requestBinding?: RequestBindingMetadata;
 }
 
 export interface ResolvedManifestResult {
@@ -147,26 +165,98 @@ function assertValidClassCombination(classes: ReadonlySet<DataClass>): void {
   }
 }
 
+function safeInvokeResolver<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof SanitizedAiError) {
+      throw err;
+    }
+    // Map unexpected resolver errors to a sanitized error without leaking source details.
+    throw new SanitizedAiError(
+      'AI_PROVIDER_UNAVAILABLE',
+      'Authoritative source resolution failed unexpectedly',
+    );
+  }
+}
+
+function assertNoDuplicateRefs(refs: ReadonlyArray<string>, label: string): void {
+  if (!Array.isArray(refs)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', `Invalid ${label} list`);
+  }
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    if (typeof ref !== 'string' || ref.length === 0) {
+      throw new SanitizedAiError('AI_PRIVACY_INELIGIBLE', `Invalid reference in ${label}`);
+    }
+    if (seen.has(ref)) {
+      throw new SanitizedAiError('AI_PRIVACY_INELIGIBLE', `Duplicate reference in ${label}`);
+    }
+    seen.add(ref);
+  }
+}
+
+interface ResolvedDescriptorInfo {
+  classes: ReadonlySet<DataClass>;
+  authoritativeContent: string;
+  authoritativeIdentity: string;
+}
+
 /**
  * Pure, fail-closed provenance and ownership verifier for GenerationIntent.
- * Validates all message parts, recursive DERIVED_SUMMARY lineage, owner/interview
- * boundaries, and canonical data-class derivation before any provider admission.
+ * Validates all message parts against authoritative source content, recursive
+ * DERIVED_SUMMARY lineage, owner/interview boundaries, and canonical data-class derivation.
  */
 export function resolveAndAuthorizeSourceManifest(
   input: ResolveManifestInput,
   resolver: AuthoritativeSourceResolver,
 ): ResolvedManifestResult {
-  if (!input.authenticatedUserId || !input.interviewId) {
+  if (!input || typeof input !== 'object') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Manifest input must be an object');
+  }
+  if (
+    typeof input.authenticatedUserId !== 'string' ||
+    input.authenticatedUserId.length === 0 ||
+    typeof input.interviewId !== 'string' ||
+    input.interviewId.length === 0
+  ) {
     throw new SanitizedAiError(
       'AI_PRIVACY_INELIGIBLE',
       'Authenticated user and interview context are required',
     );
   }
+  if (!Array.isArray(input.messages) || input.messages.length === 0) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Generation messages must be a non-empty array',
+    );
+  }
+  if (!Array.isArray(input.descriptors)) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Source descriptors must be an array',
+    );
+  }
+  if (!Array.isArray(input.declaredDataClasses)) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Declared dataClasses must be an array',
+    );
+  }
+  if (!resolver || typeof resolver !== 'object') {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Authoritative resolver is required');
+  }
 
   const descriptorByRef = new Map<string, SourceDescriptor>();
   for (const descriptor of input.descriptors) {
-    if (!descriptor.ref || typeof descriptor.ref !== 'string') {
+    if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.ref !== 'string' || descriptor.ref.length === 0) {
       throw new SanitizedAiError('AI_PRIVACY_INELIGIBLE', 'Invalid source descriptor reference');
+    }
+    if (!Array.isArray(descriptor.inheritedClasses) || !Array.isArray(descriptor.ancestorRefs)) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Malformed source descriptor arrays');
+    }
+    if (!descriptor.scope || typeof descriptor.scope !== 'object') {
+      throw new SanitizedAiError('AI_PRIVACY_INELIGIBLE', 'Missing source descriptor scope');
     }
     if (descriptorByRef.has(descriptor.ref)) {
       throw new SanitizedAiError(
@@ -177,11 +267,11 @@ export function resolveAndAuthorizeSourceManifest(
     descriptorByRef.set(descriptor.ref, descriptor);
   }
 
-  const resolvedClassesCache = new Map<string, ReadonlySet<DataClass>>();
+  const resolvedCache = new Map<string, ResolvedDescriptorInfo>();
   const visiting = new Set<string>();
 
-  function resolveDescriptorClasses(ref: string): ReadonlySet<DataClass> {
-    const cached = resolvedClassesCache.get(ref);
+  function resolveDescriptor(ref: string): ResolvedDescriptorInfo {
+    const cached = resolvedCache.get(ref);
     if (cached) return cached;
 
     if (visiting.has(ref)) {
@@ -201,54 +291,91 @@ export function resolveAndAuthorizeSourceManifest(
 
     visiting.add(ref);
     let derived: Set<DataClass>;
+    let authoritativeContent: string;
+    let authoritativeIdentity: string;
 
     try {
       switch (descriptor.kind) {
         case 'TRUSTED_TEMPLATE': {
+          assertNoDuplicateRefs(descriptor.ancestorRefs, 'TRUSTED_TEMPLATE ancestorRefs');
+          if (descriptor.ancestorRefs.length > 0) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Root template source must not declare ancestorRefs',
+            );
+          }
           if (descriptor.scope.type !== 'SERVER_TEMPLATE') {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
               'TRUSTED_TEMPLATE requires SERVER_TEMPLATE scope',
             );
           }
-          const tpl = resolver.resolveServerTemplate({
-            templateId: descriptor.scope.templateId,
-            templateVersion: descriptor.scope.templateVersion,
-          });
-          if (!tpl) {
+          const { templateId, templateVersion } = descriptor.scope;
+          const tpl = safeInvokeResolver(() =>
+            resolver.resolveServerTemplate({ templateId, templateVersion }),
+          );
+          if (
+            !tpl ||
+            tpl.templateId !== templateId ||
+            tpl.templateVersion !== templateVersion ||
+            typeof tpl.content !== 'string'
+          ) {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
-              'Unregistered server template',
+              'Unregistered or mismatched server template',
             );
           }
           derived = new Set<DataClass>();
+          authoritativeContent = tpl.content;
+          authoritativeIdentity = `tpl:${tpl.templateId}:${tpl.templateVersion}`;
           break;
         }
 
         case 'SYNTHETIC_FIXTURE': {
+          assertNoDuplicateRefs(descriptor.ancestorRefs, 'SYNTHETIC_FIXTURE ancestorRefs');
+          if (descriptor.ancestorRefs.length > 0) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Root synthetic fixture must not declare ancestorRefs',
+            );
+          }
           if (descriptor.scope.type !== 'SYNTHETIC_FIXTURE') {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
               'SYNTHETIC_FIXTURE requires SYNTHETIC_FIXTURE scope',
             );
           }
-          const fixture = resolver.resolveSyntheticFixture({
-            fixtureId: descriptor.scope.fixtureId,
-            fixtureVersion: descriptor.scope.fixtureVersion,
-          });
-          if (!fixture) {
+          const { fixtureId, fixtureVersion } = descriptor.scope;
+          const fixture = safeInvokeResolver(() =>
+            resolver.resolveSyntheticFixture({ fixtureId, fixtureVersion }),
+          );
+          if (
+            !fixture ||
+            fixture.fixtureId !== fixtureId ||
+            fixture.fixtureVersion !== fixtureVersion ||
+            typeof fixture.content !== 'string'
+          ) {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
-              'Unregistered synthetic fixture',
+              'Unregistered or mismatched synthetic fixture',
             );
           }
           derived = new Set<DataClass>(['SYNTHETIC']);
+          authoritativeContent = fixture.content;
+          authoritativeIdentity = `fix:${fixture.fixtureId}:${fixture.fixtureVersion}`;
           break;
         }
 
         case 'CANDIDATE_RESPONSE':
         case 'CANDIDATE_CONFIGURATION':
         case 'CANDIDATE_DOCUMENT': {
+          assertNoDuplicateRefs(descriptor.ancestorRefs, 'root source ancestorRefs');
+          if (descriptor.ancestorRefs.length > 0) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Root candidate source must not declare ancestorRefs',
+            );
+          }
           if (descriptor.scope.type !== 'USER_INTERVIEW') {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
@@ -264,32 +391,45 @@ export function resolveAndAuthorizeSourceManifest(
               'Source scope does not match authenticated principal or current interview',
             );
           }
-          const record = resolver.resolveUserInterviewSource({
-            userId: input.authenticatedUserId,
-            interviewId: input.interviewId,
-            recordId: descriptor.scope.recordId,
-            recordVersion: descriptor.scope.recordVersion,
-          });
+          const { recordId, recordVersion } = descriptor.scope;
+          const record = safeInvokeResolver(() =>
+            resolver.resolveUserInterviewSource({
+              userId: input.authenticatedUserId,
+              interviewId: input.interviewId,
+              recordId,
+              recordVersion,
+            }),
+          );
           if (
             !record ||
             record.userId !== input.authenticatedUserId ||
             record.interviewId !== input.interviewId ||
-            record.recordId !== descriptor.scope.recordId ||
-            record.recordVersion !== descriptor.scope.recordVersion ||
-            record.kind !== descriptor.kind
+            record.recordId !== recordId ||
+            record.recordVersion !== recordVersion ||
+            record.kind !== descriptor.kind ||
+            typeof record.content !== 'string'
           ) {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
               'Authoritative source resolution failed',
             );
           }
+          if (!Array.isArray(record.ancestorRefs) || record.ancestorRefs.length > 0) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Root source must not conceal undeclared derived lineage',
+            );
+          }
           const dataClass: DataClass =
             descriptor.kind === 'CANDIDATE_DOCUMENT' ? 'USER_DOCUMENT' : 'USER_TRANSCRIPT';
           derived = new Set<DataClass>([dataClass]);
+          authoritativeContent = record.content;
+          authoritativeIdentity = `usr:${record.userId}:${record.interviewId}:${record.recordId}:${record.recordVersion}`;
           break;
         }
 
         case 'DERIVED_SUMMARY': {
+          assertNoDuplicateRefs(descriptor.ancestorRefs, 'DERIVED_SUMMARY ancestorRefs');
           if (descriptor.scope.type !== 'USER_INTERVIEW') {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
@@ -305,40 +445,58 @@ export function resolveAndAuthorizeSourceManifest(
               'Derived summary scope does not match authenticated principal or current interview',
             );
           }
-          const record = resolver.resolveUserInterviewSource({
-            userId: input.authenticatedUserId,
-            interviewId: input.interviewId,
-            recordId: descriptor.scope.recordId,
-            recordVersion: descriptor.scope.recordVersion,
-          });
+          const { recordId, recordVersion } = descriptor.scope;
+          const record = safeInvokeResolver(() =>
+            resolver.resolveUserInterviewSource({
+              userId: input.authenticatedUserId,
+              interviewId: input.interviewId,
+              recordId,
+              recordVersion,
+            }),
+          );
           if (
             !record ||
             record.userId !== input.authenticatedUserId ||
             record.interviewId !== input.interviewId ||
-            record.recordId !== descriptor.scope.recordId ||
-            record.recordVersion !== descriptor.scope.recordVersion ||
-            record.kind !== 'DERIVED_SUMMARY'
+            record.recordId !== recordId ||
+            record.recordVersion !== recordVersion ||
+            record.kind !== 'DERIVED_SUMMARY' ||
+            typeof record.content !== 'string'
           ) {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
               'Authoritative derived summary resolution failed',
             );
           }
-          if (descriptor.ancestorRefs.length === 0) {
+          assertNoDuplicateRefs(record.ancestorRefs, 'authoritative ancestorRefs');
+          if (record.ancestorRefs.length === 0 || descriptor.ancestorRefs.length === 0) {
             throw new SanitizedAiError(
               'AI_PRIVACY_INELIGIBLE',
               'DERIVED_SUMMARY must declare at least one ancestor reference',
             );
           }
 
+          const declaredAncestors = new Set<string>(descriptor.ancestorRefs);
+          const authoritativeAncestors = new Set<string>(record.ancestorRefs);
+          if (!setsEqual(declaredAncestors, authoritativeAncestors)) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Declared DERIVED_SUMMARY ancestorRefs do not match authoritative lineage',
+            );
+          }
+
           derived = new Set<DataClass>();
-          for (const ancestorRef of descriptor.ancestorRefs) {
-            const ancestorClasses = resolveDescriptorClasses(ancestorRef);
-            for (const cls of ancestorClasses) {
+          const ancestorIdentities: string[] = [];
+          for (const ancestorRef of record.ancestorRefs) {
+            const ancestorInfo = resolveDescriptor(ancestorRef);
+            for (const cls of ancestorInfo.classes) {
               derived.add(cls);
             }
+            ancestorIdentities.push(ancestorInfo.authoritativeIdentity);
           }
           assertValidClassCombination(derived);
+          authoritativeContent = record.content;
+          authoritativeIdentity = `sum:${record.userId}:${record.interviewId}:${record.recordId}:${record.recordVersion}[${ancestorIdentities.sort().join(',')}]`;
           break;
         }
 
@@ -355,8 +513,13 @@ export function resolveAndAuthorizeSourceManifest(
         );
       }
 
-      resolvedClassesCache.set(ref, derived);
-      return derived;
+      const info: ResolvedDescriptorInfo = {
+        classes: derived,
+        authoritativeContent,
+        authoritativeIdentity,
+      };
+      resolvedCache.set(ref, info);
+      return info;
     } finally {
       visiting.delete(ref);
     }
@@ -364,31 +527,70 @@ export function resolveAndAuthorizeSourceManifest(
 
   const totalClasses = new Set<DataClass>();
   const flattenedMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
+  const messageComposition: Array<{
+    role: string;
+    parts: Array<{ sourceIdentity: string; contentMac: string }>;
+  }> = [];
 
   for (const message of input.messages) {
-    if (!message.parts || message.parts.length === 0) {
+    if (
+      !message ||
+      typeof message !== 'object' ||
+      (message.role !== 'system' && message.role !== 'user' && message.role !== 'assistant') ||
+      !Array.isArray(message.parts) ||
+      message.parts.length === 0
+    ) {
       throw new SanitizedAiError(
         'AI_CONFIGURATION_INVALID',
-        'Every generation message must contain at least one part',
+        'Every generation message must have a valid role and at least one part',
       );
     }
     const textChunks: string[] = [];
+    const partBindings: Array<{ sourceIdentity: string; contentMac: string }> = [];
+
     for (const part of message.parts) {
-      if (!part.sourceRef) {
+      if (
+        !part ||
+        typeof part !== 'object' ||
+        typeof part.sourceRef !== 'string' ||
+        part.sourceRef.length === 0 ||
+        typeof part.text !== 'string'
+      ) {
         throw new SanitizedAiError(
           'AI_PRIVACY_INELIGIBLE',
-          'Message part is missing sourceRef',
+          'Message part is missing valid sourceRef or text',
         );
       }
-      const partClasses = resolveDescriptorClasses(part.sourceRef);
-      for (const cls of partClasses) {
+
+      const resolvedInfo = resolveDescriptor(part.sourceRef);
+      if (part.text !== resolvedInfo.authoritativeContent) {
+        throw new SanitizedAiError(
+          'AI_PRIVACY_INELIGIBLE',
+          'Message part content does not match authoritative source record',
+        );
+      }
+
+      for (const cls of resolvedInfo.classes) {
         totalClasses.add(cls);
       }
-      textChunks.push(part.text);
+      textChunks.push(resolvedInfo.authoritativeContent);
+
+      const contentMac = createHmac('sha256', EPHEMERAL_PERMIT_HMAC_KEY)
+        .update(resolvedInfo.authoritativeContent)
+        .digest('hex');
+      partBindings.push({
+        sourceIdentity: resolvedInfo.authoritativeIdentity,
+        contentMac,
+      });
     }
+
     flattenedMessages.push({
       role: message.role,
       content: textChunks.join('\n'),
+    });
+    messageComposition.push({
+      role: message.role,
+      parts: partBindings,
     });
   }
 
@@ -403,13 +605,17 @@ export function resolveAndAuthorizeSourceManifest(
   }
 
   const canonicalDataClasses = sortDataClasses(totalClasses);
-  const identityInput = JSON.stringify({
-    u: input.authenticatedUserId,
-    i: input.interviewId,
-    c: canonicalDataClasses,
-    n: input.descriptors.length,
+  const bindingPayload = JSON.stringify({
+    authenticatedUserId: input.authenticatedUserId,
+    interviewId: input.interviewId,
+    canonicalDataClasses,
+    requestBinding: input.requestBinding ?? null,
+    messageComposition,
   });
-  const requestIdentity = createHash('sha256').update(identityInput).digest('hex').slice(0, 24);
+  const requestIdentity = createHmac('sha256', EPHEMERAL_PERMIT_HMAC_KEY)
+    .update(bindingPayload)
+    .digest('hex')
+    .slice(0, 32);
 
   return {
     canonicalDataClasses,
