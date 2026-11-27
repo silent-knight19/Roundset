@@ -12,6 +12,7 @@ import { OTP_POLICY, OtpInvalidError } from '../otp/types.js';
 import type { PasswordService } from '../password/password.service.js';
 import type { AuthRateLimitService } from '../rate-limit/rate-limit.service.js';
 import { RATE_LIMIT_POLICIES } from '../rate-limit/types.js';
+import { createRegistrationReceipt, readRegistrationReceipt, registrationRateSubject } from './receipt.js';
 
 export const PENDING_REGISTRATION_POLICY = {
   ttlMs: 15 * 60_000,
@@ -117,14 +118,11 @@ export class PendingRegistrationService {
     checkEligibility?: RegistrationEligibilityCheck
   ): Promise<StartRegistrationResult> {
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
+    const subject = registrationRateSubject(this.hmacSecret, input.emailNormalized);
     const cooldownResult = await this.rateLimitService.consumeOrThrow(
-      'REGISTER_REPLACE_COOLDOWN',
-      input.emailNormalized
+      'REGISTER_REPLACE_COOLDOWN', subject
     );
-    await this.rateLimitService.consumeOrThrow(
-      'REGISTER_RESEND_EMAIL',
-      input.emailNormalized
-    );
+    await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_EMAIL', subject);
 
     // Bind ordering to the durable cooldown admission timestamp, not a post-limiter clock read
     const admissionTime = new Date(
@@ -135,12 +133,10 @@ export class PendingRegistrationService {
     const registrationId = crypto
       .randomBytes(PENDING_REGISTRATION_POLICY.registrationIdBytes)
       .toString('hex');
-    const nonce = crypto
-      .randomBytes(PENDING_REGISTRATION_POLICY.nonceBytes)
-      .toString('base64url');
     const otpCode = generateOtpCode();
     const currentNow = this.now();
     const expiresAt = new Date(currentNow.getTime() + PENDING_REGISTRATION_POLICY.ttlMs);
+    const nonce = createRegistrationReceipt(this.hmacSecret, registrationId, subject, expiresAt);
     const otpExpiresAt = new Date(
       currentNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs
     );
@@ -290,6 +286,16 @@ export class PendingRegistrationService {
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
 
     const currentNow = this.now();
+    const receipt = readRegistrationReceipt(this.hmacSecret, input.registrationId, input.nonce, currentNow);
+    if (!receipt) throw new OtpInvalidError();
+    // Both genuine and decoy receipts carry the same authenticated rate subject.
+    // Charge before lookup so absence, replacement and consumption cannot be oracles.
+    await this.rateLimitService.consumeOrThrow('REGISTER_REPLACE_COOLDOWN', receipt.subject);
+    await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_EMAIL', receipt.subject);
+    const genericResult: ResendRegistrationResult = {
+      registrationId: input.registrationId, version: 1,
+      deliveryAccepted: false, otpExpiresAt: currentNow,
+    };
     const expectedNonceDigest = computeDomainHmac(this.hmacSecret, [
       'REG_NONCE',
       input.registrationId,
@@ -305,18 +311,9 @@ export class PendingRegistrationService {
       })
       .exec();
 
-    if (!existing) {
-      throw new OtpInvalidError();
+    if (!existing || registrationRateSubject(this.hmacSecret, existing.emailNormalized) !== receipt.subject) {
+      return genericResult;
     }
-
-    await this.rateLimitService.consumeOrThrow(
-      'REGISTER_REPLACE_COOLDOWN',
-      existing.emailNormalized
-    );
-    await this.rateLimitService.consumeOrThrow(
-      'REGISTER_RESEND_EMAIL',
-      existing.emailNormalized
-    );
 
     if (checkEligibility && !(await checkEligibility(existing.emailNormalized, existing.consentVersion))) {
       // The bound request has consumed its ordinary abuse budget, but a
@@ -332,7 +329,7 @@ export class PendingRegistrationService {
     // The asynchronous rate/eligibility checks may have consumed time.
     // Never extend the original pending registration's lifetime.
     const resendNow = this.now();
-    if (existing.expiresAt <= resendNow) throw new OtpInvalidError();
+    if (existing.expiresAt <= resendNow || receipt.expiresAt <= resendNow) return genericResult;
     const nextVersion = existing.version + 1;
     const otpCode = generateOtpCode();
     const otpExpiresAt = new Date(Math.min(
@@ -371,9 +368,7 @@ export class PendingRegistrationService {
       )
       .exec();
 
-    if (!updated) {
-      throw new OtpInvalidError();
-    }
+    if (!updated) return genericResult;
 
     const deliveryAccepted = await this.dispatchAndRecordDelivery(
       updated.registrationId,

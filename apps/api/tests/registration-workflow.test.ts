@@ -8,6 +8,7 @@ import { RATE_LIMIT_POLICIES, RateLimitExceededError } from '../src/modules/auth
 import type { PasswordService } from '../src/modules/auth/password/password.service.js';
 import { PendingRegistrationService } from '../src/modules/auth/registration/registration.service.js';
 import { RegistrationWorkflow } from '../src/modules/auth/registration/workflow.js';
+import { registrationRateSubject } from '../src/modules/auth/registration/receipt.js';
 
 const lookup = vi.hoisted(() => ({
   userExists: vi.fn(),
@@ -21,6 +22,8 @@ vi.mock('../src/modules/identity/models/index.js', () => ({
 }));
 
 const email = 'candidate@example.test';
+const secret = 'synthetic-reg-test-secret-at-least-32-bytes';
+const subject = registrationRateSubject(secret, email);
 const ip = '203.0.113.30';
 const input = { email, password: 'Valid-Password-2026!', consentVersion: 'v1' };
 const requestId = '00000000-0000-4000-8000-000000000004';
@@ -48,7 +51,7 @@ function fixture(mode: 'PUBLIC' | 'INVITE_ONLY' = 'PUBLIC') {
     rateLimitService: rateLimits,
     passwordService: { hashPassword: hash } as unknown as PasswordService,
     emailSender: { providerName: 'mock', sendOtpEmail: send },
-    hmacSecret: 'synthetic-reg-test-secret-at-least-32-bytes',
+    hmacSecret: secret,
     now: () => now,
   });
   const activate = vi.fn(async () => undefined);
@@ -101,8 +104,8 @@ describe('P2-AUTH-03b registration admission and workflow', () => {
     const real = await eligible.workflow.register(input, ip);
     expect(eligible.consume.mock.calls).toEqual([
       ['REGISTER_RESEND_IP', ip],
-      ['REGISTER_REPLACE_COOLDOWN', email],
-      ['REGISTER_RESEND_EMAIL', email],
+      ['REGISTER_REPLACE_COOLDOWN', subject],
+      ['REGISTER_RESEND_EMAIL', subject],
     ]);
     expect(eligible.hash).toHaveBeenCalledWith(input.password);
     expect(eligible.hash.mock.invocationCallOrder[0])
@@ -120,7 +123,7 @@ describe('P2-AUTH-03b registration admission and workflow', () => {
     expect(Object.keys(decoy).sort()).toEqual(Object.keys(real).sort());
     for (const result of [real, decoy]) {
       expect(result.registrationId).toMatch(/^[a-f0-9]{32}$/);
-      expect(result.nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(result.nonce).toMatch(/^[A-Za-z0-9_-]{128}$/);
     }
     expect(decoy.registrationId).not.toBe(real.registrationId);
     expect(ineligible.pendingStore.findOne).not.toHaveBeenCalled();
@@ -172,19 +175,58 @@ describe('P2-AUTH-03b registration admission and workflow', () => {
 
   it('does not resend for an account which became ineligible after registration', async () => {
     const f = fixture();
+    const receipt = await f.workflow.register(input, ip);
+    f.consume.mockClear();
+    f.pendingStore.findOneAndUpdate.mockClear();
+    f.send.mockClear();
     f.findExec.mockResolvedValue({
-      registrationId: 'registration', emailNormalized: email,
+      registrationId: receipt.registrationId, emailNormalized: email,
       consentVersion: 'v1', version: 1, otpExpiresAt: new Date(f.now.getTime() + 60_000),
       expiresAt: new Date(f.now.getTime() + 120_000),
     });
     lookup.userExec.mockResolvedValue({ _id: 'existing-principal' });
-    await expect(f.workflow.resend('registration', 'nonce', ip)).resolves.toBeUndefined();
+    await expect(f.workflow.resend(receipt.registrationId, receipt.nonce, ip)).resolves.toBeUndefined();
     expect(f.consume.mock.calls).toEqual([
-      ['REGISTER_RESEND_IP', ip], ['REGISTER_REPLACE_COOLDOWN', email],
-      ['REGISTER_RESEND_EMAIL', email],
+      ['REGISTER_RESEND_IP', ip], ['REGISTER_REPLACE_COOLDOWN', subject],
+      ['REGISTER_RESEND_EMAIL', subject],
     ]);
     expect(f.pendingStore.findOneAndUpdate).not.toHaveBeenCalled();
     expect(f.send).not.toHaveBeenCalled();
+  });
+
+  it('charges identical resend budgets for a genuine and a decoy receipt before lookup', async () => {
+    const real = fixture();
+    const realReceipt = await real.workflow.register(input, ip);
+    lookup.userExec.mockResolvedValue({ _id: 'existing-principal' });
+    const decoy = fixture();
+    const decoyReceipt = await decoy.workflow.register(input, ip);
+    for (const [f, receipt] of [[real, realReceipt], [decoy, decoyReceipt]] as const) {
+      f.consume.mockClear();
+      f.pendingStore.findOne.mockClear();
+      f.send.mockClear();
+      await expect(f.workflow.resend(receipt.registrationId, receipt.nonce, ip)).resolves.toBeUndefined();
+      expect(f.consume.mock.calls).toEqual([
+        ['REGISTER_RESEND_IP', ip], ['REGISTER_REPLACE_COOLDOWN', subject],
+        ['REGISTER_RESEND_EMAIL', subject],
+      ]);
+      expect(f.consume.mock.invocationCallOrder[2]).toBeLessThan(f.pendingStore.findOne.mock.invocationCallOrder[0]!);
+      expect(f.send).not.toHaveBeenCalled();
+      f.consume.mockRejectedValueOnce(new RateLimitExceededError(60, 'OTP_RATE_LIMITED'));
+      await expect(f.workflow.resend(receipt.registrationId, receipt.nonce, ip)).rejects.toMatchObject({ statusCode: 429 });
+    }
+  });
+
+  it('rejects forged and swapped receipts before using an email budget', async () => {
+    const f = fixture();
+    const receipt = await f.workflow.register(input, ip);
+    f.consume.mockClear();
+    f.pendingStore.findOne.mockClear();
+    const modified = (receipt.nonce[0] === 'A' ? 'B' : 'A') + receipt.nonce.slice(1);
+    for (const [id, nonce] of [[receipt.registrationId, modified], ['a'.repeat(32), receipt.nonce]] as const) {
+      await expect(f.workflow.resend(id, nonce, ip)).rejects.toMatchObject({ code: 'OTP_INVALID' });
+    }
+    expect(f.consume.mock.calls).toEqual([['REGISTER_RESEND_IP', ip], ['REGISTER_RESEND_IP', ip]]);
+    expect(f.pendingStore.findOne).not.toHaveBeenCalled();
   });
 
   it('charges the IP cap for invalid browser registration cookies', async () => {
