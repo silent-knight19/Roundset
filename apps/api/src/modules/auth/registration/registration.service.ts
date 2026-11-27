@@ -52,6 +52,12 @@ export interface PendingRegistrationServiceOptions {
   compareDigest?: (actual: string, expected: string) => boolean;
 }
 
+/** A trusted server-side admission decision, evaluated only after abuse admission. */
+export type RegistrationEligibilityCheck = (
+  emailNormalized: string,
+  consentVersion: string
+) => Promise<boolean>;
+
 export interface StartRegistrationInput {
   emailNormalized: string;
   password: string;
@@ -107,7 +113,8 @@ export class PendingRegistrationService {
    * touching pendingRegistrations. Never sends an email unless persistence succeeded.
    */
   async startOrReplaceRegistration(
-    input: StartRegistrationInput
+    input: StartRegistrationInput,
+    checkEligibility?: RegistrationEligibilityCheck
   ): Promise<StartRegistrationResult> {
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
     const cooldownResult = await this.rateLimitService.consumeOrThrow(
@@ -143,6 +150,20 @@ export class PendingRegistrationService {
       registrationId,
       nonce,
     ]);
+
+    // Real pending work is stored only for eligible addresses. Generate the
+    // same random ID/nonce and perform the same bounded hash for ineligible
+    // addresses, but never create a pending credential or send to them.
+    if (checkEligibility && !(await checkEligibility(input.emailNormalized, input.consentVersion))) {
+      return {
+        registrationId,
+        nonce,
+        version: 1,
+        deliveryAccepted: false,
+        expiresAt,
+        otpExpiresAt,
+      };
+    }
 
     let version = 1;
     let persisted = false;
@@ -220,8 +241,9 @@ export class PendingRegistrationService {
               otpExpiresAt,
               expiresAt,
               consentVersion: input.consentVersion,
-              displayName: input.displayName,
+              ...(input.displayName === undefined ? {} : { displayName: input.displayName }),
             },
+            ...(input.displayName === undefined ? { $unset: { displayName: 1 } } : {}),
             $inc: { resendCount: 1 },
           },
           { new: true }
@@ -262,7 +284,8 @@ export class PendingRegistrationService {
    * while advancing version, resetting attempts, and issuing a fresh 5m OTP.
    */
   async resendRegistrationOtp(
-    input: ResendRegistrationInput
+    input: ResendRegistrationInput,
+    checkEligibility?: RegistrationEligibilityCheck
   ): Promise<ResendRegistrationResult> {
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
 
@@ -294,6 +317,17 @@ export class PendingRegistrationService {
       'REGISTER_RESEND_EMAIL',
       existing.emailNormalized
     );
+
+    if (checkEligibility && !(await checkEligibility(existing.emailNormalized, existing.consentVersion))) {
+      // The bound request has consumed its ordinary abuse budget, but a
+      // newly ineligible registration must not receive another message.
+      return {
+        registrationId: existing.registrationId,
+        version: existing.version,
+        deliveryAccepted: false,
+        otpExpiresAt: existing.otpExpiresAt,
+      };
+    }
 
     const nextVersion = existing.version + 1;
     const otpCode = generateOtpCode();
