@@ -486,6 +486,35 @@ export function resolveAndAuthorizeSourceManifest(
               'DERIVED_SUMMARY must declare at least one ancestor reference',
             );
           }
+          if (
+            !Array.isArray(record.authoritativeAncestors) ||
+            record.authoritativeAncestors.length === 0
+          ) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'DERIVED_SUMMARY requires non-empty authoritativeAncestors',
+            );
+          }
+
+          const expectedKeys = new Set<string>();
+          for (const anc of record.authoritativeAncestors) {
+            if (
+              !anc ||
+              typeof anc !== 'object' ||
+              typeof anc.kind !== 'string' ||
+              anc.kind.length === 0 ||
+              typeof anc.recordId !== 'string' ||
+              anc.recordId.length === 0 ||
+              typeof anc.recordVersion !== 'string' ||
+              anc.recordVersion.length === 0
+            ) {
+              throw new SanitizedAiError(
+                'AI_PRIVACY_INELIGIBLE',
+                'Malformed authoritativeAncestors entry',
+              );
+            }
+            expectedKeys.add(`${anc.kind}:${anc.recordId}:${anc.recordVersion}`);
+          }
 
           const declaredAncestors = new Set<string>(descriptor.ancestorRefs);
           const authoritativeAncestors = new Set<string>(record.ancestorRefs);
@@ -506,24 +535,21 @@ export function resolveAndAuthorizeSourceManifest(
             }
             ancestorIdentities.push(ancestorInfo.authoritativeIdentity);
             const ancestorDesc = descriptorByRef.get(ancestorRef);
-            if (ancestorDesc && ancestorDesc.scope.type === 'USER_INTERVIEW') {
-              resolvedAncestorKeys.add(
-                `${ancestorDesc.kind}:${ancestorDesc.scope.recordId}:${ancestorDesc.scope.recordVersion}`,
-              );
-            }
-          }
-          if (record.authoritativeAncestors) {
-            const expectedKeys = new Set<string>(
-              record.authoritativeAncestors.map(
-                (a) => `${a.kind}:${a.recordId}:${a.recordVersion}`,
-              ),
-            );
-            if (!setsEqual(resolvedAncestorKeys, expectedKeys)) {
+            if (!ancestorDesc || ancestorDesc.scope.type !== 'USER_INTERVIEW') {
               throw new SanitizedAiError(
                 'AI_PRIVACY_INELIGIBLE',
-                'Resolved ancestor identities do not match authoritative summary lineage',
+                'DERIVED_SUMMARY ancestors must be authoritative USER_INTERVIEW sources',
               );
             }
+            resolvedAncestorKeys.add(
+              `${ancestorDesc.kind}:${ancestorDesc.scope.recordId}:${ancestorDesc.scope.recordVersion}`,
+            );
+          }
+          if (!setsEqual(resolvedAncestorKeys, expectedKeys)) {
+            throw new SanitizedAiError(
+              'AI_PRIVACY_INELIGIBLE',
+              'Resolved ancestor identities do not match authoritative summary lineage',
+            );
           }
           assertValidClassCombination(derived);
           authoritativeContent = record.content;

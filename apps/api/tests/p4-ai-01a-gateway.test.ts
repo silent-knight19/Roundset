@@ -93,6 +93,9 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
       recordVersion: 'v1',
       kind: 'DERIVED_SUMMARY',
       ancestorRefs: ['resp-a-1'],
+      authoritativeAncestors: [
+        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+      ],
       content: 'Synthetic summary context',
     });
 
@@ -1433,5 +1436,231 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
     );
 
     expect(result.canonicalDataClasses).toEqual(['USER_TRANSCRIPT', 'USER_DOCUMENT']);
+  });
+
+  // --- P4-AI-01a-R3 Mandatory Regressions ---
+
+  it('R14. Rejects DERIVED_SUMMARY when authoritativeAncestors is missing', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Answer 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-1'],
+      content: 'Summary without authoritativeAncestors',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            {
+              role: 'user',
+              parts: [{ text: 'Summary without authoritativeAncestors', sourceRef: 'sum-1' }],
+            },
+          ],
+          descriptors: [
+            {
+              ref: 'resp-1',
+              kind: 'CANDIDATE_RESPONSE',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-resp-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: ['resp-1'],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum-1',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_TRANSCRIPT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R15. Rejects DERIVED_SUMMARY when authoritativeAncestors is empty', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Answer 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-1'],
+      authoritativeAncestors: [],
+      content: 'Summary with empty authoritativeAncestors',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            {
+              role: 'user',
+              parts: [{ text: 'Summary with empty authoritativeAncestors', sourceRef: 'sum-1' }],
+            },
+          ],
+          descriptors: [
+            {
+              ref: 'resp-1',
+              kind: 'CANDIDATE_RESPONSE',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-resp-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: ['resp-1'],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum-1',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_TRANSCRIPT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R16. Rejects DERIVED_SUMMARY when authoritativeAncestors has incomplete identity coverage', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Answer 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-doc-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_DOCUMENT',
+      ancestorRefs: [],
+      content: 'Doc 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-1', 'doc-1'],
+      authoritativeAncestors: [
+        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+      ],
+      content: 'Incomplete coverage summary',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            { role: 'user', parts: [{ text: 'Incomplete coverage summary', sourceRef: 'sum-1' }] },
+          ],
+          descriptors: [
+            {
+              ref: 'resp-1',
+              kind: 'CANDIDATE_RESPONSE',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-resp-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'doc-1',
+              kind: 'CANDIDATE_DOCUMENT',
+              inheritedClasses: ['USER_DOCUMENT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-doc-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_TRANSCRIPT', 'USER_DOCUMENT'],
+              ancestorRefs: ['resp-1', 'doc-1'],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum-1',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_TRANSCRIPT', 'USER_DOCUMENT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
   });
 });
