@@ -147,131 +147,134 @@ export class PendingRegistrationService {
       nonce,
     ]);
 
-    // Real pending work is stored only for eligible addresses. Generate the
-    // same random ID/nonce and perform the same bounded hash for ineligible
-    // addresses, but never create a pending credential or send to them.
-    if (checkEligibility && !(await checkEligibility(input.emailNormalized, input.consentVersion))) {
-      return {
-        registrationId,
-        nonce,
-        version: 1,
-        deliveryAccepted: false,
-        expiresAt,
-        otpExpiresAt,
-      };
-    }
+    const genericResult: StartRegistrationResult = {
+      registrationId, nonce, version: 1, deliveryAccepted: false, expiresAt, otpExpiresAt,
+    };
+    try {
+      // Real pending work is stored only for eligible addresses. Generate the
+      // same random ID/nonce and perform the same bounded hash for ineligible
+      // addresses, but never create a pending credential or send to them.
+      if (checkEligibility && !(await checkEligibility(input.emailNormalized, input.consentVersion))) {
+        return genericResult;
+      }
 
-    let version = 1;
-    let persisted = false;
+      let version = 1;
+      let persisted = false;
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const existing = await this.pendingModel
-        .findOne({ emailNormalized: input.emailNormalized })
-        .exec();
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const existing = await this.pendingModel
+          .findOne({ emailNormalized: input.emailNormalized })
+          .exec();
 
-      if (!existing) {
-        const otpDigest = computeDomainHmac(this.hmacSecret, [
-          'REG_OTP',
-          registrationId,
-          '1',
-          otpCode,
-        ]);
-        try {
-          await this.pendingModel.create({
+        if (!existing) {
+          const otpDigest = computeDomainHmac(this.hmacSecret, [
+            'REG_OTP',
             registrationId,
-            emailNormalized: input.emailNormalized,
-            passwordHash,
-            nonceDigest,
-            otpDigest,
-            version: 1,
-            attempts: 0,
-            resendCount: 0,
-            state: 'PENDING_DELIVERY',
-            deliveryState: 'PENDING',
-            otpExpiresAt,
-            expiresAt,
-            consentVersion: input.consentVersion,
-            displayName: input.displayName,
-          });
-          version = 1;
-          persisted = true;
-          break;
-        } catch (err: unknown) {
-          const code = (err as { code?: number })?.code;
-          if (code === 11000) {
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (existing.updatedAt && existing.updatedAt > admissionTime) {
-        throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
-      }
-
-      const nextVersion = existing.version + 1;
-      const otpDigest = computeDomainHmac(this.hmacSecret, [
-        'REG_OTP',
-        registrationId,
-        String(nextVersion),
-        otpCode,
-      ]);
-
-      const updated = await this.pendingModel
-        .findOneAndUpdate(
-          {
-            _id: existing._id,
-            version: existing.version,
-            ...(existing.updatedAt ? { updatedAt: existing.updatedAt } : {}),
-          },
-          {
-            $set: {
+            '1',
+            otpCode,
+          ]);
+          try {
+            await this.pendingModel.create({
               registrationId,
+              emailNormalized: input.emailNormalized,
               passwordHash,
               nonceDigest,
               otpDigest,
-              version: nextVersion,
+              version: 1,
               attempts: 0,
+              resendCount: 0,
               state: 'PENDING_DELIVERY',
               deliveryState: 'PENDING',
               otpExpiresAt,
               expiresAt,
               consentVersion: input.consentVersion,
-              ...(input.displayName === undefined ? {} : { displayName: input.displayName }),
+              displayName: input.displayName,
+            });
+            version = 1;
+            persisted = true;
+            break;
+          } catch (err: unknown) {
+            const code = (err as { code?: number })?.code;
+            if (code === 11000) {
+              continue;
+            }
+            throw err;
+          }
+        }
+
+        if (existing.updatedAt && existing.updatedAt > admissionTime) {
+          throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
+        }
+
+        const nextVersion = existing.version + 1;
+        const otpDigest = computeDomainHmac(this.hmacSecret, [
+          'REG_OTP',
+          registrationId,
+          String(nextVersion),
+          otpCode,
+        ]);
+
+        const updated = await this.pendingModel
+          .findOneAndUpdate(
+            {
+              _id: existing._id,
+              version: existing.version,
+              ...(existing.updatedAt ? { updatedAt: existing.updatedAt } : {}),
             },
-            ...(input.displayName === undefined ? { $unset: { displayName: 1 } } : {}),
-            $inc: { resendCount: 1 },
-          },
-          { new: true }
-        )
-        .exec();
+            {
+              $set: {
+                registrationId,
+                passwordHash,
+                nonceDigest,
+                otpDigest,
+                version: nextVersion,
+                attempts: 0,
+                state: 'PENDING_DELIVERY',
+                deliveryState: 'PENDING',
+                otpExpiresAt,
+                expiresAt,
+                consentVersion: input.consentVersion,
+                ...(input.displayName === undefined ? {} : { displayName: input.displayName }),
+              },
+              ...(input.displayName === undefined ? { $unset: { displayName: 1 } } : {}),
+              $inc: { resendCount: 1 },
+            },
+            { new: true }
+          )
+          .exec();
 
-      if (updated) {
-        version = nextVersion;
-        persisted = true;
-        break;
+        if (updated) {
+          version = nextVersion;
+          persisted = true;
+          break;
+        }
       }
+
+      if (!persisted) {
+        throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
+      }
+
+      const deliveryAccepted = await this.dispatchAndRecordDelivery(
+        registrationId,
+        version,
+        input.emailNormalized,
+        otpCode
+      );
+
+      return {
+        registrationId,
+        nonce,
+        version,
+        deliveryAccepted,
+        expiresAt,
+        otpExpiresAt,
+      };
+    } catch (error) {
+      // Public workflow failures after rate admission must not distinguish
+      // pending/eligible addresses from decoys. Internal primitives still throw.
+      if (checkEligibility) return genericResult;
+      throw error;
     }
-
-    if (!persisted) {
-      throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
-    }
-
-    const deliveryAccepted = await this.dispatchAndRecordDelivery(
-      registrationId,
-      version,
-      input.emailNormalized,
-      otpCode
-    );
-
-    return {
-      registrationId,
-      nonce,
-      version,
-      deliveryAccepted,
-      expiresAt,
-      otpExpiresAt,
-    };
   }
 
   /**
@@ -296,93 +299,99 @@ export class PendingRegistrationService {
       registrationId: input.registrationId, version: 1,
       deliveryAccepted: false, otpExpiresAt: currentNow,
     };
-    const expectedNonceDigest = computeDomainHmac(this.hmacSecret, [
-      'REG_NONCE',
-      input.registrationId,
-      input.nonce,
-    ]);
+    try {
+      const expectedNonceDigest = computeDomainHmac(this.hmacSecret, [
+        'REG_NONCE',
+        input.registrationId,
+        input.nonce,
+      ]);
 
-    const existing = await this.pendingModel
-      .findOne({
-        registrationId: input.registrationId,
-        nonceDigest: expectedNonceDigest,
-        state: { $in: ['PENDING_DELIVERY', 'SENT'] },
-        expiresAt: { $gt: currentNow },
-      })
-      .exec();
-
-    if (!existing || registrationRateSubject(this.hmacSecret, existing.emailNormalized) !== receipt.subject) {
-      return genericResult;
-    }
-
-    if (checkEligibility && !(await checkEligibility(existing.emailNormalized, existing.consentVersion))) {
-      // The bound request has consumed its ordinary abuse budget, but a
-      // newly ineligible registration must not receive another message.
-      return {
-        registrationId: existing.registrationId,
-        version: existing.version,
-        deliveryAccepted: false,
-        otpExpiresAt: existing.otpExpiresAt,
-      };
-    }
-
-    // The asynchronous rate/eligibility checks may have consumed time.
-    // Never extend the original pending registration's lifetime.
-    const resendNow = this.now();
-    if (existing.expiresAt <= resendNow || receipt.expiresAt <= resendNow) return genericResult;
-    const nextVersion = existing.version + 1;
-    const otpCode = generateOtpCode();
-    const otpExpiresAt = new Date(Math.min(
-      resendNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs,
-      existing.expiresAt.getTime()
-    ));
-    const otpDigest = computeDomainHmac(this.hmacSecret, [
-      'REG_OTP',
-      existing.registrationId,
-      String(nextVersion),
-      otpCode,
-    ]);
-
-    const updated = await this.pendingModel
-      .findOneAndUpdate(
-        {
-          _id: existing._id,
-          registrationId: existing.registrationId,
+      const existing = await this.pendingModel
+        .findOne({
+          registrationId: input.registrationId,
           nonceDigest: expectedNonceDigest,
-          version: existing.version,
           state: { $in: ['PENDING_DELIVERY', 'SENT'] },
-          expiresAt: { $gt: resendNow },
-        },
-        {
-          $set: {
-            otpDigest,
-            version: nextVersion,
-            attempts: 0,
-            state: 'PENDING_DELIVERY',
-            deliveryState: 'PENDING',
-            otpExpiresAt,
+          expiresAt: { $gt: currentNow },
+        })
+        .exec();
+
+      if (!existing || registrationRateSubject(this.hmacSecret, existing.emailNormalized) !== receipt.subject) {
+        return genericResult;
+      }
+
+      if (checkEligibility && !(await checkEligibility(existing.emailNormalized, existing.consentVersion))) {
+        // The bound request has consumed its ordinary abuse budget, but a
+        // newly ineligible registration must not receive another message.
+        return {
+          registrationId: existing.registrationId,
+          version: existing.version,
+          deliveryAccepted: false,
+          otpExpiresAt: existing.otpExpiresAt,
+        };
+      }
+
+      // The asynchronous rate/eligibility checks may have consumed time.
+      // Never extend the original pending registration's lifetime.
+      const resendNow = this.now();
+      if (existing.expiresAt <= resendNow || receipt.expiresAt <= resendNow) return genericResult;
+      const nextVersion = existing.version + 1;
+      const otpCode = generateOtpCode();
+      const otpExpiresAt = new Date(Math.min(
+        resendNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs,
+        existing.expiresAt.getTime()
+      ));
+      const otpDigest = computeDomainHmac(this.hmacSecret, [
+        'REG_OTP',
+        existing.registrationId,
+        String(nextVersion),
+        otpCode,
+      ]);
+
+      const updated = await this.pendingModel
+        .findOneAndUpdate(
+          {
+            _id: existing._id,
+            registrationId: existing.registrationId,
+            nonceDigest: expectedNonceDigest,
+            version: existing.version,
+            state: { $in: ['PENDING_DELIVERY', 'SENT'] },
+            expiresAt: { $gt: resendNow },
           },
-          $inc: { resendCount: 1 },
-        },
-        { new: true }
-      )
-      .exec();
+          {
+            $set: {
+              otpDigest,
+              version: nextVersion,
+              attempts: 0,
+              state: 'PENDING_DELIVERY',
+              deliveryState: 'PENDING',
+              otpExpiresAt,
+            },
+            $inc: { resendCount: 1 },
+          },
+          { new: true }
+        )
+        .exec();
 
-    if (!updated) return genericResult;
+      if (!updated) return genericResult;
 
-    const deliveryAccepted = await this.dispatchAndRecordDelivery(
-      updated.registrationId,
-      nextVersion,
-      updated.emailNormalized,
-      otpCode
-    );
+      const deliveryAccepted = await this.dispatchAndRecordDelivery(
+        updated.registrationId,
+        nextVersion,
+        updated.emailNormalized,
+        otpCode
+      );
 
-    return {
-      registrationId: updated.registrationId,
-      version: nextVersion,
-      deliveryAccepted,
-      otpExpiresAt,
-    };
+      return {
+        registrationId: updated.registrationId,
+        version: nextVersion,
+        deliveryAccepted,
+        otpExpiresAt,
+      };
+    } catch (error) {
+      // Rate limits and receipt authentication above still fail explicitly.
+      if (checkEligibility) return genericResult;
+      throw error;
+    }
   }
 
   /**

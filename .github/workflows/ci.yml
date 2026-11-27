@@ -45,3 +45,28 @@ jobs:
 
       - name: Audit production dependencies
         run: npm audit --omit=dev
+
+      - name: Start isolated MongoDB replica set
+        run: |
+          docker run -d --name roundset-auth-mongo -p 127.0.0.1:27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec roundset-auth-mongo mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)'; then break; fi
+            sleep 2
+          done
+          docker exec roundset-auth-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+          for i in $(seq 1 30); do
+            if docker exec roundset-auth-mongo mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)'; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Test password auth on real MongoDB replica set
+        env:
+          RUN_AUTH_REPLICA_TESTS: "true"
+          MONGODB_TEST_URI: mongodb://127.0.0.1:27017/roundset_test?replicaSet=rs0
+        run: npx --no-install vitest run apps/api/tests/p2-auth-03b-live-mongodb.integration.test.ts
+
+      - name: Remove disposable MongoDB
+        if: always()
+        run: |
+          if docker inspect roundset-auth-mongo >/dev/null 2>&1; then docker rm -f -v roundset-auth-mongo; fi
