@@ -7,7 +7,6 @@ import type { ReadinessProvider } from '../core/readiness.js';
 import { getRequestId } from '../core/request-id.js';
 import type { SessionService } from '../modules/auth/session/session.service.js';
 import { createAuthRouter } from './auth.js';
-import type { PasswordAuthRouteServices } from './password-auth.js';
 
 export interface RouteOptions {
   readinessProvider: ReadinessProvider;
@@ -15,7 +14,6 @@ export interface RouteOptions {
   sessionService?: SessionService;
   allowedOrigin?: string;
   isProduction?: boolean;
-  passwordAuth?: PasswordAuthRouteServices;
 }
 
 /**
@@ -66,7 +64,6 @@ export function createV1Router(options: RouteOptions): Router {
         sessionService: options.sessionService,
         allowedOrigin: options.allowedOrigin,
         isProduction: options.isProduction,
-        passwordAuth: options.passwordAuth,
       })
     );
   }

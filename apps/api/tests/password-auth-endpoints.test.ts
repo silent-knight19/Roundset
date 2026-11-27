@@ -167,6 +167,38 @@ describe('P2-AUTH-03b HTTP contract', () => {
     expect(services.recovery.reset).not.toHaveBeenCalled();
   }, 15000);
 
+  it('charges malformed and oversized JSON before parsing across all password routes', async () => {
+    const { post, services } = fixture();
+    const paths = ['/register', '/otp/resend', '/verify-email', '/login', '/password/forgot', '/password/reset'];
+    const oversized = JSON.stringify({ extra: 'x'.repeat(64 * 1024) });
+    for (let i = 0; i < 60; i += 1) {
+      const body = i % 2 === 0 ? '{' : oversized;
+      const response = await post(paths[i % paths.length]!).type('application/json').send(body);
+      expect(response.status).toBe(i % 2 === 0 ? 400 : 413);
+      expect(response.headers['cache-control']).toBe('no-store');
+      expect(response.body.error.code).toBe(i % 2 === 0 ? 'INVALID_INPUT' : 'PAYLOAD_TOO_LARGE');
+    }
+    for (const path of paths) {
+      for (const body of ['{', oversized]) {
+        const blocked = await post(path).type('application/json').send(body);
+        expect(blocked.status).toBe(429);
+        expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
+        expect(blocked.headers['cache-control']).toBe('no-store');
+        expect(blocked.body.error.code).toBe('AUTH_RATE_LIMITED');
+      }
+    }
+    expect(services.assertReady).not.toHaveBeenCalled();
+    expect(services.registration.register).not.toHaveBeenCalled();
+    expect(services.registration.resend).not.toHaveBeenCalled();
+    expect(services.registration.verify).not.toHaveBeenCalled();
+    expect(services.login.login).not.toHaveBeenCalled();
+    expect(services.recovery.forgot).not.toHaveBeenCalled();
+    expect(services.recovery.reset).not.toHaveBeenCalled();
+    // Non-password session endpoints still use the original body parser.
+    expect((await post('/refresh').type('application/json').send('{')).status).toBe(400);
+    expect((await post('/refresh').type('application/json').send(oversized)).status).toBe(413);
+  }, 15000);
+
   it('rejects invalid mock-email settings and keys', () => {
     expect(() => loadEnv({ AUTH_DEV_MOCK_EMAIL: 'maybe' })).toThrow();
     expect(() => loadEnv({ AUTH_CHALLENGE_HMAC_KEY: 'short' })).toThrow();

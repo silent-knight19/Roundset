@@ -13,7 +13,6 @@ import {
 import { createOriginAndFetchMetadataMiddleware } from '../modules/auth/session/middleware.js';
 import { getRequestId } from '../core/request-id.js';
 import { InvalidInputError } from '../core/errors.js';
-import { createPasswordAuthRouter, type PasswordAuthRouteServices } from './password-auth.js';
 
 function validateStrictEmptyObjectBody(body: unknown): void {
   if (
@@ -30,7 +29,6 @@ export interface AuthRouteOptions {
   sessionService: SessionService;
   allowedOrigin: string;
   isProduction?: boolean;
-  passwordAuth?: PasswordAuthRouteServices;
 }
 
 export function createAuthRouter(options: AuthRouteOptions): Router {
@@ -155,6 +153,5 @@ export function createAuthRouter(options: AuthRouteOptions): Router {
     }
   });
 
-  router.use(createPasswordAuthRouter({ allowedOrigin, isProduction, services: options.passwordAuth }));
   return router;
 }

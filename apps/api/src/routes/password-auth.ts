@@ -1,6 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { Router, type ErrorRequestHandler, type RequestHandler } from 'express';
+import { Router, json, type ErrorRequestHandler, type RequestHandler } from 'express';
+import { JSON_BODY_LIMIT_BYTES } from '../core/security.js';
 import type { z } from 'zod';
 import {
   RegisterRequestSchema, RegisterResponseSchema, VerifyEmailRequestSchema,
@@ -60,6 +61,7 @@ export function createPasswordAuthRouter(options: {
   const { allowedOrigin, isProduction, services } = options;
   const origin = createOriginAndFetchMetadataMiddleware(allowedOrigin);
   const flood = createFloodShedderMiddleware();
+  const parseBody = json({ limit: JSON_BODY_LIMIT_BYTES });
 
   // Keep slots until work actually settles, including if a client disconnects.
   // Never race a response timeout against an in-flight credential mutation.
@@ -82,7 +84,7 @@ export function createPasswordAuthRouter(options: {
     return services;
   }
 
-  router.post('/register', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/register', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(RegisterRequestSchema, req.body);
     const svc = await ready();
     const result = await withResponseFloor(() => svc.registration.register(input, extractTrustedClientIp(req)));
@@ -96,7 +98,7 @@ export function createPasswordAuthRouter(options: {
     res.status(202).json(response);
   }));
 
-  router.post('/otp/resend', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/otp/resend', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(ResendOtpRequestSchema, req.body);
     const svc = await ready();
     const cookie = parseRegistrationCookie(req.headers.cookie, { isProduction });
@@ -107,7 +109,7 @@ export function createPasswordAuthRouter(options: {
     }));
   }));
 
-  router.post('/verify-email', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/verify-email', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(VerifyEmailRequestSchema, req.body);
     const svc = await ready();
     const cookie = parseRegistrationCookie(req.headers.cookie, { isProduction });
@@ -117,7 +119,7 @@ export function createPasswordAuthRouter(options: {
     res.status(204).end();
   }));
 
-  router.post('/login', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/login', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(LoginRequestSchema, req.body);
     const svc = await ready();
     const result = await svc.login.login(input, extractTrustedClientIp(req), getRequestId(res, req), req.secure);
@@ -126,7 +128,7 @@ export function createPasswordAuthRouter(options: {
     res.status(200).json(body);
   }));
 
-  router.post('/password/forgot', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/password/forgot', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(PasswordForgotRequestSchema, req.body);
     const svc = await ready();
     await withResponseFloor(() => svc.recovery.forgot(input, extractTrustedClientIp(req)));
@@ -135,7 +137,7 @@ export function createPasswordAuthRouter(options: {
     }));
   }));
 
-  router.post('/password/reset', noStore, origin, flood, bounded(async (req, res) => {
+  router.post('/password/reset', noStore, origin, flood, parseBody, bounded(async (req, res) => {
     const input = parse(PasswordResetRequestSchema, req.body);
     const svc = await ready();
     await svc.recovery.reset(input, extractTrustedClientIp(req));
