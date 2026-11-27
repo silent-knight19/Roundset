@@ -94,3 +94,29 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm audit --include=dev --json
+
+  sharp-compatibility-spike:
+    name: Temporary sharp security compatibility experiment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - name: Resolve scoped override using npm (no repository writes)
+        run: |
+          cp package-lock.json /tmp/roundset-lock-before.json
+          node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("package.json","utf8")); p.overrides={...p.overrides,"@huggingface/transformers@3.8.1":{"sharp":"0.35.5"}}; fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          node --input-type=module -e 'import fs from "node:fs"; const a=JSON.parse(fs.readFileSync("/tmp/roundset-lock-before.json","utf8")),b=JSON.parse(fs.readFileSync("package-lock.json","utf8")); const changed=Object.fromEntries(Object.entries(b.packages).filter(([k,v])=>JSON.stringify(v)!==JSON.stringify(a.packages[k]))); const removed=Object.keys(a.packages).filter(k=>!(k in b.packages)); console.log("LOCK_DELTA "+JSON.stringify({changed,removed}));'
+      - run: npm ci
+      - run: npm ls sharp @huggingface/transformers kokoro-js
+      - run: npm audit --include=dev
+      - name: Exercise patched native module and Transformers import
+        run: |
+          node --input-type=module -e 'import sharp from "sharp"; import {env} from "@huggingface/transformers"; const result=await sharp({create:{width:2,height:2,channels:3,background:"white"}}).png().toBuffer(); if(result.length===0||!env)throw Error("Dependency smoke test failed"); console.log("sharp version:",sharp.versions.sharp)'
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
