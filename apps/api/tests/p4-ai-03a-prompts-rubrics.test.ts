@@ -4,9 +4,11 @@ import {
   buildRubricAuthoringPrompt,
   computeNormalizedQuestionFingerprint,
   DeterministicFakeSourceResolver,
+  executeOfflineGeneration,
   parseUnknownProposal,
   PlanSlot,
   SanitizedAiError,
+  serializeCanonicalPromptContext,
   SYNTHETIC_ASSESSMENT_POLICY_V1,
   trimContextPartsDeterministically,
   validateContextSummaryPolicy,
@@ -1187,14 +1189,63 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
       ancestorRefs: [],
       content: 'role=backend_engineer;track=node_ts;difficulty=MEDIUM;topic=api_design;competency=api_contracts',
     });
+    resolver.registerServerTemplate({
+      templateId: 'tpl-slot-1',
+      templateVersion: 'v1',
+      content: serializeCanonicalPromptContext({
+        assignedSlot: SLOT_1,
+        usedSlotIds: [],
+        usedTopicIds: [],
+        usedCompetencyIds: [],
+        difficultyHint: 'MAINTAIN',
+      }),
+    });
+    resolver.registerServerTemplate({
+      templateId: 'tpl-slot-2',
+      templateVersion: 'v1',
+      content: serializeCanonicalPromptContext({
+        assignedSlot: SLOT_2,
+        usedSlotIds: [],
+        usedTopicIds: [],
+        usedCompetencyIds: [],
+        difficultyHint: 'MAINTAIN',
+      }),
+    });
 
-    const res1 = buildRubricAuthoringPrompt({ ...baseInput, assignedSlot: SLOT_1 }, resolver);
-    const res2 = buildRubricAuthoringPrompt({ ...baseInput, assignedSlot: SLOT_2 }, resolver);
+    const res1 = buildRubricAuthoringPrompt(
+      {
+        ...baseInput,
+        assignedSlot: SLOT_1,
+        slotContextDescriptor: {
+          ref: 'tpl-slot-1',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-slot-1', templateVersion: 'v1' },
+        },
+      },
+      resolver,
+    );
+    const res2 = buildRubricAuthoringPrompt(
+      {
+        ...baseInput,
+        assignedSlot: SLOT_2,
+        slotContextDescriptor: {
+          ref: 'tpl-slot-2',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-slot-2', templateVersion: 'v1' },
+        },
+      },
+      resolver,
+    );
 
+    expect(res1.flattenedMessages[0].content).not.toBe(res2.flattenedMessages[0].content);
     expect(res1.requestIdentity).not.toBe(res2.requestIdentity);
   });
 
-  it('R13. Changing used-slot metadata changes prompt requestIdentity', () => {
+  it('R13. Changing used-slot metadata changes BOTH flattenedMessages and requestIdentity', () => {
     const resolver = new DeterministicFakeSourceResolver();
     resolver.registerServerTemplate({
       templateId: 'tpl-q',
@@ -1209,6 +1260,28 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
       kind: 'CANDIDATE_CONFIGURATION',
       ancestorRefs: [],
       content: 'role=backend_engineer;track=node_ts;difficulty=MEDIUM;topic=api_design;competency=api_contracts',
+    });
+    resolver.registerServerTemplate({
+      templateId: 'tpl-used-1',
+      templateVersion: 'v1',
+      content: serializeCanonicalPromptContext({
+        assignedSlot: SLOT_1,
+        usedSlotIds: ['slot-1'],
+        usedTopicIds: ['api_design'],
+        usedCompetencyIds: ['api_contracts'],
+        difficultyHint: 'MAINTAIN',
+      }),
+    });
+    resolver.registerServerTemplate({
+      templateId: 'tpl-used-2',
+      templateVersion: 'v1',
+      content: serializeCanonicalPromptContext({
+        assignedSlot: SLOT_1,
+        usedSlotIds: ['slot-1', 'slot-2'],
+        usedTopicIds: ['api_design'],
+        usedCompetencyIds: ['api_contracts'],
+        difficultyHint: 'MAINTAIN',
+      }),
     });
 
     const baseInput = {
@@ -1255,17 +1328,42 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
         competency: 'api_contracts',
       },
       assignedSlot: SLOT_1,
+      approvedPlanSlotIds: new Set(['slot-1', 'slot-2']),
       usedTopicIds: ['api_design'],
       usedCompetencyIds: ['api_contracts'],
       difficultyHint: 'MAINTAIN' as const,
     };
 
-    const res1 = buildRubricAuthoringPrompt({ ...baseInput, usedSlotIds: ['slot-1'] }, resolver);
+    const res1 = buildRubricAuthoringPrompt(
+      {
+        ...baseInput,
+        usedSlotIds: ['slot-1'],
+        slotContextDescriptor: {
+          ref: 'tpl-used-1',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-used-1', templateVersion: 'v1' },
+        },
+      },
+      resolver,
+    );
     const res2 = buildRubricAuthoringPrompt(
-      { ...baseInput, usedSlotIds: ['slot-1', 'slot-2'] },
+      {
+        ...baseInput,
+        usedSlotIds: ['slot-1', 'slot-2'],
+        slotContextDescriptor: {
+          ref: 'tpl-used-2',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-used-2', templateVersion: 'v1' },
+        },
+      },
       resolver,
     );
 
+    expect(res1.flattenedMessages[0].content).not.toBe(res2.flattenedMessages[0].content);
     expect(res1.requestIdentity).not.toBe(res2.requestIdentity);
   });
 
@@ -1391,5 +1489,137 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
     expect(() => validateQuestionProposalPolicy(manipulatedWeights, SLOT_1)).toThrowError(
       SanitizedAiError,
     );
+  });
+
+  it('R17. End-to-end offline regression: builder-generated request passes gateway provenance and permit validation', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-q',
+      templateVersion: 'v1',
+      content: 'Author main question.',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-1',
+      recordId: 'cfg-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_CONFIGURATION',
+      ancestorRefs: [],
+      content: 'role=backend_engineer;track=node_ts;difficulty=MEDIUM;topic=api_design;competency=api_contracts',
+    });
+    resolver.registerServerTemplate({
+      templateId: 'tpl-slot-e2e',
+      templateVersion: 'v1',
+      content: serializeCanonicalPromptContext({
+        assignedSlot: SLOT_1,
+        usedSlotIds: ['slot-1'],
+        usedTopicIds: ['api_design'],
+        usedCompetencyIds: ['api_contracts'],
+        difficultyHint: 'MAINTAIN',
+      }),
+    });
+
+    const built = buildRubricAuthoringPrompt(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-1',
+        operationId: 'op-e2e',
+        generationEpoch: 1,
+        attemptId: 'att-e2e',
+        attemptNo: 1,
+        provider: 'MOCK',
+        purpose: 'QUESTION',
+        promptVersion: '1.0.0',
+        outputSchemaVersion: 'QuestionProposal.v1',
+        maxOutputTokens: 512,
+        estimatedInputTokens: 32,
+        reasoningProfile: 'NO_REASONING',
+        absoluteDeadlineAt: NOW_ISO,
+        templateDescriptor: {
+          ref: 'tpl-q',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-q', templateVersion: 'v1' },
+        },
+        templateText: 'Author main question.',
+        slotContextDescriptor: {
+          ref: 'tpl-slot-e2e',
+          kind: 'TRUSTED_TEMPLATE',
+          inheritedClasses: [],
+          ancestorRefs: [],
+          scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-slot-e2e', templateVersion: 'v1' },
+        },
+        candidateConfigDescriptor: {
+          ref: 'cfg-1',
+          kind: 'CANDIDATE_CONFIGURATION',
+          inheritedClasses: ['USER_TRANSCRIPT'],
+          ancestorRefs: [],
+          scope: {
+            type: 'USER_INTERVIEW',
+            userId: 'user-a',
+            interviewId: 'int-1',
+            recordId: 'cfg-1',
+            recordVersion: 'v1',
+          },
+        },
+        candidateConfig: {
+          role: 'backend_engineer',
+          track: 'node_ts',
+          difficulty: 'MEDIUM',
+          topic: 'api_design',
+          competency: 'api_contracts',
+        },
+        assignedSlot: SLOT_1,
+        approvedPlanSlotIds: new Set(['slot-1']),
+        usedSlotIds: ['slot-1'],
+        usedTopicIds: ['api_design'],
+        usedCompetencyIds: ['api_contracts'],
+        difficultyHint: 'MAINTAIN',
+      },
+      resolver,
+    );
+
+    const nowMs = Date.parse('2026-11-27T12:00:00.000Z');
+    const result = executeOfflineGeneration(
+      {
+        authenticatedUserId: 'user-a',
+        intent: {
+          operationId: 'op-e2e',
+          generationEpoch: 1,
+          attemptId: 'att-e2e',
+          attemptNo: 1,
+          interviewId: 'int-1',
+          purpose: 'QUESTION',
+          outputSchemaVersion: 'QuestionProposal.v1',
+          promptVersion: '1.0.0',
+          dataClasses: built.dataClasses,
+          sourceManifest: built.sourceManifest,
+          messages: built.messages,
+          maxOutputTokens: 512,
+          estimatedInputTokens: 32,
+          absoluteDeadlineAt: NOW_ISO,
+          reasoningProfile: 'NO_REASONING',
+        },
+        provider: 'MOCK',
+        cutoffMode: 'PRE_START',
+        deadlineInput: {
+          readyExpiresAt: nowMs + 60_000,
+          reservationExpiresAt: nowMs + 60_000,
+          controllerLeaseUntil: nowMs + 60_000,
+          requestDeadline: nowMs + 60_000,
+        },
+        nowMs,
+        permitReceipt: {
+          permitId: 'permit-e2e',
+          canonicalDataClasses: built.canonicalDataClasses,
+          requestIdentity: built.requestIdentity,
+        },
+      },
+      { resolver, eligibilityPolicy: { isEligible: () => true } },
+    );
+
+    expect(result.provider).toBe('MOCK');
+    expect(result.attemptId).toBe('att-e2e');
   });
 });

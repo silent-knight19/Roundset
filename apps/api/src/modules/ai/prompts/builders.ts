@@ -84,6 +84,25 @@ function assertTrustedTemplateDescriptor(descriptor: SourceDescriptor): void {
   }
 }
 
+export function serializeCanonicalPromptContext(input: {
+  assignedSlot?: PlanSlot;
+  usedSlotIds: ReadonlyArray<string>;
+  usedTopicIds: ReadonlyArray<string>;
+  usedCompetencyIds: ReadonlyArray<string>;
+  difficultyHint: AdaptiveDifficultyHint;
+}): string {
+  const slotPart = input.assignedSlot
+    ? `${input.assignedSlot.slotId}:${input.assignedSlot.topic}:${input.assignedSlot.competency}:${input.assignedSlot.questionType}:${input.assignedSlot.difficulty}`
+    : 'none';
+  return `slot=${slotPart};usedSlots=${input.usedSlotIds.join(',')};usedTopics=${input.usedTopicIds.join(',')};usedCompetencies=${input.usedCompetencyIds.join(',')};hint=${input.difficultyHint}`;
+}
+
+export interface BuildPromptResult extends ResolvedManifestResult {
+  messages: GenerationMessage[];
+  sourceManifest: SourceDescriptor[];
+  dataClasses: DataClass[];
+}
+
 export interface RubricAuthoringPromptInput {
   authenticatedUserId: string;
   interviewId: string;
@@ -102,11 +121,14 @@ export interface RubricAuthoringPromptInput {
   /** Must be a registered immutable TRUSTED_TEMPLATE with SERVER_TEMPLATE scope. */
   templateDescriptor: SourceDescriptor;
   templateText: string;
+  /** Optional provenance-bound TRUSTED_TEMPLATE descriptor for canonical slot/context metadata. */
+  slotContextDescriptor?: SourceDescriptor;
   /** Optional structured candidate configuration (retains USER_TRANSCRIPT class). */
   candidateConfigDescriptor?: SourceDescriptor;
   candidateConfig?: StructuredCandidateConfig;
   /** Server-approved structured metadata only. */
   assignedSlot?: PlanSlot;
+  approvedPlanSlotIds?: ReadonlySet<string>;
   usedSlotIds: ReadonlyArray<string>;
   usedTopicIds: ReadonlyArray<string>;
   usedCompetencyIds: ReadonlyArray<string>;
@@ -121,7 +143,7 @@ export interface RubricAuthoringPromptInput {
 export function buildRubricAuthoringPrompt(
   input: RubricAuthoringPromptInput,
   resolver: AuthoritativeSourceResolver,
-): ResolvedManifestResult {
+): BuildPromptResult {
   if (!VALID_RUBRIC_PURPOSES.has(input.purpose)) {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid rubric-authoring purpose');
   }
@@ -138,6 +160,9 @@ export function buildRubricAuthoringPrompt(
   for (const slotId of input.usedSlotIds) {
     if (typeof slotId !== 'string' || slotId.length === 0) {
       throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid usedSlotId');
+    }
+    if (input.approvedPlanSlotIds && !input.approvedPlanSlotIds.has(slotId)) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'usedSlotId is not in approved plan');
     }
   }
   for (const topicId of input.usedTopicIds) {
@@ -156,6 +181,12 @@ export function buildRubricAuthoringPrompt(
       throw new SanitizedAiError(
         'AI_CONFIGURATION_INVALID',
         'QUESTION prompt requires an assigned server-authorized PlanSlot',
+      );
+    }
+    if (input.approvedPlanSlotIds && !input.approvedPlanSlotIds.has(input.assignedSlot.slotId)) {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'Assigned PlanSlot is not in approved plan',
       );
     }
     if (
@@ -179,6 +210,22 @@ export function buildRubricAuthoringPrompt(
     { text: input.templateText, sourceRef: input.templateDescriptor.ref },
   ];
   const declaredClasses: DataClass[] = [...input.templateDescriptor.inheritedClasses];
+
+  if (input.slotContextDescriptor) {
+    assertTrustedTemplateDescriptor(input.slotContextDescriptor);
+    const canonicalContextText = serializeCanonicalPromptContext({
+      assignedSlot: input.assignedSlot,
+      usedSlotIds: input.usedSlotIds,
+      usedTopicIds: input.usedTopicIds,
+      usedCompetencyIds: input.usedCompetencyIds,
+      difficultyHint: input.difficultyHint,
+    });
+    descriptors.push(input.slotContextDescriptor);
+    parts.push({
+      text: canonicalContextText,
+      sourceRef: input.slotContextDescriptor.ref,
+    });
+  }
 
   if (input.candidateConfigDescriptor && input.candidateConfig !== undefined) {
     if (input.candidateConfigDescriptor.kind !== 'CANDIDATE_CONFIGURATION') {
@@ -207,7 +254,7 @@ export function buildRubricAuthoringPrompt(
     },
   ];
 
-  return resolveAndAuthorizeSourceManifest(
+  const resolved = resolveAndAuthorizeSourceManifest(
     {
       authenticatedUserId: input.authenticatedUserId,
       interviewId: input.interviewId,
@@ -227,17 +274,17 @@ export function buildRubricAuthoringPrompt(
         estimatedInputTokens: input.estimatedInputTokens,
         reasoningProfile: input.reasoningProfile,
         absoluteDeadlineAt: input.absoluteDeadlineAt,
-        promptContext: {
-          assignedSlot: input.assignedSlot ?? null,
-          usedSlotIds: input.usedSlotIds,
-          usedTopicIds: input.usedTopicIds,
-          usedCompetencyIds: input.usedCompetencyIds,
-          difficultyHint: input.difficultyHint,
-        },
       },
     },
     resolver,
   );
+
+  return {
+    ...resolved,
+    messages,
+    sourceManifest: descriptors,
+    dataClasses: [...resolved.canonicalDataClasses],
+  };
 }
 
 export interface LowerTrustContextPart {
