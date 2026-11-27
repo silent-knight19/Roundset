@@ -121,14 +121,14 @@ export interface RubricAuthoringPromptInput {
   /** Must be a registered immutable TRUSTED_TEMPLATE with SERVER_TEMPLATE scope. */
   templateDescriptor: SourceDescriptor;
   templateText: string;
-  /** Optional provenance-bound TRUSTED_TEMPLATE descriptor for canonical slot/context metadata. */
+  /** Authoritative CANDIDATE_CONFIGURATION descriptor for canonical slot/context metadata (required for QUESTION). */
   slotContextDescriptor?: SourceDescriptor;
   /** Optional structured candidate configuration (retains USER_TRANSCRIPT class). */
   candidateConfigDescriptor?: SourceDescriptor;
   candidateConfig?: StructuredCandidateConfig;
   /** Server-approved structured metadata only. */
   assignedSlot?: PlanSlot;
-  approvedPlanSlotIds?: ReadonlySet<string>;
+  approvedPlanSlots?: ReadonlyArray<PlanSlot>;
   usedSlotIds: ReadonlyArray<string>;
   usedTopicIds: ReadonlyArray<string>;
   usedCompetencyIds: ReadonlyArray<string>;
@@ -157,11 +157,18 @@ export function buildRubricAuthoringPrompt(
   ) {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid used-slot/topic/competency IDs');
   }
+  const approvedSlotById = new Map<string, PlanSlot>();
+  if (input.approvedPlanSlots) {
+    for (const s of input.approvedPlanSlots) {
+      approvedSlotById.set(s.slotId, s);
+    }
+  }
+
   for (const slotId of input.usedSlotIds) {
     if (typeof slotId !== 'string' || slotId.length === 0) {
       throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid usedSlotId');
     }
-    if (input.approvedPlanSlotIds && !input.approvedPlanSlotIds.has(slotId)) {
+    if (input.approvedPlanSlots && !approvedSlotById.has(slotId)) {
       throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'usedSlotId is not in approved plan');
     }
   }
@@ -183,10 +190,30 @@ export function buildRubricAuthoringPrompt(
         'QUESTION prompt requires an assigned server-authorized PlanSlot',
       );
     }
-    if (input.approvedPlanSlotIds && !input.approvedPlanSlotIds.has(input.assignedSlot.slotId)) {
+    if (!Array.isArray(input.approvedPlanSlots) || input.approvedPlanSlots.length === 0) {
       throw new SanitizedAiError(
         'AI_CONFIGURATION_INVALID',
-        'Assigned PlanSlot is not in approved plan',
+        'QUESTION prompt requires approvedPlanSlots',
+      );
+    }
+    if (!input.slotContextDescriptor) {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'QUESTION prompt requires authoritative slotContextDescriptor',
+      );
+    }
+    const authoritativeSlot = approvedSlotById.get(input.assignedSlot.slotId);
+    if (
+      !authoritativeSlot ||
+      authoritativeSlot.topic !== input.assignedSlot.topic ||
+      authoritativeSlot.competency !== input.assignedSlot.competency ||
+      authoritativeSlot.weight !== input.assignedSlot.weight ||
+      authoritativeSlot.questionType !== input.assignedSlot.questionType ||
+      authoritativeSlot.difficulty !== input.assignedSlot.difficulty
+    ) {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'Assigned PlanSlot does not match authoritative approved plan slot',
       );
     }
     if (
@@ -212,7 +239,15 @@ export function buildRubricAuthoringPrompt(
   const declaredClasses: DataClass[] = [...input.templateDescriptor.inheritedClasses];
 
   if (input.slotContextDescriptor) {
-    assertTrustedTemplateDescriptor(input.slotContextDescriptor);
+    if (
+      input.slotContextDescriptor.kind !== 'CANDIDATE_CONFIGURATION' ||
+      input.slotContextDescriptor.scope?.type !== 'USER_INTERVIEW'
+    ) {
+      throw new SanitizedAiError(
+        'AI_PRIVACY_INELIGIBLE',
+        'slotContextDescriptor must be CANDIDATE_CONFIGURATION with USER_INTERVIEW scope',
+      );
+    }
     const canonicalContextText = serializeCanonicalPromptContext({
       assignedSlot: input.assignedSlot,
       usedSlotIds: input.usedSlotIds,
@@ -225,6 +260,11 @@ export function buildRubricAuthoringPrompt(
       text: canonicalContextText,
       sourceRef: input.slotContextDescriptor.ref,
     });
+    for (const cls of input.slotContextDescriptor.inheritedClasses) {
+      if (!declaredClasses.includes(cls)) {
+        declaredClasses.push(cls);
+      }
+    }
   }
 
   if (input.candidateConfigDescriptor && input.candidateConfig !== undefined) {
