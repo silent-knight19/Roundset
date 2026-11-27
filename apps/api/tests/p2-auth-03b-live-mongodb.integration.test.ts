@@ -45,7 +45,7 @@ describe.skipIf(!enabled)('P2-AUTH-03b replica-set HTTP lifecycle', () => {
 
   beforeAll(async () => {
     if (process.env.MONGODB_TEST_URI !== testUri) throw new Error('Only the disposable loopback replica set is permitted');
-    conn = await mongoose.createConnection(testUri, { serverSelectionTimeoutMS: 5000 }).asPromise();
+    conn = await mongoose.createConnection(testUri, { serverSelectionTimeoutMS: 5000, timeoutMS: 5000 }).asPromise();
     await ensureIdentityIndexes(conn);
     const keyring = new SessionKeyring(env);
     runtime = createPasswordAuthRuntime({ config: env, connection: conn, keyring, emailSender: sender });

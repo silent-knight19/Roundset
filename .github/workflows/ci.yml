@@ -66,7 +66,27 @@ jobs:
           MONGODB_TEST_URI: mongodb://127.0.0.1:27017/roundset_test?replicaSet=rs0
         run: npx --no-install vitest run apps/api/tests/p2-auth-03b-live-mongodb.integration.test.ts
 
+      - name: Re-run existing identity and OTP integration suites
+        env:
+          RUN_LIVE_MONGODB_TESTS: "true"
+          MONGODB_TEST_URI: mongodb://127.0.0.1:27017/roundset_test?replicaSet=rs0
+        run: |
+          npx --no-install vitest run apps/api/tests/identity-live-mongodb.integration.test.ts
+          npx --no-install vitest run apps/api/tests/p2-auth-04a-live-mongodb.integration.test.ts
+
       - name: Remove disposable MongoDB
         if: always()
         run: |
           if docker inspect roundset-auth-mongo >/dev/null 2>&1; then docker rm -f -v roundset-auth-mongo; fi
+
+  audit-all-dependencies:
+    name: Audit all dependencies (including development)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - run: npm ci
+      - run: npm audit --include=dev --json

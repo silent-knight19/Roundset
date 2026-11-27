@@ -1,4 +1,8 @@
 import type { Logger } from 'pino';
+import request from 'supertest';
+import { createApp } from '../src/app.js';
+import { loadEnv } from '../src/config/env.js';
+import { createLogger } from '../src/core/logging.js';
 import { describe, expect, it, vi } from 'vitest';
 import { reportAuthFailure, withAuthDiagnostics } from '../src/modules/auth/diagnostics.js';
 import { MockEmailSender } from '../src/modules/auth/email/mock-email.sender.js';
@@ -26,6 +30,26 @@ describe('Authentication diagnostics and mock retention', () => {
   it('does not expose failures from a broken diagnostic sink', async () => {
     const logger = { warn: () => { throw new Error('sink unavailable'); } } as unknown as Logger;
     await expect(withAuthDiagnostics('request', logger, async () => reportAuthFailure('RESEND_WORK_FAILED'))).resolves.toBeUndefined();
+  });
+
+  it('redacts authentication and proxy proof headers from real HTTP logs', async () => {
+    const lines: string[] = [];
+    const logger = createLogger({ level: 'info' }, { write: line => { lines.push(line); } });
+    const app = createApp({ env: loadEnv({ NODE_ENV: 'test' }), logger });
+    const secrets = {
+      'Authorization': 'Bearer synthetic-secret-authorization',
+      'Cookie': 'roundset_refresh=synthetic-secret-cookie',
+      'X-CSRF-Token': 'synthetic-secret-csrf',
+      'X-Roundset-Edge-Auth': 'synthetic-secret-edge',
+      'X-Roundset-Client-IP': '203.0.113.77',
+      'X-Forwarded-For': '203.0.113.78',
+    };
+    const result = await request(app).get('/api/v1/health/live').set(secrets);
+    expect(result.status).toBe(200);
+    const logs = lines.join('');
+    expect(logs).toContain(result.headers['x-request-id']);
+    for (const value of Object.values(secrets)) expect(logs).not.toContain(value);
+    expect(logs).not.toContain('synthetic-secret-');
   });
 
   it('retains no more than 100 recent mock records and never captures OTP by default', async () => {

@@ -96,6 +96,16 @@ describe('P2-AUTH-03b bounded auth transactions', () => {
     expect(f.session.abortTransaction).not.toHaveBeenCalled();
   });
 
+  it('treats an unlabeled client-side commit timeout conservatively as ambiguous', async () => {
+    const f = fixture();
+    f.session.commitTransaction.mockRejectedValueOnce(Object.assign(new Error('timeout'), { name: 'MongoOperationTimeoutError' }));
+    const work = vi.fn(async () => 'ok');
+    await expect(runAuthTransaction(f.conn, work)).resolves.toBe('ok');
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(f.session.commitTransaction).toHaveBeenCalledTimes(2);
+    expect(f.session.abortTransaction).not.toHaveBeenCalled();
+  });
+
   it('never replays work when every commit outcome is ambiguous', async () => {
     const f = fixture();
     f.session.commitTransaction.mockRejectedValue(mongoLabel('UnknownTransactionCommitResult'));

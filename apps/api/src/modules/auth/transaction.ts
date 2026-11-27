@@ -72,7 +72,8 @@ export async function runAuthTransaction<T>(
             await session.commitTransaction();
             return result;
           } catch (error) {
-            if (hasLabel(error, 'UnknownTransactionCommitResult')) {
+            if (hasLabel(error, 'UnknownTransactionCommitResult') ||
+                (typeof error === 'object' && error !== null && 'name' in error && error.name === 'MongoOperationTimeoutError')) {
               commitAmbiguous = true;
               continue;
             }
