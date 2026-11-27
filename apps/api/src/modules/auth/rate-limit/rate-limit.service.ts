@@ -23,6 +23,10 @@ export class AuthRateLimitService {
   private readonly rateLimitModel: Model<IAuthRateLimit>;
   private readonly hmacSecret: string;
   private readonly now: () => Date;
+  private readonly loginReservations = new WeakMap<RateLimitConsumeResult, {
+    bucketKey: string;
+    windowEndMs: number;
+  }>();
 
   constructor(options: AuthRateLimitServiceOptions) {
     this.rateLimitModel = options.rateLimitModel;
@@ -49,6 +53,42 @@ export class AuthRateLimitService {
         throw err;
       }
       throw new RateLimitExceededError(1, RATE_LIMIT_POLICIES[policyName].errorCode ?? 'AUTH_RATE_LIMITED');
+    }
+  }
+
+  /**
+   * Reserve a failure slot before password comparison, including dummy
+   * comparisons. Concurrent guesses cannot exceed the persistent cap.
+   * A successfully proven password may return only its own reservation.
+   */
+  async reserveLoginAttempt(emailNormalized: string): Promise<RateLimitConsumeResult> {
+    const result = await this.consumeOrThrow('LOGIN_FAIL_EMAIL', emailNormalized);
+    this.loginReservations.set(result, {
+      bucketKey: this.computeBucketKey('LOGIN_FAIL_EMAIL', emailNormalized),
+      windowEndMs: result.windowEnd.getTime(),
+    });
+    return result;
+  }
+
+  async releaseProvenLoginAttempt(reservation: RateLimitConsumeResult): Promise<boolean> {
+    const metadata = this.loginReservations.get(reservation);
+    if (!metadata) return false;
+    // Never retry an uncertain refund: a double decrement could admit
+    // additional guesses. A failed or lost refund remains conservative.
+    this.loginReservations.delete(reservation);
+    try {
+      const updated = await this.rateLimitModel.findOneAndUpdate(
+        {
+          bucketKey: metadata.bucketKey,
+          windowEnd: new Date(metadata.windowEndMs),
+          count: { $gt: 0 },
+        },
+        { $inc: { count: -1 } },
+        { new: true }
+      ).exec();
+      return Boolean(updated);
+    } catch {
+      return false;
     }
   }
 
