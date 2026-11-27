@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { ClientSession, Model } from 'mongoose';
+import { HttpError } from '../../../core/errors.js';
 import type { IPendingRegistration } from '../../identity/models/pending-registration.model.js';
 import type { EmailSender } from '../email/types.js';
 import {
@@ -18,6 +19,16 @@ export const PENDING_REGISTRATION_POLICY = {
   registrationIdBytes: 16, // 128 bits
   nonceBytes: 32, // 256 bits
 } as const;
+
+export interface VerifiedRegistrationProof {
+  readonly registrationId: string;
+  readonly version: number;
+  readonly emailNormalized: string;
+  readonly nonceDigest: string;
+  readonly expiresAt: Date;
+}
+
+const issuedRegistrationProofs = new WeakSet<VerifiedRegistrationProof>();
 
 export interface PendingRegistrationServiceOptions {
   pendingRegistrationModel: Model<IPendingRegistration>;
@@ -46,6 +57,19 @@ export interface StartRegistrationResult {
   otpExpiresAt: Date;
 }
 
+export interface ResendRegistrationInput {
+  registrationId: string;
+  nonce: string;
+  trustedIp: string;
+}
+
+export interface ResendRegistrationResult {
+  registrationId: string;
+  version: number;
+  deliveryAccepted: boolean;
+  otpExpiresAt: Date;
+}
+
 export class PendingRegistrationService {
   private readonly pendingModel: Model<IPendingRegistration>;
   private readonly rateLimitService: AuthRateLimitService;
@@ -67,13 +91,12 @@ export class PendingRegistrationService {
 
   /**
    * Starts or atomically replaces a pending registration by canonical email.
-   * Enforces IP cap, combined email budget, and 60s replacement cooldown BEFORE
-   * touching pendingRegistrations so rejected requests never overwrite existing state.
+   * Enforces IP cap, replacement cooldown, and combined email budget BEFORE
+   * touching pendingRegistrations. Never sends an email unless persistence succeeded.
    */
   async startOrReplaceRegistration(
     input: StartRegistrationInput
   ): Promise<StartRegistrationResult> {
-    // 1. Durable rate limits & cooldown (independent of pendingRegistrations)
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
     await this.rateLimitService.consumeOrThrow(
       'REGISTER_REPLACE_COOLDOWN',
@@ -84,10 +107,8 @@ export class PendingRegistrationService {
       input.emailNormalized
     );
 
-    // 2. Hash password with bounded Argon2id service
     const passwordHash = await this.passwordService.hashPassword(input.password);
 
-    // 3. Generate CSPRNG registrationId (>=128 bits), nonce (>=256 bits), and 6-digit OTP
     const registrationId = crypto
       .randomBytes(PENDING_REGISTRATION_POLICY.registrationIdBytes)
       .toString('hex');
@@ -107,8 +128,9 @@ export class PendingRegistrationService {
       nonce,
     ]);
 
-    // 4. Atomic upsert/replacement by canonical email
     let version = 1;
+    let persisted = false;
+
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const existing = await this.pendingModel
         .findOne({ emailNormalized: input.emailNormalized })
@@ -139,6 +161,7 @@ export class PendingRegistrationService {
             displayName: input.displayName,
           });
           version = 1;
+          persisted = true;
           break;
         } catch (err: unknown) {
           const code = (err as { code?: number })?.code;
@@ -186,53 +209,136 @@ export class PendingRegistrationService {
 
       if (updated) {
         version = nextVersion;
+        persisted = true;
         break;
       }
     }
 
-    // 5. Send OTP outside any DB transaction, then CAS-update deliveryState
-    const sendOutcome = await this.emailSender.sendOtpEmail({
-      purpose: 'REGISTER_VERIFY',
-      toEmail: input.emailNormalized,
-      otpCode,
-      correlationId: registrationId,
-      generation: version,
-    });
+    if (!persisted) {
+      throw new HttpError(409, 'CONFLICT', 'Concurrent registration conflict');
+    }
 
-    await this.pendingModel
-      .findOneAndUpdate(
-        {
-          registrationId,
-          version,
-          deliveryState: 'PENDING',
-        },
-        {
-          $set: sendOutcome.accepted
-            ? { deliveryState: 'ACCEPTED', state: 'SENT' }
-            : { deliveryState: 'FAILED' },
-        }
-      )
-      .exec();
+    const deliveryAccepted = await this.dispatchAndRecordDelivery(
+      registrationId,
+      version,
+      input.emailNormalized,
+      otpCode
+    );
 
     return {
       registrationId,
       nonce,
       version,
-      deliveryAccepted: sendOutcome.accepted,
+      deliveryAccepted,
       expiresAt,
       otpExpiresAt,
     };
   }
 
   /**
+   * Browser-bound registration resend primitive.
+   * Preserves existing passwordHash, nonceDigest, and registration expiresAt,
+   * while advancing version, resetting attempts, and issuing a fresh 5m OTP.
+   */
+  async resendRegistrationOtp(
+    input: ResendRegistrationInput
+  ): Promise<ResendRegistrationResult> {
+    await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
+
+    const currentNow = this.now();
+    const expectedNonceDigest = computeDomainHmac(this.hmacSecret, [
+      'REG_NONCE',
+      input.registrationId,
+      input.nonce,
+    ]);
+
+    const existing = await this.pendingModel
+      .findOne({
+        registrationId: input.registrationId,
+        nonceDigest: expectedNonceDigest,
+        state: { $in: ['PENDING_DELIVERY', 'SENT'] },
+        expiresAt: { $gt: currentNow },
+      })
+      .exec();
+
+    if (!existing) {
+      throw new OtpInvalidError();
+    }
+
+    await this.rateLimitService.consumeOrThrow(
+      'REGISTER_REPLACE_COOLDOWN',
+      existing.emailNormalized
+    );
+    await this.rateLimitService.consumeOrThrow(
+      'REGISTER_RESEND_EMAIL',
+      existing.emailNormalized
+    );
+
+    const nextVersion = existing.version + 1;
+    const otpCode = generateOtpCode();
+    const otpExpiresAt = new Date(
+      currentNow.getTime() + PENDING_REGISTRATION_POLICY.otpTtlMs
+    );
+    const otpDigest = computeDomainHmac(this.hmacSecret, [
+      'REG_OTP',
+      existing.registrationId,
+      String(nextVersion),
+      otpCode,
+    ]);
+
+    const updated = await this.pendingModel
+      .findOneAndUpdate(
+        {
+          _id: existing._id,
+          registrationId: existing.registrationId,
+          nonceDigest: expectedNonceDigest,
+          version: existing.version,
+          state: { $in: ['PENDING_DELIVERY', 'SENT'] },
+          expiresAt: { $gt: currentNow },
+        },
+        {
+          $set: {
+            otpDigest,
+            version: nextVersion,
+            attempts: 0,
+            state: 'PENDING_DELIVERY',
+            deliveryState: 'PENDING',
+            otpExpiresAt,
+          },
+          $inc: { resendCount: 1 },
+        },
+        { new: true }
+      )
+      .exec();
+
+    if (!updated) {
+      throw new OtpInvalidError();
+    }
+
+    const deliveryAccepted = await this.dispatchAndRecordDelivery(
+      updated.registrationId,
+      nextVersion,
+      updated.emailNormalized,
+      otpCode
+    );
+
+    return {
+      registrationId: updated.registrationId,
+      version: nextVersion,
+      deliveryAccepted,
+      otpExpiresAt,
+    };
+  }
+
+  /**
    * Atomically claims 1 of 5 OTP attempt slots BEFORE comparing the OTP digest.
-   * Validates browser-bound nonce digest, accepted delivery, SENT state, and expiry.
+   * Returns an unforgeable `VerifiedRegistrationProof` capability on success.
    */
   async claimAndVerifyRegistrationOtp(params: {
     registrationId: string;
     nonce: string;
     otpCode: string;
-  }): Promise<{ registrationId: string; version: number; emailNormalized: string }> {
+  }): Promise<VerifiedRegistrationProof> {
     const currentNow = this.now();
     const expectedNonceDigest = computeDomainHmac(this.hmacSecret, [
       'REG_NONCE',
@@ -273,31 +379,45 @@ export class PendingRegistrationService {
       throw new OtpInvalidError();
     }
 
-    return {
+    const proof: VerifiedRegistrationProof = Object.freeze({
       registrationId: claimed.registrationId,
       version: claimed.version,
       emailNormalized: claimed.emailNormalized,
-    };
+      nonceDigest: claimed.nonceDigest,
+      expiresAt: claimed.expiresAt,
+    });
+    issuedRegistrationProofs.add(proof);
+    return proof;
   }
 
   /**
-   * Transaction-aware consumption primitive for pending registration.
+   * Transaction-aware consumption primitive requiring an unforgeable
+   * `VerifiedRegistrationProof` and an active `ClientSession` transaction.
    */
   async consumePendingRegistration(
-    registrationId: string,
-    version: number,
+    proof: VerifiedRegistrationProof,
     session: ClientSession
   ): Promise<IPendingRegistration> {
-    if (!session) {
-      throw new Error('ClientSession is required for transactional registration consumption');
+    if (!proof || !issuedRegistrationProofs.has(proof)) {
+      throw new OtpInvalidError();
+    }
+    if (!session || typeof session.inTransaction !== 'function' || !session.inTransaction()) {
+      throw new Error(
+        'Active ClientSession transaction is required for transactional registration consumption'
+      );
     }
 
     const currentNow = this.now();
+    if (proof.expiresAt <= currentNow) {
+      throw new OtpInvalidError();
+    }
+
     const consumed = await this.pendingModel
       .findOneAndUpdate(
         {
-          registrationId,
-          version,
+          registrationId: proof.registrationId,
+          version: proof.version,
+          nonceDigest: proof.nonceDigest,
           state: 'SENT',
           deliveryState: 'ACCEPTED',
           otpExpiresAt: { $gt: currentNow },
@@ -314,6 +434,45 @@ export class PendingRegistrationService {
       throw new OtpInvalidError();
     }
 
+    issuedRegistrationProofs.delete(proof);
     return consumed;
+  }
+
+  private async dispatchAndRecordDelivery(
+    registrationId: string,
+    version: number,
+    toEmail: string,
+    otpCode: string
+  ): Promise<boolean> {
+    let accepted = false;
+    try {
+      const outcome = await this.emailSender.sendOtpEmail({
+        purpose: 'REGISTER_VERIFY',
+        toEmail,
+        otpCode,
+        correlationId: registrationId,
+        generation: version,
+      });
+      accepted = outcome.accepted;
+    } catch {
+      accepted = false;
+    }
+
+    await this.pendingModel
+      .findOneAndUpdate(
+        {
+          registrationId,
+          version,
+          deliveryState: 'PENDING',
+        },
+        {
+          $set: accepted
+            ? { deliveryState: 'ACCEPTED', state: 'SENT' }
+            : { deliveryState: 'FAILED' },
+        }
+      )
+      .exec();
+
+    return accepted;
   }
 }

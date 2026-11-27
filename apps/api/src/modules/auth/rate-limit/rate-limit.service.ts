@@ -4,7 +4,6 @@ import { computeDomainHmac } from '../otp/crypto.js';
 import {
   RATE_LIMIT_POLICIES,
   RateLimitExceededError,
-  type RateLimitPolicy,
   type RateLimitPolicyName,
 } from './types.js';
 
@@ -43,7 +42,21 @@ export class AuthRateLimitService {
     policyName: RateLimitPolicyName,
     subjectKey: string
   ): Promise<RateLimitConsumeResult> {
-    const policy: RateLimitPolicy = RATE_LIMIT_POLICIES[policyName];
+    try {
+      return await this.executeConsume(policyName, subjectKey);
+    } catch (err) {
+      if (err instanceof RateLimitExceededError) {
+        throw err;
+      }
+      throw new RateLimitExceededError(1, RATE_LIMIT_POLICIES[policyName].errorCode ?? 'AUTH_RATE_LIMITED');
+    }
+  }
+
+  private async executeConsume(
+    policyName: RateLimitPolicyName,
+    subjectKey: string
+  ): Promise<RateLimitConsumeResult> {
+    const policy = RATE_LIMIT_POLICIES[policyName];
     const bucketKey = this.computeBucketKey(policyName, subjectKey);
     const currentNow = this.now();
     const newWindowEnd = new Date(currentNow.getTime() + policy.windowMs);

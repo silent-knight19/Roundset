@@ -39,6 +39,15 @@ export interface IssuedChallengeResult {
   otpCode: string;
 }
 
+export interface VerifiedOtpChallengeProof {
+  readonly challengeId: string;
+  readonly purpose: OtpPurpose;
+  readonly subjectDigest: string;
+  readonly generation: number;
+  readonly expiresAt: Date;
+  readonly input: ChallengeSubjectInput;
+}
+
 export class OtpInvalidError extends HttpError {
   constructor(message = 'Invalid or expired verification code') {
     super(400, 'OTP_INVALID', message);

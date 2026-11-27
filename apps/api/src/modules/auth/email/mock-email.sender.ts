@@ -12,19 +12,23 @@ export interface RecordedMockEmail {
 export interface MockEmailSenderOptions {
   nodeEnv?: string;
   shouldAccept?: boolean;
+  /** Explicit opt-in for capturing OTPs in automated tests (bounded FIFO). */
+  enableTestOtpCapture?: boolean;
+  maxCapturedOtps?: number;
 }
 
 /**
  * Development and test-only EmailSender.
  * Strictly refuses instantiation or execution in production.
- * Never logs or retains raw email addresses, OTP codes, passwords, or nonces.
+ * Never logs or retains raw email addresses, passwords, or nonces.
  */
 export class MockEmailSender implements EmailSender {
   readonly providerName = 'mock' as const;
   private readonly nodeEnv: string;
   private shouldAccept: boolean;
+  private readonly enableTestOtpCapture: boolean;
+  private readonly maxCapturedOtps: number;
   public readonly sentRecords: RecordedMockEmail[] = [];
-  /** Test-only in-memory map keyed by correlationId for verifying OTPs in automated tests. */
   private readonly testOtpByCorrelation = new Map<string, string>();
 
   constructor(options: MockEmailSenderOptions = {}) {
@@ -33,6 +37,8 @@ export class MockEmailSender implements EmailSender {
       throw new ForbiddenError('MockEmailSender is forbidden in production');
     }
     this.shouldAccept = options.shouldAccept ?? true;
+    this.enableTestOtpCapture = options.enableTestOtpCapture ?? false;
+    this.maxCapturedOtps = options.maxCapturedOtps ?? 100;
   }
 
   setShouldAccept(accept: boolean): void {
@@ -40,6 +46,9 @@ export class MockEmailSender implements EmailSender {
   }
 
   getTestOtp(correlationId: string): string | undefined {
+    if (!this.enableTestOtpCapture) {
+      return undefined;
+    }
     return this.testOtpByCorrelation.get(correlationId);
   }
 
@@ -58,7 +67,15 @@ export class MockEmailSender implements EmailSender {
     });
 
     if (accepted) {
-      this.testOtpByCorrelation.set(request.correlationId, request.otpCode);
+      if (this.enableTestOtpCapture) {
+        if (this.testOtpByCorrelation.size >= this.maxCapturedOtps) {
+          const oldestKey = this.testOtpByCorrelation.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.testOtpByCorrelation.delete(oldestKey);
+          }
+        }
+        this.testOtpByCorrelation.set(request.correlationId, request.otpCode);
+      }
       return {
         accepted: true,
         provider: 'mock',

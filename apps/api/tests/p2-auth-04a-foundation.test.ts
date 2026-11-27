@@ -13,11 +13,13 @@ import {
   computeSubjectDigest,
   generateOtpCode,
   type ChallengeSubjectInput,
+  type VerifiedOtpChallengeProof,
 } from '../src/modules/auth/otp/index.js';
 import {
   AuthRateLimitService,
   InProcessFloodShedder,
   RateLimitExceededError,
+  createFloodShedderMiddleware,
   extractTrustedClientIp,
 } from '../src/modules/auth/rate-limit/index.js';
 import {
@@ -213,6 +215,13 @@ function createInMemoryPendingRegistrationModel() {
       } else if (key === 'attempts' && typeof val === 'object' && val !== null) {
         const lt = (val as { $lt?: number }).$lt;
         if (lt !== undefined && !((doc.attempts as number) < lt)) return false;
+      } else if (
+        typeof val === 'object' &&
+        val !== null &&
+        '$in' in val &&
+        Array.isArray((val as { $in?: unknown[] }).$in)
+      ) {
+        if (!(val as { $in: unknown[] }).$in.includes(doc[key])) return false;
       } else if (doc[key] !== val) {
         return false;
       }
@@ -316,7 +325,7 @@ describe('P2-AUTH-04a: Pending Registration, OTP & Rate-Limiting Foundation', ()
       let currentTime = new Date('2026-11-27T10:00:00.000Z');
       const rateModel = createInMemoryRateLimitModel();
       const pendingModel = createInMemoryPendingRegistrationModel();
-      const emailSender = new MockEmailSender({ nodeEnv: 'test' });
+      const emailSender = new MockEmailSender({ nodeEnv: 'test', enableTestOtpCapture: true });
       const passwordService = createPasswordService();
 
       const rateLimitService = new AuthRateLimitService({
@@ -600,6 +609,137 @@ describe('P2-AUTH-04a: Pending Registration, OTP & Rate-Limiting Foundation', ()
       expect(() => new MockEmailSender({ nodeEnv: 'production' })).toThrow(ForbiddenError);
       const devSender: EmailSender = new MockEmailSender({ nodeEnv: 'test' });
       expect(devSender.providerName).toBe('mock');
+
+      // Raw OTP capture is disabled unless explicitly opted in
+      await devSender.sendOtpEmail({
+        purpose: 'REGISTER_VERIFY',
+        toEmail: 'a@example.com',
+        otpCode: '123456',
+        correlationId: 'corr_1',
+        generation: 1,
+      });
+      expect((devSender as MockEmailSender).getTestOtp('corr_1')).toBeUndefined();
+    });
+
+    it('enforces unforgeable verified-proof capability and active ClientSession transaction', async () => {
+      const challengeModel = createInMemoryChallengeModel();
+      const otpService = new OtpChallengeService({
+        challengeModel: challengeModel as never,
+        hmacSecret: TEST_HMAC_SECRET,
+      });
+
+      const subject: ChallengeSubjectInput = {
+        purpose: 'PHONE_VERIFY',
+        phoneE164: '+14155552671',
+        userId: new Types.ObjectId(),
+      };
+      const issued = await otpService.issueChallenge(subject);
+      await otpService.markDeliveryState(issued.challengeId, issued.generation, 'ACCEPTED');
+
+      const forgedProof = {
+        challengeId: issued.challengeId,
+        purpose: issued.purpose,
+        subjectDigest: issued.subjectDigest,
+        generation: issued.generation,
+        expiresAt: issued.expiresAt,
+        input: subject,
+      } as VerifiedOtpChallengeProof;
+
+      const activeSession = { inTransaction: () => true } as never;
+      const inactiveSession = { inTransaction: () => false } as never;
+
+      // Forged proof rejected
+      await expect(otpService.consumeVerifiedChallenge(forgedProof, activeSession)).rejects.toThrow(
+        OtpInvalidError
+      );
+
+      // Valid proof with inactive transaction rejected
+      const realProof = await otpService.claimAndVerifyAttempt(
+        subject,
+        issued.challengeId,
+        issued.generation,
+        issued.otpCode
+      );
+      await expect(
+        otpService.consumeVerifiedChallenge(realProof, inactiveSession)
+      ).rejects.toThrow('Active ClientSession transaction is required');
+
+      // Valid proof with active transaction succeeds
+      await expect(
+        otpService.consumeVerifiedChallenge(realProof, activeSession)
+      ).resolves.toBeUndefined();
+    });
+
+    it('supports browser-bound resend, prevents orphan emails on CAS exhaustion, and maps email exceptions', async () => {
+      let currentTime = new Date('2026-11-27T10:00:00.000Z');
+      const rateModel = createInMemoryRateLimitModel();
+      const pendingModel = createInMemoryPendingRegistrationModel();
+      const emailSender = new MockEmailSender({ nodeEnv: 'test', enableTestOtpCapture: true });
+      const passwordService = createPasswordService();
+      const rateLimitService = new AuthRateLimitService({
+        rateLimitModel: rateModel as never,
+        hmacSecret: TEST_HMAC_SECRET,
+        now: () => currentTime,
+      });
+
+      const regService = new PendingRegistrationService({
+        pendingRegistrationModel: pendingModel as never,
+        rateLimitService,
+        passwordService,
+        emailSender,
+        hmacSecret: TEST_HMAC_SECRET,
+        now: () => currentTime,
+      });
+
+      const r1 = await regService.startOrReplaceRegistration({
+        emailNormalized: 'resend@example.com',
+        password: 'Valid-Password-2026!',
+        consentVersion: 'v1.0',
+        trustedIp: '203.0.113.20',
+      });
+      const otp1 = emailSender.getTestOtp(r1.registrationId)!;
+
+      // Advance 61s and resend with valid registrationId + nonce
+      currentTime = new Date(currentTime.getTime() + 61_000);
+      const resendRes = await regService.resendRegistrationOtp({
+        registrationId: r1.registrationId,
+        nonce: r1.nonce,
+        trustedIp: '203.0.113.20',
+      });
+      expect(resendRes.version).toBe(2);
+      expect(resendRes.deliveryAccepted).toBe(true);
+      const otp2 = emailSender.getTestOtp(r1.registrationId)!;
+      expect(otp2).not.toBe(otp1);
+
+      // Old OTP1 no longer works
+      await expect(
+        regService.claimAndVerifyRegistrationOtp({
+          registrationId: r1.registrationId,
+          nonce: r1.nonce,
+          otpCode: otp1,
+        })
+      ).rejects.toThrow(OtpInvalidError);
+
+      // New OTP2 works
+      await expect(
+        regService.claimAndVerifyRegistrationOtp({
+          registrationId: r1.registrationId,
+          nonce: r1.nonce,
+          otpCode: otp2,
+        })
+      ).resolves.toMatchObject({ registrationId: r1.registrationId, version: 2 });
+
+      // Flood shedder middleware sets Retry-After on 429
+      const shedder = new InProcessFloodShedder({ perIpLimitPerMinute: 1, globalLimitPerMinute: 10 });
+      const mw = createFloodShedderMiddleware(shedder);
+      const headers: Record<string, string> = {};
+      const next1 = vi.fn();
+      mw({ clientIp: '198.51.100.9' } as never, { setHeader: (k: string, v: string) => { headers[k] = v; } } as never, next1);
+      expect(next1).toHaveBeenCalledWith();
+      const next2 = vi.fn();
+      mw({ clientIp: '198.51.100.9' } as never, { setHeader: (k: string, v: string) => { headers[k] = v; } } as never, next2);
+      expect(headers['Retry-After']).toBeDefined();
+      expect(next2.mock.calls[0]?.[0]).toBeInstanceOf(RateLimitExceededError);
     });
   });
 });

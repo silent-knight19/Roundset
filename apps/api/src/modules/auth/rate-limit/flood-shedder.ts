@@ -1,4 +1,5 @@
-import { RateLimitExceededError } from './types.js';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { RateLimitExceededError, extractTrustedClientIp } from './types.js';
 
 interface CounterWindow {
   count: number;
@@ -54,7 +55,7 @@ export class InProcessFloodShedder {
         1,
         Math.ceil((this.globalWindow.windowEndMs - currentNow) / 1000)
       );
-      throw new RateLimitExceededError(retryAfter, 'RATE_LIMITED');
+      throw new RateLimitExceededError(retryAfter, 'AUTH_RATE_LIMITED');
     }
 
     // 2. Per-trusted-IP limit
@@ -72,7 +73,7 @@ export class InProcessFloodShedder {
         1,
         Math.ceil((ipEntry.windowEndMs - currentNow) / 1000)
       );
-      throw new RateLimitExceededError(retryAfter, 'RATE_LIMITED');
+      throw new RateLimitExceededError(retryAfter, 'AUTH_RATE_LIMITED');
     }
 
     this.globalWindow.count += 1;
@@ -91,4 +92,24 @@ export class InProcessFloodShedder {
       this.ipWindows.delete(oldestKey);
     }
   }
+}
+
+/**
+ * Reusable pre-database Express flood-shedding middleware.
+ * Uses only ingress-derived `req.clientIp` and sets `Retry-After` on 429.
+ */
+export function createFloodShedderMiddleware(
+  shedder: InProcessFloodShedder = new InProcessFloodShedder()
+): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    try {
+      shedder.consumeOrThrow(extractTrustedClientIp(req));
+      next();
+    } catch (err) {
+      if (err instanceof RateLimitExceededError) {
+        res.setHeader('Retry-After', String(err.retryAfterSeconds));
+      }
+      next(err);
+    }
+  };
 }

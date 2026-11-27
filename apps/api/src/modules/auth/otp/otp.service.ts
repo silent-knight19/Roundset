@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
-import type { ClientSession, Model } from 'mongoose';
+import type { ClientSession, Model, Types } from 'mongoose';
 import type { IVerificationChallenge } from '../../identity/models/verification-challenge.model.js';
+import type { IUser } from '../../identity/models/user.model.js';
+import type { IAuthIdentity } from '../../identity/models/auth-identity.model.js';
 import {
   compareDigestConstantTime,
   computeOtpDigest,
@@ -12,13 +14,31 @@ import {
   OtpInvalidError,
   type ChallengeSubjectInput,
   type IssuedChallengeResult,
+  type VerifiedOtpChallengeProof,
 } from './types.js';
+
+/**
+ * Private runtime capability registry. Only `claimAndVerifyAttempt` may
+ * register a `VerifiedOtpChallengeProof`, preventing caller-constructed objects
+ * from authorizing consumption.
+ */
+const issuedOtpProofs = new WeakSet<VerifiedOtpChallengeProof>();
 
 export interface OtpChallengeServiceOptions {
   challengeModel: Model<IVerificationChallenge>;
   hmacSecret: string;
   now?: () => Date;
   compareDigest?: (actual: string, expected: string) => boolean;
+}
+
+export interface VerifyRecoveryBindingParams {
+  userModel: Model<IUser>;
+  authIdentityModel: Model<IAuthIdentity>;
+  userId: Types.ObjectId;
+  passwordIdentityIdAtIssue: Types.ObjectId;
+  identityVersionAtIssue: number;
+  emailNormalized: string;
+  session?: ClientSession;
 }
 
 function buildBindingFilter(input: ChallengeSubjectInput): Record<string, unknown> {
@@ -57,8 +77,6 @@ export class OtpChallengeService {
 
   /**
    * Issues or atomically replaces the single mutable challenge slot for (purpose, subjectDigest).
-   * Generates a fresh challengeId, increments generation, resets attempts to 0,
-   * and sets deliveryState to PENDING.
    */
   async issueChallenge(input: ChallengeSubjectInput): Promise<IssuedChallengeResult> {
     const subjectDigest = computeSubjectDigest(this.hmacSecret, input);
@@ -194,15 +212,14 @@ export class OtpChallengeService {
 
   /**
    * Atomically claims 1 of max 5 attempt slots in MongoDB BEFORE comparing any OTP digest.
-   * A 6th concurrent request, expired challenge, or PENDING/FAILED delivery never reaches
-   * digest comparison.
+   * Returns an unforgeable `VerifiedOtpChallengeProof` capability on success.
    */
   async claimAndVerifyAttempt(
     input: ChallengeSubjectInput,
     challengeId: string,
     generation: number,
     otpCode: string
-  ): Promise<{ challengeId: string; generation: number; subjectDigest: string }> {
+  ): Promise<VerifiedOtpChallengeProof> {
     const subjectDigest = computeSubjectDigest(this.hmacSecret, input);
     const currentNow = this.now();
     const bindingFilter = buildBindingFilter(input);
@@ -244,39 +261,93 @@ export class OtpChallengeService {
       throw new OtpInvalidError();
     }
 
-    return {
+    const proof: VerifiedOtpChallengeProof = Object.freeze({
       challengeId: claimed.challengeId,
-      generation: claimed.generation,
+      purpose: input.purpose,
       subjectDigest,
-    };
+      generation: claimed.generation,
+      expiresAt: claimed.expiresAt,
+      input,
+    });
+    issuedOtpProofs.add(proof);
+    return proof;
   }
 
   /**
-   * Transaction-aware consumption primitive accepting the caller's ClientSession.
-   * Must be executed inside an active MongoDB replica-set transaction alongside
-   * the protected credential/account mutation.
+   * Verifies that a RESET_PASSWORD challenge's bound userId, passwordIdentityIdAtIssue,
+   * identityVersionAtIssue, ACTIVE status, and canonical email match current DB state.
+   *
+   * Mandatory for P2-AUTH-03b: `POST /auth/password/reset` must call this within the
+   * same `ClientSession` transaction as `consumeVerifiedChallenge` AND perform a guarded
+   * `users.findOneAndUpdate({ _id: userId, accountStatus: 'ACTIVE', identityVersion: identityVersionAtIssue, emailNormalized }, { $inc: { identityVersion: 1, sessionEpoch: 1 } })`
+   * to prevent check-then-mutate races.
    */
-  async consumeVerifiedChallenge(
-    input: ChallengeSubjectInput,
-    challengeId: string,
-    generation: number,
-    session: ClientSession
+  async verifyAuthoritativeRecoveryBinding(
+    params: VerifyRecoveryBindingParams
   ): Promise<void> {
-    if (!session) {
-      throw new Error('ClientSession is required for transactional challenge consumption');
+    const user = await params.userModel
+      .findOne(
+        {
+          _id: params.userId,
+          accountStatus: 'ACTIVE',
+          emailNormalized: params.emailNormalized,
+          identityVersion: params.identityVersionAtIssue,
+        },
+        null,
+        params.session ? { session: params.session } : undefined
+      )
+      .exec();
+
+    if (!user) {
+      throw new OtpInvalidError();
     }
 
-    const subjectDigest = computeSubjectDigest(this.hmacSecret, input);
+    const identity = await params.authIdentityModel
+      .findOne(
+        {
+          _id: params.passwordIdentityIdAtIssue,
+          userId: params.userId,
+          provider: 'PASSWORD',
+        },
+        null,
+        params.session ? { session: params.session } : undefined
+      )
+      .exec();
+
+    if (!identity) {
+      throw new OtpInvalidError();
+    }
+  }
+
+  /**
+   * Transaction-aware consumption primitive requiring an unforgeable
+   * `VerifiedOtpChallengeProof` and an active `ClientSession` transaction.
+   */
+  async consumeVerifiedChallenge(
+    proof: VerifiedOtpChallengeProof,
+    session: ClientSession
+  ): Promise<void> {
+    if (!proof || !issuedOtpProofs.has(proof)) {
+      throw new OtpInvalidError();
+    }
+    if (!session || typeof session.inTransaction !== 'function' || !session.inTransaction()) {
+      throw new Error('Active ClientSession transaction is required for challenge consumption');
+    }
+
     const currentNow = this.now();
-    const bindingFilter = buildBindingFilter(input);
+    if (proof.expiresAt <= currentNow) {
+      throw new OtpInvalidError();
+    }
+
+    const bindingFilter = buildBindingFilter(proof.input);
 
     const consumed = await this.challengeModel
       .findOneAndUpdate(
         {
-          challengeId,
-          purpose: input.purpose,
-          subjectDigest,
-          generation,
+          challengeId: proof.challengeId,
+          purpose: proof.purpose,
+          subjectDigest: proof.subjectDigest,
+          generation: proof.generation,
           state: 'ISSUED',
           deliveryState: 'ACCEPTED',
           expiresAt: { $gt: currentNow },
@@ -295,5 +366,7 @@ export class OtpChallengeService {
     if (!consumed) {
       throw new OtpInvalidError();
     }
+
+    issuedOtpProofs.delete(proof);
   }
 }
