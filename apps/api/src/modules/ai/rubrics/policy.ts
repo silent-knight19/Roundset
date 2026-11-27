@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { SanitizedAiError } from '../contracts.js';
 import {
+  ContextSummaryProposalV1,
   FollowUpProposalV1,
   PlanProposalV1,
   QuestionProposalV1,
+  StartBundleProposalV1,
 } from '../schemas/proposals.js';
 
 export interface AssessmentPolicyFixture {
@@ -14,6 +16,13 @@ export interface AssessmentPolicyFixture {
   readonly approvedCompetencies: ReadonlySet<string>;
   readonly approvedCriteria: ReadonlySet<string>;
   readonly approvedConcepts: ReadonlySet<string>;
+  readonly roleToTracks: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly trackToTopics: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly topicToCompetencies: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly competencyToConcepts: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly competencyToCriteria: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly criterionApprovedDescriptions: Readonly<Record<string, string>>;
+  readonly followUpApprovedTexts: Readonly<Record<string, ReadonlySet<string>>>;
 }
 
 /**
@@ -46,12 +55,66 @@ export const SYNTHETIC_ASSESSMENT_POLICY_V1: AssessmentPolicyFixture = {
     'consistency',
     'caching_invalidation',
   ]),
+  roleToTracks: {
+    backend_engineer: new Set(['node_ts', 'distributed_systems']),
+    frontend_engineer: new Set(['react_ts']),
+    fullstack_engineer: new Set(['node_ts', 'react_ts']),
+  },
+  trackToTopics: {
+    node_ts: new Set(['api_design', 'concurrency', 'caching', 'testing']),
+    react_ts: new Set(['state_management', 'testing', 'api_design']),
+    distributed_systems: new Set(['concurrency', 'data_modeling', 'caching']),
+  },
+  topicToCompetencies: {
+    api_design: new Set(['api_contracts', 'system_reliability']),
+    concurrency: new Set(['async_control', 'system_reliability']),
+    data_modeling: new Set(['state_management', 'system_reliability']),
+    caching: new Set(['system_reliability', 'state_management']),
+    testing: new Set(['api_contracts', 'async_control']),
+  },
+  competencyToConcepts: {
+    api_contracts: new Set(['idempotency', 'rate_limiting', 'atomicity']),
+    async_control: new Set(['backpressure', 'atomicity', 'consistency']),
+    system_reliability: new Set(['idempotency', 'rate_limiting', 'consistency', 'caching_invalidation']),
+    state_management: new Set(['consistency', 'caching_invalidation', 'atomicity']),
+  },
+  competencyToCriteria: {
+    api_contracts: new Set(['correctness', 'edge_cases', 'clarity', 'tradeoffs']),
+    async_control: new Set(['correctness', 'edge_cases', 'scalability', 'tradeoffs']),
+    system_reliability: new Set(['correctness', 'scalability', 'edge_cases', 'tradeoffs']),
+    state_management: new Set(['correctness', 'clarity', 'tradeoffs']),
+  },
+  criterionApprovedDescriptions: {
+    correctness: 'Explains idempotency key storage.',
+    edge_cases: 'Handles concurrent duplicate deliveries.',
+    scalability: 'Evaluates throughput and bounded resource usage.',
+    clarity: 'Communicates structure and contracts clearly.',
+    tradeoffs: 'Compares alternative designs and failure modes.',
+  },
+  followUpApprovedTexts: {
+    api_contracts: new Set([
+      'Could you clarify how you store the idempotency key?',
+      'What happens if a client retries with a different payload?',
+    ]),
+    async_control: new Set([
+      'How do you bound queue growth under backpressure?',
+    ]),
+  },
 };
 
 export interface ServerEntitlementConstraints {
   maxDurationMinutes: number;
   allowedModes: ReadonlySet<'TEXT' | 'VOICE'>;
   allowedQuestionTypes: ReadonlySet<'CONCEPTUAL' | 'SYSTEM_DESIGN' | 'BEHAVIORAL'>;
+}
+
+export interface PlanSlot {
+  slotId: string;
+  topic: string;
+  competency: string;
+  weight: number;
+  questionType: 'CONCEPTUAL' | 'SYSTEM_DESIGN' | 'BEHAVIORAL';
+  difficulty: 'EASY' | 'MEDIUM' | 'HARD';
 }
 
 /**
@@ -68,6 +131,9 @@ export function validateTrustedPlan(
   }
   if (!policy.approvedTracks.has(plan.track)) {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Unapproved interview track');
+  }
+  if (!policy.roleToTracks[plan.role]?.has(plan.track)) {
+    throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Track is not approved for role');
   }
   if (!entitlement.allowedModes.has(plan.mode)) {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Interview mode exceeds entitlement');
@@ -99,8 +165,17 @@ export function validateTrustedPlan(
     if (!policy.approvedTopics.has(slot.topic)) {
       throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Unapproved plan slot topic');
     }
+    if (!policy.trackToTopics[plan.track]?.has(slot.topic)) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Topic is not approved for track');
+    }
     if (!policy.approvedCompetencies.has(slot.competency)) {
       throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Unapproved plan slot competency');
+    }
+    if (!policy.topicToCompetencies[slot.topic]?.has(slot.competency)) {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'Competency is not approved for topic',
+      );
     }
     if (!plan.allowedQuestionTypes.includes(slot.questionType)) {
       throw new SanitizedAiError(
@@ -135,28 +210,69 @@ export function computeNormalizedQuestionFingerprint(text: string): string {
 }
 
 /**
- * Validates QuestionProposal.v1 against rubric total (exactly 10),
+ * Validates QuestionProposal.v1 against the exact assigned PlanSlot,
+ * rubric total (exactly 10), server-owned criterion descriptions,
  * approved competency/criterion/concept families, and duplicate fingerprints.
  */
 export function validateQuestionProposalPolicy(
   proposal: QuestionProposalV1,
+  slot: PlanSlot,
   policy: AssessmentPolicyFixture = SYNTHETIC_ASSESSMENT_POLICY_V1,
   priorFingerprints: ReadonlySet<string> = new Set(),
 ): { proposal: QuestionProposalV1; fingerprint: string } {
-  if (!policy.approvedTopics.has(proposal.topic)) {
-    throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Unapproved question topic');
+  if (proposal.topic !== slot.topic) {
+    throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Question topic does not match assigned slot');
+  }
+  if (proposal.type !== slot.questionType) {
+    throw new SanitizedAiError(
+      'AI_SCHEMA_INVALID',
+      'Question type does not match assigned slot',
+    );
+  }
+  if (proposal.difficulty !== slot.difficulty) {
+    throw new SanitizedAiError(
+      'AI_SCHEMA_INVALID',
+      'Question difficulty does not match assigned slot',
+    );
   }
 
+  const allowedConcepts = policy.competencyToConcepts[slot.competency];
+  const seenConcepts = new Set<string>();
   for (const concept of proposal.expectedConcepts) {
-    if (!policy.approvedConcepts.has(concept)) {
-      throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Unapproved expected concept');
+    if (seenConcepts.has(concept)) {
+      throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Duplicate expected concept');
+    }
+    seenConcepts.add(concept);
+    if (!policy.approvedConcepts.has(concept) || !allowedConcepts?.has(concept)) {
+      throw new SanitizedAiError(
+        'AI_SCHEMA_INVALID',
+        'Expected concept is not approved for slot competency',
+      );
     }
   }
 
+  const allowedCriteria = policy.competencyToCriteria[slot.competency];
+  const seenCriteria = new Set<string>();
   let totalPoints = 0;
   for (const item of proposal.scoringRubric) {
-    if (!policy.approvedCriteria.has(item.criterion)) {
-      throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Unapproved rubric criterion family');
+    if (seenCriteria.has(item.criterion)) {
+      throw new SanitizedAiError('AI_SCHEMA_INVALID', 'Duplicate rubric criterion');
+    }
+    seenCriteria.add(item.criterion);
+
+    if (!policy.approvedCriteria.has(item.criterion) || !allowedCriteria?.has(item.criterion)) {
+      throw new SanitizedAiError(
+        'AI_SCHEMA_INVALID',
+        'Rubric criterion is not approved for slot competency',
+      );
+    }
+
+    const serverDescription = policy.criterionApprovedDescriptions[item.criterion];
+    if (!serverDescription || item.description !== serverDescription) {
+      throw new SanitizedAiError(
+        'AI_SCHEMA_INVALID',
+        'Rubric criterion description does not match server-owned grading policy',
+      );
     }
     totalPoints += item.maxPoints;
   }
@@ -179,10 +295,36 @@ export function validateQuestionProposalPolicy(
   return { proposal, fingerprint };
 }
 
+/**
+ * Validates StartBundleProposal.v1 (offline fixtures only), ensuring Q1
+ * is consistent with the first slot of its validated plan.
+ */
+export function validateStartBundlePolicy(
+  bundle: StartBundleProposalV1,
+  entitlement: ServerEntitlementConstraints,
+  policy: AssessmentPolicyFixture = SYNTHETIC_ASSESSMENT_POLICY_V1,
+  priorFingerprints: ReadonlySet<string> = new Set(),
+): { bundle: StartBundleProposalV1; q1Fingerprint: string } {
+  validateTrustedPlan(bundle.plan, entitlement, policy);
+  const firstSlot = bundle.plan.slots[0];
+  if (!firstSlot) {
+    throw new SanitizedAiError('AI_SCHEMA_INVALID', 'StartBundle plan must contain at least one slot');
+  }
+  const { fingerprint } = validateQuestionProposalPolicy(
+    bundle.q1,
+    firstSlot,
+    policy,
+    priorFingerprints,
+  );
+  return { bundle, q1Fingerprint: fingerprint };
+}
+
 export interface ParentQuestionContext {
   questionId: string;
   topic: string;
   allowedCompetencyTags: ReadonlySet<string>;
+  followUpCount: number;
+  maxFollowUps: number;
 }
 
 /** Fixed server-owned clarifying fallback when semantic compatibility fails. */
@@ -200,7 +342,14 @@ export const SERVER_TRANSITION_EVENT = {
 export function validateFollowUpProposalPolicy(
   proposal: FollowUpProposalV1,
   parent: ParentQuestionContext,
+  policy: AssessmentPolicyFixture = SYNTHETIC_ASSESSMENT_POLICY_V1,
 ): FollowUpProposalV1 {
+  if (parent.followUpCount >= parent.maxFollowUps) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Follow-up turn limit exceeded for parent question',
+    );
+  }
   if (proposal.parentQuestionId !== parent.questionId) {
     throw new SanitizedAiError(
       'AI_SCHEMA_INVALID',
@@ -213,5 +362,34 @@ export function validateFollowUpProposalPolicy(
       'Follow-up competencyTag is outside parent question scope',
     );
   }
+  const approvedTexts = policy.followUpApprovedTexts[proposal.competencyTag];
+  if (!approvedTexts || !approvedTexts.has(proposal.text)) {
+    throw new SanitizedAiError(
+      'AI_SCHEMA_INVALID',
+      'Follow-up text failed conservative semantic compatibility check',
+    );
+  }
   return proposal;
+}
+
+export function validateContextSummaryPolicy(
+  summary: ContextSummaryProposalV1,
+  expectedMaxCoveredTurns: number,
+  allowedTopics: ReadonlySet<string>,
+): ContextSummaryProposalV1 {
+  if (summary.coveredTurns > expectedMaxCoveredTurns) {
+    throw new SanitizedAiError(
+      'AI_SCHEMA_INVALID',
+      'ContextSummary coveredTurns exceeds authoritative turn count',
+    );
+  }
+  for (const topic of summary.keyTopics) {
+    if (!allowedTopics.has(topic)) {
+      throw new SanitizedAiError(
+        'AI_SCHEMA_INVALID',
+        'ContextSummary keyTopics contains unapproved topic',
+      );
+    }
+  }
+  return summary;
 }
