@@ -13,6 +13,8 @@ import {
 const EPHEMERAL_PERMIT_HMAC_KEY = randomBytes(32);
 
 export interface AuthoritativeAncestorIdentity {
+  userId: string;
+  interviewId: string;
   kind: SourceKind;
   recordId: string;
   recordVersion: string;
@@ -513,7 +515,17 @@ export function resolveAndAuthorizeSourceManifest(
                 'Malformed authoritativeAncestors entry',
               );
             }
-            expectedKeys.add(`${anc.kind}:${anc.recordId}:${anc.recordVersion}`);
+            // Ancestor identities are persisted scope-bound identities, not
+            // aliases that can be resolved to a different user's local record.
+            if (anc.userId !== input.authenticatedUserId || anc.interviewId !== input.interviewId) {
+              throw new SanitizedAiError(
+                'AI_PRIVACY_INELIGIBLE',
+                'Authoritative ancestor scope does not match current interview',
+              );
+            }
+            expectedKeys.add(JSON.stringify([
+              anc.userId, anc.interviewId, anc.kind, anc.recordId, anc.recordVersion,
+            ]));
           }
 
           const declaredAncestors = new Set<string>(descriptor.ancestorRefs);
@@ -541,9 +553,13 @@ export function resolveAndAuthorizeSourceManifest(
                 'DERIVED_SUMMARY ancestors must be authoritative USER_INTERVIEW sources',
               );
             }
-            resolvedAncestorKeys.add(
-              `${ancestorDesc.kind}:${ancestorDesc.scope.recordId}:${ancestorDesc.scope.recordVersion}`,
-            );
+            resolvedAncestorKeys.add(JSON.stringify([
+              ancestorDesc.scope.userId,
+              ancestorDesc.scope.interviewId,
+              ancestorDesc.kind,
+              ancestorDesc.scope.recordId,
+              ancestorDesc.scope.recordVersion,
+            ]));
           }
           if (!setsEqual(resolvedAncestorKeys, expectedKeys)) {
             throw new SanitizedAiError(
