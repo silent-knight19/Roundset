@@ -1,8 +1,40 @@
 import { useState } from 'react';
 import { NavLink, Link, Outlet } from 'react-router-dom';
+import { useAuth } from '../app/AuthContext';
 
 export function AppLayout() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const { status, user, reloginReason, error: authError, logout, logoutAll } = useAuth();
+
+  const handleLogout = async () => {
+    setActionError(null);
+    setSigningOut(true);
+    try {
+      const res = await logout();
+      if (res.kind === 'mismatch' || res.kind === 'error') {
+        setActionError(res.error);
+      }
+    } finally {
+      setSigningOut(false);
+      setMobileMenuOpen(false);
+    }
+  };
+
+  const handleLogoutAll = async () => {
+    setActionError(null);
+    setSigningOut(true);
+    try {
+      const res = await logoutAll();
+      if (res.kind === 'error') {
+        setActionError(res.error);
+      }
+    } finally {
+      setSigningOut(false);
+      setMobileMenuOpen(false);
+    }
+  };
 
   const navLinkClasses = ({ isActive }: { isActive: boolean }) =>
     `px-3 py-2 text-sm font-medium rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB] ${
@@ -61,15 +93,43 @@ export function AppLayout() {
               </span>
 
               <div className="flex items-center gap-1.5 ml-3 pl-3 border-l border-slate-200">
-                <NavLink to="/login" className={navLinkClasses}>
-                  Sign In
-                </NavLink>
-                <NavLink
-                  to="/register"
-                  className="px-3 py-1.5 text-xs font-semibold rounded-md bg-[#2563EB] text-white hover:bg-blue-700 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
-                >
-                  Register
-                </NavLink>
+                {status === 'loading' ? (
+                  <span className="text-xs text-slate-500 px-2">Checking session...</span>
+                ) : status === 'authenticated' && user ? (
+                  <>
+                    <span className="text-xs font-medium text-slate-700 px-2 max-w-[140px] truncate">
+                      {user.displayName || user.email}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={signingOut}
+                      onClick={() => void handleLogout()}
+                      className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+                    >
+                      Sign Out
+                    </button>
+                    <button
+                      type="button"
+                      disabled={signingOut}
+                      onClick={() => void handleLogoutAll()}
+                      className="px-2.5 py-1.5 text-xs font-medium rounded-md text-slate-600 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+                    >
+                      Sign Out All
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <NavLink to="/login" className={navLinkClasses}>
+                      Sign In
+                    </NavLink>
+                    <NavLink
+                      to="/register"
+                      className="px-3 py-1.5 text-xs font-semibold rounded-md bg-[#2563EB] text-white hover:bg-blue-700 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+                    >
+                      Register
+                    </NavLink>
+                  </>
+                )}
               </div>
             </nav>
 
@@ -153,20 +213,48 @@ export function AppLayout() {
               </span>
             </div>
             <div className="pt-2 border-t border-slate-200 flex flex-col gap-1">
-              <NavLink
-                to="/login"
-                onClick={() => setMobileMenuOpen(false)}
-                className={navLinkClasses}
-              >
-                Sign In
-              </NavLink>
-              <NavLink
-                to="/register"
-                onClick={() => setMobileMenuOpen(false)}
-                className={navLinkClasses}
-              >
-                Register
-              </NavLink>
+              {status === 'loading' ? (
+                <span className="px-3 py-2 text-xs text-slate-500">Checking session...</span>
+              ) : status === 'authenticated' && user ? (
+                <>
+                  <span className="px-3 py-1.5 text-xs font-semibold text-slate-700">
+                    Signed in as {user.displayName || user.email}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={signingOut}
+                    onClick={() => void handleLogout()}
+                    className="text-left px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-md disabled:opacity-50"
+                  >
+                    Sign Out
+                  </button>
+                  <button
+                    type="button"
+                    disabled={signingOut}
+                    onClick={() => void handleLogoutAll()}
+                    className="text-left px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-50 rounded-md disabled:opacity-50"
+                  >
+                    Sign Out All Devices
+                  </button>
+                </>
+              ) : (
+                <>
+                  <NavLink
+                    to="/login"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={navLinkClasses}
+                  >
+                    Sign In
+                  </NavLink>
+                  <NavLink
+                    to="/register"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={navLinkClasses}
+                  >
+                    Register
+                  </NavLink>
+                </>
+              )}
             </div>
           </nav>
         )}
@@ -174,6 +262,28 @@ export function AppLayout() {
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {(actionError || (status === 'relogin_required' && authError)) && (
+          <div
+            role="alert"
+            className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 flex items-center justify-between gap-4"
+          >
+            <span>
+              {actionError ??
+                (reloginReason === 'replay_detected'
+                  ? 'Session replay detected. Your session was revoked — please sign in again.'
+                  : authError)}
+            </span>
+            {actionError && (
+              <button
+                type="button"
+                onClick={() => setActionError(null)}
+                className="text-xs font-semibold underline shrink-0"
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+        )}
         <Outlet />
       </main>
 

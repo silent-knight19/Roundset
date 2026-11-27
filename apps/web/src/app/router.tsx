@@ -1,5 +1,6 @@
 import { createBrowserRouter, type RouteObject } from 'react-router-dom';
 import { AppLayout } from '../components/AppLayout';
+import { ProtectedRoute } from '../components/auth/ProtectedRoute';
 import { HomePage } from '../pages/HomePage';
 import { InterviewPage } from '../pages/InterviewPage';
 import { DashboardPage } from '../pages/DashboardPage';
@@ -41,11 +42,19 @@ export const routes: RouteObject[] = [
       },
       {
         path: 'interview',
-        element: <InterviewPage />,
+        element: (
+          <ProtectedRoute routeLabel="Interview Session">
+            <InterviewPage />
+          </ProtectedRoute>
+        ),
       },
       {
         path: 'dashboard',
-        element: <DashboardPage />,
+        element: (
+          <ProtectedRoute routeLabel="Candidate Dashboard">
+            <DashboardPage />
+          </ProtectedRoute>
+        ),
       },
       {
         path: 'pricing',

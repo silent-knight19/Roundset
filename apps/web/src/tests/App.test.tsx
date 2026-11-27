@@ -83,24 +83,113 @@ describe('App and Navigation Tests', () => {
     ).toBeTruthy();
   });
 
-  it('navigates to interview placeholder with inactive status', () => {
-    globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {}));
-    const testRouter = createMemoryRouter(routes, { initialEntries: ['/interview'] });
-    render(<App router={testRouter} />);
+  it('gates interview route when unauthenticated and renders when authenticated', async () => {
+    // Unauthenticated: /api/v1/auth/refresh returns 401 AUTH_REQUIRED
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 401,
+      json: async () => ({
+        error: {
+          code: 'AUTH_REQUIRED',
+          message: 'Refresh token is required',
+          requestId: '00000000-0000-4000-8000-000000000001',
+        },
+      }),
+    } as unknown as Response);
 
-    expect(screen.getByRole('heading', { name: /Interview Session/i })).toBeTruthy();
+    const unauthRouter = createMemoryRouter(routes, { initialEntries: ['/interview'] });
+    const { unmount } = render(<App router={unauthRouter} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Sign in required/i })).toBeTruthy();
+    });
+    expect(screen.getByRole('link', { name: /Go to Sign In/i })).toBeTruthy();
+    unmount();
+
+    // Authenticated: /api/v1/auth/refresh returns 200 SessionResponse
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 200,
+      json: async () => ({
+        data: {
+          accessToken: 'ey.access.token',
+          tokenType: 'Bearer',
+          expiresInSeconds: 600,
+          user: {
+            id: '507f1f77bcf86cd799439011',
+            email: 'candidate@example.test',
+            emailVerified: true,
+            displayName: 'Test Candidate',
+            role: 'CANDIDATE',
+            accountStatus: 'ACTIVE',
+          },
+          session: {
+            id: 'sess-123',
+            expiresAt: '2026-12-22T16:00:00.000Z',
+          },
+        },
+        meta: { requestId: '00000000-0000-4000-8000-000000000002' },
+      }),
+    } as unknown as Response);
+
+    const authRouter = createMemoryRouter(routes, { initialEntries: ['/interview'] });
+    render(<App router={authRouter} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Interview Session/i })).toBeTruthy();
+    });
     expect(screen.getByText(/Not Yet Implemented \(Phase 4 & 5\)/i)).toBeTruthy();
-    expect(screen.getByText(/No mock interview session is simulated/i)).toBeTruthy();
   });
 
-  it('navigates to dashboard placeholder with inactive status', () => {
-    globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {}));
-    const testRouter = createMemoryRouter(routes, { initialEntries: ['/dashboard'] });
-    render(<App router={testRouter} />);
+  it('gates dashboard route when unauthenticated and renders when authenticated', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 401,
+      json: async () => ({
+        error: {
+          code: 'AUTH_REQUIRED',
+          message: 'Refresh token is required',
+          requestId: '00000000-0000-4000-8000-000000000003',
+        },
+      }),
+    } as unknown as Response);
 
-    expect(screen.getByRole('heading', { name: /Candidate Dashboard/i })).toBeTruthy();
+    const unauthRouter = createMemoryRouter(routes, { initialEntries: ['/dashboard'] });
+    const { unmount } = render(<App router={unauthRouter} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Sign in required/i })).toBeTruthy();
+    });
+    unmount();
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 200,
+      json: async () => ({
+        data: {
+          accessToken: 'ey.access.token',
+          tokenType: 'Bearer',
+          expiresInSeconds: 600,
+          user: {
+            id: '507f1f77bcf86cd799439011',
+            email: 'candidate@example.test',
+            emailVerified: true,
+            displayName: 'Test Candidate',
+            role: 'CANDIDATE',
+            accountStatus: 'ACTIVE',
+          },
+          session: {
+            id: 'sess-123',
+            expiresAt: '2026-12-22T16:00:00.000Z',
+          },
+        },
+        meta: { requestId: '00000000-0000-4000-8000-000000000004' },
+      }),
+    } as unknown as Response);
+
+    const authRouter = createMemoryRouter(routes, { initialEntries: ['/dashboard'] });
+    render(<App router={authRouter} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Candidate Dashboard/i })).toBeTruthy();
+    });
     expect(screen.getByText(/Not Yet Implemented \(Phase 2 & 3\)/i)).toBeTruthy();
-    expect(screen.getByText(/No fake accounts or simulated metrics/i)).toBeTruthy();
   });
 
   it('navigates to pricing placeholder with inactive status', () => {
