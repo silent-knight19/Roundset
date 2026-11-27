@@ -146,6 +146,27 @@ describe('P2-AUTH-03b HTTP contract', () => {
     ]) expect(() => loadEnv({ ...raw, ...overrides })).toThrow(/AUTH_DEV_MOCK_EMAIL/);
   });
 
+  it('shares pre-database flood protection across all six password auth endpoints', async () => {
+    const { post, services } = fixture();
+    // Invalid bodies avoid invoking the services; admission must still be counted.
+    for (let i = 0; i < 60; i += 1) {
+      expect((await post('/login').send({})).status).toBe(400);
+    }
+    for (const path of ['/register', '/otp/resend', '/verify-email', '/login', '/password/forgot', '/password/reset']) {
+      const blocked = await post(path).send({});
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers['retry-after']).toMatch(/^\\d+$/);
+      expect(blocked.headers['cache-control']).toBe('no-store');
+    }
+    expect(services.assertReady).not.toHaveBeenCalled();
+    expect(services.registration.register).not.toHaveBeenCalled();
+    expect(services.registration.resend).not.toHaveBeenCalled();
+    expect(services.registration.verify).not.toHaveBeenCalled();
+    expect(services.login.login).not.toHaveBeenCalled();
+    expect(services.recovery.forgot).not.toHaveBeenCalled();
+    expect(services.recovery.reset).not.toHaveBeenCalled();
+  }, 15000);
+
   it('rejects invalid mock-email settings and keys', () => {
     expect(() => loadEnv({ AUTH_DEV_MOCK_EMAIL: 'maybe' })).toThrow();
     expect(() => loadEnv({ AUTH_CHALLENGE_HMAC_KEY: 'short' })).toThrow();

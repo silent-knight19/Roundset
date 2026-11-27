@@ -108,7 +108,7 @@ jobs:
         run: |
           cp package-lock.json /tmp/roundset-lock-before.json
           node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("package.json","utf8")); p.overrides={...p.overrides,"@huggingface/transformers@3.8.1":{"sharp":"0.35.5"}}; fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")'
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm update sharp --package-lock-only --ignore-scripts --no-audit --no-fund
           node --input-type=module -e 'import fs from "node:fs"; const a=JSON.parse(fs.readFileSync("/tmp/roundset-lock-before.json","utf8")),b=JSON.parse(fs.readFileSync("package-lock.json","utf8")); const changed=Object.fromEntries(Object.entries(b.packages).filter(([k,v])=>JSON.stringify(v)!==JSON.stringify(a.packages[k]))); const removed=Object.keys(a.packages).filter(k=>!(k in b.packages)); console.log("LOCK_DELTA "+JSON.stringify({changed,removed}));'
       - run: npm ci
       - run: npm ls sharp @huggingface/transformers kokoro-js
