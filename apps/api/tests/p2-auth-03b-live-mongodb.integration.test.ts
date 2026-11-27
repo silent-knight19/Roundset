@@ -24,7 +24,7 @@ describe.skipIf(!enabled)('P2-AUTH-03b replica-set HTTP lifecycle', () => {
   const password = 'synthetic-passphrase-123!';
   const newPassword = 'synthetic-replacement-456!';
   const env = loadEnv({
-    NODE_ENV: 'test', WEB_ORIGIN: origin, AUTH_DEV_MOCK_EMAIL: 'true',
+    NODE_ENV: 'test', WEB_ORIGIN: origin, AUTH_DEV_MOCK_EMAIL: 'true', MONGODB_URI: testUri,
     AUTH_CHALLENGE_HMAC_KEY: randomBytes(32).toString('hex'),
     REFRESH_HMAC_KEY: randomBytes(32).toString('hex'),
     REFRESH_DIGEST_KEY: randomBytes(32).toString('hex'),

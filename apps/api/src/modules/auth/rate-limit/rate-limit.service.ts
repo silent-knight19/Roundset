@@ -135,6 +135,8 @@ export class AuthRateLimitService {
         .exec();
 
       if (active) {
+        // A proven login may have refunded a slot after the failed increment.
+        if (active.count < policy.limit) continue;
         const retryAfter = Math.max(
           1,
           Math.ceil((active.windowEnd.getTime() - currentNow.getTime()) / 1000)

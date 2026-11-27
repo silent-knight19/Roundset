@@ -1,5 +1,5 @@
 import type { Connection } from 'mongoose';
-import type { AppConfig } from '../../../config/env.js';
+import { isIsolatedMockAuthConfig, type AppConfig } from '../../../config/env.js';
 import { ServiceUnavailableError } from '../../../core/errors.js';
 import type { PasswordAuthRouteServices } from '../../../routes/password-auth.js';
 import {
@@ -35,8 +35,7 @@ export function createPasswordAuthRuntime(options: {
   emailSender: EmailSender;
 }): PasswordAuthRuntime {
   const { config, connection, keyring } = options;
-  if (config.NODE_ENV === 'production' || config.MOCK_DATABASE ||
-      config.INGRESS_MODE !== 'LOCAL' || options.emailSender.providerName !== 'mock') {
+  if (!isIsolatedMockAuthConfig(config) || options.emailSender.providerName !== 'mock') {
     throw new Error('Password authentication runtime requires local real-database/mock-email mode');
   }
   const hmacSecret = config.AUTH_CHALLENGE_HMAC_KEY;
@@ -74,7 +73,9 @@ export function createPasswordAuthRuntime(options: {
   async function checkDatabase(): Promise<boolean> {
     try {
       const hello = await connection.db?.admin().command({ hello: 1, maxTimeMS: 5000 });
-      if (!hello?.setName || hello.logicalSessionTimeoutMinutes == null) return false;
+      if (connection.name !== 'roundset_test' || (connection.host !== '127.0.0.1' && connection.host !== 'localhost') ||
+          hello?.setName !== 'rs0' || hello.logicalSessionTimeoutMinutes == null ||
+          !Array.isArray(hello.hosts) || hello.hosts.some((host: unknown) => typeof host !== 'string' || !/^(localhost|127\.0\.0\.1):\d{1,5}$/.test(host))) return false;
       return (await verifyIdentityIndexes(connection)).ok;
     } catch {
       return false;

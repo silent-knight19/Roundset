@@ -140,6 +140,9 @@ export const EnvSchema = z
     CSRF_RETIRED_KEYS_JSON: parseJsonArray(RetiredCsrfKeySchema),
   })
   .superRefine((data, ctx) => {
+    if (data.AUTH_DEV_MOCK_EMAIL && !isIsolatedMockAuthConfig(data)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_DEV_MOCK_EMAIL'], message: 'Mock auth requires loopback roundset_test replica set, loopback web origin, and distinct explicit 32-byte hex keys' });
+    }
     // R2-01: Keyring collision and duplicate key validation (all environments)
     if (data.JWT_RETIRED_KEYS_JSON) {
       const seenJwtKids = new Set<string>();
@@ -319,4 +322,18 @@ export function loadEnv(rawEnv: Record<string, unknown> = process.env): AppConfi
     throw new Error(`Environment validation failed: ${formattedErrors.join('; ')}`);
   }
   return result.data;
+}
+
+/** Deliberately narrow opt-in; never route mock verification to a shared database. */
+export function isIsolatedMockAuthConfig(config: AppConfig): boolean {
+  const keys = [config.AUTH_CHALLENGE_HMAC_KEY, config.REFRESH_HMAC_KEY,
+    config.REFRESH_DIGEST_KEY, config.CSRF_HMAC_KEY];
+  return config.AUTH_DEV_MOCK_EMAIL && config.NODE_ENV !== 'production' &&
+    config.INGRESS_MODE === 'LOCAL' && !config.MOCK_DATABASE && config.TRUST_PROXY_HOPS === 0 &&
+    /^mongodb:\/\/127\.0\.0\.1:\d{1,5}\/roundset_test\?replicaSet=rs0$/.test(config.MONGODB_URI ?? '') &&
+    /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/.test(config.WEB_ORIGIN) &&
+    keys.every(key => typeof key === 'string' && /^[a-f0-9]{64}$/i.test(key)) &&
+    new Set(keys.map(key => key?.toLowerCase())).size === keys.length &&
+    !config.REFRESH_RETIRED_KEYS_JSON?.length && !config.CSRF_RETIRED_KEYS_JSON?.length &&
+    !config.JWT_RETIRED_KEYS_JSON?.length;
 }

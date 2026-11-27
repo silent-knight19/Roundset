@@ -33,7 +33,7 @@ export class BudgetedEmailSender implements EmailSender {
           { $inc: { [key]: 1 } }, { new: true },
         ).exec();
         if (reserved) return await this.sender.sendOtpEmail(input);
-        if (await this.model.exists({ dateKey }).exec()) return failure;
+        if (await this.model.exists({ dateKey }).exec()) continue;
         try {
           await this.model.create({
             dateKey, generalUsed: recovery ? 0 : 1, recoveryUsed: recovery ? 1 : 0,

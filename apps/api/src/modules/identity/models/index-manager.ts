@@ -138,10 +138,7 @@ export function matchesKey(
   const actualEntries = Object.entries(actualKey);
   const expectedEntries = Object.entries(expectedKey);
   if (actualEntries.length !== expectedEntries.length) return false;
-  for (const [k, v] of expectedEntries) {
-    if (actualKey[k] !== v) return false;
-  }
-  return true;
+  return expectedEntries.every(([k, v], i) => actualEntries[i]?.[0] === k && actualEntries[i]?.[1] === v);
 }
 
 export interface RawMongoIndex {
@@ -150,6 +147,8 @@ export interface RawMongoIndex {
   expireAfterSeconds?: number;
   partialFilterExpression?: Record<string, unknown>;
   name?: string;
+  sparse?: boolean;
+  collation?: { locale?: string };
   [extra: string]: unknown;
 }
 
@@ -175,43 +174,19 @@ export async function verifyIdentityIndexes(conn: Connection): Promise<{
     }
 
     for (const expected of req.criticalIndexes) {
-      const match = actualIndexes.find((idx) => matchesKey(idx.key, expected.key));
-      if (!match) {
-        issues.push(
-          `Collection ${req.collectionName} missing required index: ${JSON.stringify(expected.key)}`
-        );
+      const candidates = actualIndexes.filter(idx => matchesKey(idx.key, expected.key));
+      if (!candidates.length) {
+        issues.push(`Collection ${req.collectionName} missing required index: ${JSON.stringify(expected.key)}`);
         continue;
       }
-
-      if (expected.unique && !match.unique) {
-        issues.push(
-          `Index ${JSON.stringify(expected.key)} on ${req.collectionName} expected unique: true but found ${match.unique}`
-        );
-      }
-
-      if (
-        expected.expireAfterSeconds !== undefined &&
-        match.expireAfterSeconds !== expected.expireAfterSeconds
-      ) {
-        issues.push(
-          `Index ${JSON.stringify(expected.key)} on ${req.collectionName} expected expireAfterSeconds: ${expected.expireAfterSeconds} but found ${match.expireAfterSeconds}`
-        );
-      }
-
-      if (expected.partialFilterExpression) {
-        if (!match.partialFilterExpression) {
-          issues.push(
-            `Index ${JSON.stringify(expected.key)} on ${req.collectionName} missing expected partialFilterExpression`
-          );
-        } else {
-          const expectedStr = JSON.stringify(expected.partialFilterExpression);
-          const actualStr = JSON.stringify(match.partialFilterExpression);
-          if (expectedStr !== actualStr) {
-            issues.push(
-              `Index ${JSON.stringify(expected.key)} on ${req.collectionName} partialFilterExpression mismatch: expected ${expectedStr}, found ${actualStr}`
-            );
-          }
-        }
+      if (!candidates.some(idx =>
+        Boolean(idx.unique) === Boolean(expected.unique) &&
+        !idx.sparse &&
+        (!idx.collation || idx.collation.locale === 'simple') &&
+        idx.expireAfterSeconds === expected.expireAfterSeconds &&
+        JSON.stringify(idx.partialFilterExpression) === JSON.stringify(expected.partialFilterExpression)
+      )) {
+        issues.push(`Collection ${req.collectionName} index options mismatch: ${JSON.stringify(expected.key)}`);
       }
     }
   }

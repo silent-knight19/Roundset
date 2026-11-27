@@ -4,7 +4,7 @@ import mongoose from 'mongoose';
 import { fileURLToPath } from 'node:url';
 import type { Logger } from 'pino';
 import { createApp } from './app.js';
-import { loadEnv, type AppConfig } from './config/env.js';
+import { loadEnv, isIsolatedMockAuthConfig, type AppConfig } from './config/env.js';
 import { createLogger } from './core/logging.js';
 import { MongoManager } from './integrations/mongodb.js';
 import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.js';
@@ -70,6 +70,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
   // 1. Load and validate configuration
   const config = options.env ?? loadEnv();
   const logger = options.logger ?? createLogger();
+  if (config.AUTH_DEV_MOCK_EMAIL && !isIsolatedMockAuthConfig(config)) {
+    throw new Error('Unsafe mock authentication configuration');
+  }
 
   let mongoManager = options.mongoManager ?? null;
   let readinessProvider: ReadinessProvider;
@@ -114,7 +117,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 
   // 4. Start HTTP listener with controlled error handling
   const server: Server = await new Promise((resolve, reject) => {
-    const s = app.listen(listenPort);
+    const s = config.INGRESS_MODE === 'LOCAL' ? app.listen(listenPort, '127.0.0.1') : app.listen(listenPort);
 
     const onError = (err: Error) => {
       s.removeListener('listening', onListening);
