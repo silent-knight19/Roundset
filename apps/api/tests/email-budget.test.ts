@@ -31,6 +31,14 @@ describe('P2-AUTH-03b durable email budget', () => {
     expect(f.create).not.toHaveBeenCalled();
     expect(f.sendOtpEmail).not.toHaveBeenCalled();
   });
+  it('retries an increment when a concurrent caller created the day', async () => {
+    const f = fixture();
+    f.execute.mockResolvedValueOnce(null);
+    expect(await f.sender.sendOtpEmail(request('RESET_PASSWORD'))).toMatchObject({ accepted: true });
+    expect(f.findOneAndUpdate).toHaveBeenCalledTimes(2);
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.sendOtpEmail).toHaveBeenCalledOnce();
+  });
   it('atomically creates the first recovery reservation of a new day', async () => {
     const f = fixture();
     f.execute.mockResolvedValue(null);

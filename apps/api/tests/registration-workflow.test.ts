@@ -200,6 +200,12 @@ describe('P2-AUTH-03b registration admission and workflow', () => {
     lookup.userExec.mockResolvedValue({ _id: 'existing-principal' });
     const decoy = fixture();
     const decoyReceipt = await decoy.workflow.register(input, ip);
+    const pending = { _id: 'pending', registrationId: realReceipt.registrationId, emailNormalized: email,
+      consentVersion: 'v1', version: 1, otpExpiresAt: new Date(real.now.getTime() + 60_000),
+      expiresAt: new Date(real.now.getTime() + 120_000) };
+    real.findExec.mockResolvedValue(pending);
+    real.updateExec.mockResolvedValue({ ...pending, version: 2 });
+    lookup.userExec.mockResolvedValue(null);
     for (const [f, receipt] of [[real, realReceipt], [decoy, decoyReceipt]] as const) {
       f.consume.mockClear();
       f.pendingStore.findOne.mockClear();
@@ -210,7 +216,10 @@ describe('P2-AUTH-03b registration admission and workflow', () => {
         ['REGISTER_RESEND_EMAIL', subject],
       ]);
       expect(f.consume.mock.invocationCallOrder[2]).toBeLessThan(f.pendingStore.findOne.mock.invocationCallOrder[0]!);
-      expect(f.send).not.toHaveBeenCalled();
+      if (f === real) {
+        expect(f.send).toHaveBeenCalledOnce();
+        expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ correlationId: realReceipt.registrationId, generation: 2 }));
+      } else expect(f.send).not.toHaveBeenCalled();
       f.consume.mockRejectedValueOnce(new RateLimitExceededError(60, 'OTP_RATE_LIMITED'));
       await expect(f.workflow.resend(receipt.registrationId, receipt.nonce, ip)).rejects.toMatchObject({ statusCode: 429 });
     }

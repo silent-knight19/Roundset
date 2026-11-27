@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { describe, it, expect, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
@@ -125,6 +126,24 @@ describe('P2-AUTH-03b HTTP contract', () => {
     services.assertReady.mockRejectedValueOnce(new (await import('../src/core/errors.js')).ServiceUnavailableError('not ready'));
     expect((await post('/login').send({ email, password })).status).toBe(503);
     expect(services.login.login).not.toHaveBeenCalled();
+  });
+
+  it('restricts mock authentication configuration to an isolated database and explicit keys', () => {
+    const raw = { NODE_ENV: 'test', AUTH_DEV_MOCK_EMAIL: 'true',
+      MONGODB_URI: 'mongodb://127.0.0.1:27017/roundset_test?replicaSet=rs0',
+      AUTH_CHALLENGE_HMAC_KEY: randomBytes(32).toString('hex'),
+      REFRESH_HMAC_KEY: randomBytes(32).toString('hex'),
+      REFRESH_DIGEST_KEY: randomBytes(32).toString('hex'),
+      CSRF_HMAC_KEY: randomBytes(32).toString('hex'),
+    };
+    expect(loadEnv(raw).AUTH_DEV_MOCK_EMAIL).toBe(true);
+    for (const overrides of [
+      { MONGODB_URI: 'mongodb://127.0.0.1:27017/roundset?replicaSet=rs0' },
+      { MONGODB_URI: 'mongodb://remote.example:27017/roundset_test?replicaSet=rs0' },
+      { WEB_ORIGIN: 'http://remote.example' }, { TRUST_PROXY_HOPS: 1 },
+      { REFRESH_HMAC_KEY: undefined }, { CSRF_HMAC_KEY: raw.REFRESH_HMAC_KEY },
+      { MOCK_DATABASE: true }, { INGRESS_MODE: 'SINGLE_ORIGIN' },
+    ]) expect(() => loadEnv({ ...raw, ...overrides })).toThrow(/AUTH_DEV_MOCK_EMAIL/);
   });
 
   it('rejects invalid mock-email settings and keys', () => {

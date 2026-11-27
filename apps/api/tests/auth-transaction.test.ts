@@ -1,4 +1,5 @@
 import type { ClientSession, Connection } from 'mongoose';
+import { performance } from 'node:perf_hooks';
 import { describe, expect, it, vi } from 'vitest';
 import { HttpError } from '../src/core/errors.js';
 import { runAuthTransaction } from '../src/modules/auth/transaction.js';
@@ -40,6 +41,19 @@ describe('P2-AUTH-03b bounded auth transactions', () => {
     }));
     expect(f.session.commitTransaction).toHaveBeenCalledTimes(1);
     expect(f.session.endSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not begin commit after the transaction deadline', async () => {
+    const f = fixture();
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    try {
+      await expect(runAuthTransaction(f.conn, async () => {
+        now.mockReturnValue(15_001);
+        return 'late';
+      })).rejects.toMatchObject({ statusCode: 503 });
+      expect(f.session.abortTransaction).toHaveBeenCalledOnce();
+      expect(f.session.commitTransaction).not.toHaveBeenCalled();
+    } finally { now.mockRestore(); }
   });
 
   it('aborts a failed business mutation and never commits it', async () => {

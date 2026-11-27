@@ -223,6 +223,19 @@ describe('P2-AUTH-03b persistent login reservation refunds', () => {
     return { service, consumed, endMs, update, execute };
   }
 
+  it('retries a failed increment when a concurrent refund opens capacity', async () => {
+    const windowEnd = new Date(Date.now() + 900_000);
+    const execute = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ count: 5, windowEnd });
+    const findOneAndUpdate = vi.fn().mockReturnValue({ exec: execute });
+    const findOne = vi.fn().mockReturnValue({ exec: vi.fn().mockResolvedValue({ count: 4, windowEnd }) });
+    const service = new AuthRateLimitService({
+      rateLimitModel: { findOneAndUpdate, findOne } as unknown as Model<IAuthRateLimit>,
+      hmacSecret: 'synthetic-secret-for-rate-limit-tests',
+    });
+    await expect(service.reserveLoginAttempt(input.email)).resolves.toMatchObject({ count: 5, remaining: 0 });
+    expect(findOneAndUpdate).toHaveBeenCalledTimes(2);
+  });
+
   it('refunds only the reserved original window and only once', async () => {
     const f = fixtureRate();
     const reservation = await f.service.reserveLoginAttempt(input.email);
