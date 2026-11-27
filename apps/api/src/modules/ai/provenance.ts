@@ -12,6 +12,12 @@ import {
 /** Process-scoped ephemeral key for privacy-safe internal request/permit binding. */
 const EPHEMERAL_PERMIT_HMAC_KEY = randomBytes(32);
 
+export interface AuthoritativeAncestorIdentity {
+  kind: SourceKind;
+  recordId: string;
+  recordVersion: string;
+}
+
 export interface AuthoritativeUserInterviewRecord {
   userId: string;
   interviewId: string;
@@ -19,6 +25,7 @@ export interface AuthoritativeUserInterviewRecord {
   recordVersion: string;
   kind: SourceKind;
   ancestorRefs: ReadonlyArray<string>;
+  authoritativeAncestors?: ReadonlyArray<AuthoritativeAncestorIdentity>;
   content: string;
 }
 
@@ -71,6 +78,10 @@ export interface RequestBindingMetadata {
   purpose: Purpose;
   promptVersion: string;
   outputSchemaVersion: string;
+  maxOutputTokens: number;
+  estimatedInputTokens: number;
+  reasoningProfile: 'NO_REASONING' | 'LOW';
+  absoluteDeadlineAt: string;
 }
 
 export interface ResolveManifestInput {
@@ -487,12 +498,32 @@ export function resolveAndAuthorizeSourceManifest(
 
           derived = new Set<DataClass>();
           const ancestorIdentities: string[] = [];
+          const resolvedAncestorKeys = new Set<string>();
           for (const ancestorRef of record.ancestorRefs) {
             const ancestorInfo = resolveDescriptor(ancestorRef);
             for (const cls of ancestorInfo.classes) {
               derived.add(cls);
             }
             ancestorIdentities.push(ancestorInfo.authoritativeIdentity);
+            const ancestorDesc = descriptorByRef.get(ancestorRef);
+            if (ancestorDesc && ancestorDesc.scope.type === 'USER_INTERVIEW') {
+              resolvedAncestorKeys.add(
+                `${ancestorDesc.kind}:${ancestorDesc.scope.recordId}:${ancestorDesc.scope.recordVersion}`,
+              );
+            }
+          }
+          if (record.authoritativeAncestors) {
+            const expectedKeys = new Set<string>(
+              record.authoritativeAncestors.map(
+                (a) => `${a.kind}:${a.recordId}:${a.recordVersion}`,
+              ),
+            );
+            if (!setsEqual(resolvedAncestorKeys, expectedKeys)) {
+              throw new SanitizedAiError(
+                'AI_PRIVACY_INELIGIBLE',
+                'Resolved ancestor identities do not match authoritative summary lineage',
+              );
+            }
           }
           assertValidClassCombination(derived);
           authoritativeContent = record.content;
@@ -595,6 +626,13 @@ export function resolveAndAuthorizeSourceManifest(
   }
 
   assertValidClassCombination(totalClasses);
+
+  if (totalClasses.size === 0) {
+    throw new SanitizedAiError(
+      'AI_PRIVACY_INELIGIBLE',
+      'Final canonical data-class union must not be empty',
+    );
+  }
 
   const declaredSet = new Set<DataClass>(input.declaredDataClasses);
   if (!setsEqual(totalClasses, declaredSet)) {

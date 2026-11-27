@@ -883,6 +883,10 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
           purpose: 'QUESTION',
           promptVersion: '1.0.0',
           outputSchemaVersion: '1.0.0',
+          maxOutputTokens: 256,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: new Date(NOW_MS + 60_000).toISOString(),
         },
       },
       resolver,
@@ -955,6 +959,10 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
           purpose: 'QUESTION',
           promptVersion: '1.0.0',
           outputSchemaVersion: '1.0.0',
+          maxOutputTokens: 256,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: new Date(NOW_MS + 60_000).toISOString(),
         },
       },
       resolver,
@@ -1008,6 +1016,10 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
           purpose: 'QUESTION',
           promptVersion: '1.0.0',
           outputSchemaVersion: '1.0.0',
+          maxOutputTokens: 256,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: new Date(NOW_MS + 60_000).toISOString(),
         },
       },
       resolver,
@@ -1107,5 +1119,319 @@ describe('P4-AI-01a: Offline AI Gateway Foundation', () => {
         { resolver: new DeterministicFakeSourceResolver(), eligibilityPolicy: { isEligible: () => true } },
       ),
     ).toThrowError(SanitizedAiError);
+  });
+
+  // --- P4-AI-01a-R2 Mandatory Regressions ---
+
+  it('R9. Rejects when authoritative document ancestor is replaced with a response under the same reference alias', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Substituted response',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['anc-1'],
+      authoritativeAncestors: [
+        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+      ],
+      content: 'Summary of document',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [{ role: 'user', parts: [{ text: 'Summary of document', sourceRef: 'sum-1' }] }],
+          descriptors: [
+            {
+              ref: 'anc-1',
+              kind: 'CANDIDATE_RESPONSE',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-resp-1',
+                recordVersion: 'v1',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_TRANSCRIPT'],
+              ancestorRefs: ['anc-1'],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum-1',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_TRANSCRIPT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R10. Rejects ancestor record version substitution under the same alias', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-doc-1',
+      recordVersion: 'v2',
+      kind: 'CANDIDATE_DOCUMENT',
+      ancestorRefs: [],
+      content: 'Doc v2',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['anc-1'],
+      authoritativeAncestors: [
+        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+      ],
+      content: 'Summary of v1',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [{ role: 'user', parts: [{ text: 'Summary of v1', sourceRef: 'sum-1' }] }],
+          descriptors: [
+            {
+              ref: 'anc-1',
+              kind: 'CANDIDATE_DOCUMENT',
+              inheritedClasses: ['USER_DOCUMENT'],
+              ancestorRefs: [],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-doc-1',
+                recordVersion: 'v2',
+              },
+            },
+            {
+              ref: 'sum-1',
+              kind: 'DERIVED_SUMMARY',
+              inheritedClasses: ['USER_DOCUMENT'],
+              ancestorRefs: ['anc-1'],
+              scope: {
+                type: 'USER_INTERVIEW',
+                userId: 'user-a',
+                interviewId: 'int-a-1',
+                recordId: 'rec-sum-1',
+                recordVersion: 'v1',
+              },
+            },
+          ],
+          declaredDataClasses: ['USER_DOCUMENT'],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R11. Rejects template-only request with an empty final data-class union', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-sys',
+      templateVersion: 'v1',
+      content: 'Authoritative system prompt',
+    });
+
+    expect(() =>
+      resolveAndAuthorizeSourceManifest(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-a-1',
+          messages: [
+            {
+              role: 'system',
+              parts: [{ text: 'Authoritative system prompt', sourceRef: 'tpl-sys' }],
+            },
+          ],
+          descriptors: [
+            {
+              ref: 'tpl-sys',
+              kind: 'TRUSTED_TEMPLATE',
+              inheritedClasses: [],
+              ancestorRefs: [],
+              scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-sys', templateVersion: 'v1' },
+            },
+          ],
+          declaredDataClasses: [],
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R12. Rejects existing permit reused with changed generation parameters', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Synthetic candidate answer',
+    });
+
+    const first = resolveAndAuthorizeSourceManifest(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-a-1',
+        messages: createBaseIntent().messages,
+        descriptors: createBaseIntent().sourceManifest,
+        declaredDataClasses: ['USER_TRANSCRIPT'],
+        requestBinding: {
+          operationId: 'op-001',
+          generationEpoch: 1,
+          attemptId: 'att-001',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'QUESTION',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: '1.0.0',
+          maxOutputTokens: 256,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: new Date(NOW_MS + 60_000).toISOString(),
+        },
+      },
+      resolver,
+    );
+
+    const receipt = {
+      permitId: 'permit-1',
+      canonicalDataClasses: first.canonicalDataClasses,
+      requestIdentity: first.requestIdentity,
+    };
+
+    expect(() =>
+      executeOfflineGeneration(
+        {
+          authenticatedUserId: 'user-a',
+          intent: createBaseIntent({ maxOutputTokens: 512 }),
+          provider: 'MOCK',
+          cutoffMode: 'POST_START',
+          deadlineInput: makePostStartDeadlines(),
+          nowMs: NOW_MS,
+          permitReceipt: receipt,
+        },
+        { resolver, eligibilityPolicy: { isEligible: () => true } },
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R13. Valid authoritative mixed-source summary remains accepted', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-resp-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_RESPONSE',
+      ancestorRefs: [],
+      content: 'Answer 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-doc-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_DOCUMENT',
+      ancestorRefs: [],
+      content: 'Doc 1',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-a-1',
+      recordId: 'rec-sum-1',
+      recordVersion: 'v1',
+      kind: 'DERIVED_SUMMARY',
+      ancestorRefs: ['resp-1', 'doc-1'],
+      authoritativeAncestors: [
+        { kind: 'CANDIDATE_RESPONSE', recordId: 'rec-resp-1', recordVersion: 'v1' },
+        { kind: 'CANDIDATE_DOCUMENT', recordId: 'rec-doc-1', recordVersion: 'v1' },
+      ],
+      content: 'Mixed summary',
+    });
+
+    const result = resolveAndAuthorizeSourceManifest(
+      {
+        authenticatedUserId: 'user-a',
+        interviewId: 'int-a-1',
+        messages: [{ role: 'user', parts: [{ text: 'Mixed summary', sourceRef: 'sum-1' }] }],
+        descriptors: [
+          {
+            ref: 'resp-1',
+            kind: 'CANDIDATE_RESPONSE',
+            inheritedClasses: ['USER_TRANSCRIPT'],
+            ancestorRefs: [],
+            scope: {
+              type: 'USER_INTERVIEW',
+              userId: 'user-a',
+              interviewId: 'int-a-1',
+              recordId: 'rec-resp-1',
+              recordVersion: 'v1',
+            },
+          },
+          {
+            ref: 'doc-1',
+            kind: 'CANDIDATE_DOCUMENT',
+            inheritedClasses: ['USER_DOCUMENT'],
+            ancestorRefs: [],
+            scope: {
+              type: 'USER_INTERVIEW',
+              userId: 'user-a',
+              interviewId: 'int-a-1',
+              recordId: 'rec-doc-1',
+              recordVersion: 'v1',
+            },
+          },
+          {
+            ref: 'sum-1',
+            kind: 'DERIVED_SUMMARY',
+            inheritedClasses: ['USER_TRANSCRIPT', 'USER_DOCUMENT'],
+            ancestorRefs: ['resp-1', 'doc-1'],
+            scope: {
+              type: 'USER_INTERVIEW',
+              userId: 'user-a',
+              interviewId: 'int-a-1',
+              recordId: 'rec-sum-1',
+              recordVersion: 'v1',
+            },
+          },
+        ],
+        declaredDataClasses: ['USER_TRANSCRIPT', 'USER_DOCUMENT'],
+      },
+      resolver,
+    );
+
+    expect(result.canonicalDataClasses).toEqual(['USER_TRANSCRIPT', 'USER_DOCUMENT']);
   });
 });
