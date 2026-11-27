@@ -332,6 +332,19 @@ export class SessionCoordinator {
       if (this.generation !== opGeneration) {
         return Promise.resolve({ kind: 'aborted' });
       }
+      const readResult = readCrossTabSyncMarker();
+      if (!readResult.ok) {
+        return Promise.resolve({
+          kind: 'uncertain',
+          reason: 'coordination_storage_unavailable',
+          error:
+            'Cross-tab coordination storage is unavailable; please sign in again.',
+        });
+      }
+      if (readResult.marker) {
+        this.inMemoryUnresolvedState = readResult.marker.status;
+        return Promise.resolve(markerToBlockedResult(readResult.marker.status));
+      }
       return refreshSession(options);
     }
 
@@ -492,12 +505,15 @@ export class SessionCoordinator {
       this.bumpGeneration();
     }
 
-    if (result.kind === 'logged_out' || result.kind === 'already_logged_out') {
-      // Confirmed safe session reset clears unresolved uncertainty.
+    if (result.kind === 'logged_out') {
+      // Only confirmed 204 server-side revocation clears unresolved uncertainty.
       this.inMemoryUnresolvedState = null;
-      if (isWebLocksSupported()) {
-        clearCrossTabSyncMarker();
-      }
+      clearCrossTabSyncMarker();
+      this.broadcast({
+        type: 'LOGOUT',
+        senderId: this.tabId,
+      });
+    } else if (result.kind === 'already_logged_out') {
       this.broadcast({
         type: 'LOGOUT',
         senderId: this.tabId,
@@ -524,11 +540,12 @@ export class SessionCoordinator {
 
     if (result.kind === 'logged_out_all' || result.kind === 'unauthenticated') {
       this.bumpGeneration();
-      // Confirmed safe session reset clears unresolved uncertainty.
+    }
+
+    if (result.kind === 'logged_out_all') {
+      // Only confirmed 204 server-side revocation clears unresolved uncertainty.
       this.inMemoryUnresolvedState = null;
-      if (isWebLocksSupported()) {
-        clearCrossTabSyncMarker();
-      }
+      clearCrossTabSyncMarker();
       this.broadcast({
         type: 'LOGOUT_ALL',
         senderId: this.tabId,

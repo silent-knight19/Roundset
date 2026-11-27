@@ -568,6 +568,74 @@ describe('AuthProvider, SessionCoordinator & Multi-Tab Sync (P2-FE-02)', () => {
     coord2.dispose();
   });
 
+  it('preserves uncertainty marker on rejected logout-all (401/403) and clears only on confirmed 204 logout', async () => {
+    const markerPayload = JSON.stringify({ status: 'uncertain', at: Date.now() });
+    localStorage.setItem('roundset:auth:sync_marker', markerPayload);
+
+    const coordinator = new SessionCoordinator();
+
+    // 1. Expired Bearer causing logout-all HTTP 401 preserves the marker
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 401,
+      json: async () => ({
+        error: {
+          code: 'AUTH_REQUIRED',
+          message: 'Access token expired',
+          requestId: VALID_REQUEST_ID,
+        },
+      }),
+    } as unknown as Response);
+    const res401 = await coordinator.logoutAll({ accessToken: 'ey.expired' });
+    expect(res401.kind).toBe('unauthenticated');
+    expect(localStorage.getItem('roundset:auth:sync_marker')).toBe(markerPayload);
+
+    // 2. logout-all HTTP 403 preserves the marker
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      status: 403,
+      json: async () => ({
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Forbidden',
+          requestId: VALID_REQUEST_ID,
+        },
+      }),
+    } as unknown as Response);
+    const res403 = await coordinator.logoutAll({ accessToken: 'ey.forbidden' });
+    expect(res403.kind).toBe('unauthenticated');
+    expect(localStorage.getItem('roundset:auth:sync_marker')).toBe(markerPayload);
+
+    // 3. Confirmed 204 logout clears the marker
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 204 } as unknown as Response);
+    const res204 = await coordinator.logout({ accessToken: 'ey.valid' });
+    expect(res204.kind).toBe('logged_out');
+    expect(localStorage.getItem('roundset:auth:sync_marker')).toBeNull();
+
+    coordinator.dispose();
+  });
+
+  it('prevents unsupported coordination APIs (no Web Locks) from bypassing an unresolved marker', async () => {
+    Object.defineProperty(navigator, 'locks', {
+      value: undefined,
+      configurable: true,
+    });
+    localStorage.setItem(
+      'roundset:auth:sync_marker',
+      JSON.stringify({ status: 'uncertain', at: Date.now() }),
+    );
+
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+
+    const coordinator = new SessionCoordinator();
+    expect(coordinator.crossTabSupported).toBe(false);
+
+    const res = await coordinator.refresh();
+    expect(res.result.kind).toBe('uncertain');
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    coordinator.dispose();
+  });
+
   it('bounds Web Lock acquisition time and prevents timed-out waiters from dispatching later', async () => {
     vi.useFakeTimers();
 
