@@ -112,7 +112,7 @@ export class PasswordLoginService {
         accountStatus: 'ACTIVE' as const,
         sessionEpoch: expectedEpoch,
         identityVersion: expectedVersion,
-        emailVerifiedAt: { $type: 'date' },
+        emailVerifiedAt: { $type: 'date' as const },
       };
       const current = await users.findOne(authority, null, { session }).exec();
       if (!current) throw invalidCredentials();
