@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
+import { useAuth } from '../app/AuthContext';
 import { AuthCard } from '../components/auth/AuthCard';
 import { FormField } from '../components/auth/FormField';
 import { AuthAlert, type AuthAlertVariant } from '../components/auth/AuthAlert';
 
 export function LoginPage() {
+  const { status: authStatus, reloginReason, error: authError } = useAuth();
   const [searchParams] = useSearchParams();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -90,14 +92,27 @@ export function LoginPage() {
         </div>
       }
     >
-      {submitStatus && (
+      {submitStatus ? (
         <AuthAlert
           variant={submitStatus.variant}
           title={submitStatus.title}
           message={submitStatus.message}
           retryAfterSeconds={submitStatus.retryAfterSeconds}
         />
-      )}
+      ) : authStatus === 'relogin_required' ? (
+        <AuthAlert
+          variant="error"
+          title={
+            reloginReason === 'replay_detected'
+              ? 'Session Revoked (Replay Detected)'
+              : 'Reauthentication Required'
+          }
+          message={
+            authError ??
+            'Your session could not be safely verified. Please sign in again.'
+          }
+        />
+      ) : null}
 
       <form onSubmit={handleSubmit} noValidate className="space-y-4">
         <FormField
