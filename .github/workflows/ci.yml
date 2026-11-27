@@ -71,8 +71,12 @@ jobs:
           RUN_LIVE_MONGODB_TESTS: "true"
           MONGODB_TEST_URI: mongodb://127.0.0.1:27017/roundset_test?replicaSet=rs0
         run: |
+          # The legacy preservation test expects a pre-existing collection.
+          # Seed only the disposable CI container, never an external database.
+          docker exec roundset-auth-mongo mongosh --quiet --eval 'db.getSiblingDB("roundset_test").smoke_test.insertOne({_id:"ci-smoke-preservation"})'
           npx --no-install vitest run apps/api/tests/identity-live-mongodb.integration.test.ts
           npx --no-install vitest run apps/api/tests/p2-auth-04a-live-mongodb.integration.test.ts
+          docker exec roundset-auth-mongo mongosh --quiet --eval 'quit(db.getSiblingDB("roundset_test").smoke_test.countDocuments({_id:"ci-smoke-preservation"}) === 1 ? 0 : 1)'
 
       - name: Remove disposable MongoDB
         if: always()
