@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@roundset/contracts": "*",
+    "argon2": "0.45.2",
     "cors": "2.8.6",
     "express": "5.3.0",
     "helmet": "8.3.0",
