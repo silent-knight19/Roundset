@@ -155,7 +155,7 @@ describe('P2-AUTH-03b HTTP contract', () => {
     for (const path of ['/register', '/otp/resend', '/verify-email', '/login', '/password/forgot', '/password/reset']) {
       const blocked = await post(path).send({});
       expect(blocked.status).toBe(429);
-      expect(blocked.headers['retry-after']).toMatch(/^\\d+$/);
+      expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
       expect(blocked.headers['cache-control']).toBe('no-store');
     }
     expect(services.assertReady).not.toHaveBeenCalled();
