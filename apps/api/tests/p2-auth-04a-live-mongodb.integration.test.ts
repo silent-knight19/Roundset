@@ -101,23 +101,15 @@ describe.skipIf(!RUN_LIVE)(
       await sAbort.abortTransaction();
       await sAbort.endSession();
 
-      // Re-verify after rollback
-      const proof2 = await otpService.claimAndVerifyAttempt(
-        subject,
-        issued.challengeId,
-        issued.generation,
-        issued.otpCode
-      );
-
-      // 2. Parallel consumption: only 1 winner
+      // 2. Parallel consumption reusing the original proof after abort: only 1 winner
       const s1 = await conn.startSession();
       const s2 = await conn.startSession();
       s1.startTransaction();
       s2.startTransaction();
 
       const outcomes = await Promise.allSettled([
-        otpService.consumeVerifiedChallenge(proof2, s1).then(() => s1.commitTransaction()),
-        otpService.consumeVerifiedChallenge(proof2, s2).then(() => s2.commitTransaction()),
+        otpService.consumeVerifiedChallenge(proof, s1).then(() => s1.commitTransaction()),
+        otpService.consumeVerifiedChallenge(proof, s2).then(() => s2.commitTransaction()),
       ]);
       await s1.endSession();
       await s2.endSession();

@@ -770,9 +770,14 @@ describe('P2-AUTH-04a: Pending Registration, OTP & Rate-Limiting Foundation', ()
       // Mutate caller-owned input after verification
       mutableInput.identityVersionAtIssue = 999;
 
-      // Simulate transaction abort (DB state not committed) -> retry with same proof succeeds
+      // Simulate transaction abort: consume, then roll back DB state to ISSUED
       const activeSession = { inTransaction: () => true } as never;
-      // Concurrent consumption: only 1 winner
+      await otpService.consumeVerifiedChallenge(proof, activeSession);
+      const storedDoc = Array.from(challengeModel.docs.values())[0]!;
+      storedDoc.state = 'ISSUED';
+      delete storedDoc.consumedAt;
+
+      // Retry with the exact same proof: concurrent consumption yields only 1 winner
       const outcomes = await Promise.allSettled([
         otpService.consumeVerifiedChallenge(proof, activeSession),
         otpService.consumeVerifiedChallenge(proof, activeSession),
@@ -780,47 +785,70 @@ describe('P2-AUTH-04a: Pending Registration, OTP & Rate-Limiting Foundation', ()
       expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
       expect(outcomes.filter((o) => o.status === 'rejected')).toHaveLength(1);
 
-      // Delayed older registration cannot overwrite newer accepted registration
+      // Interleaved deferred-promise regression: earlier delayed registration cannot overwrite newer one
       let currentTime = new Date('2026-11-27T10:00:00.000Z');
       const rateModel = createInMemoryRateLimitModel();
       const pendingModel = createInMemoryPendingRegistrationModel();
       const emailSender = new MockEmailSender({ nodeEnv: 'test', enableTestOtpCapture: true });
-      const passwordService = createPasswordService();
       const rateLimitService = new AuthRateLimitService({
         rateLimitModel: rateModel as never,
         hmacSecret: TEST_HMAC_SECRET,
         now: () => currentTime,
       });
 
+      let releaseFirstHash!: (hash: string) => void;
+      const firstHashGate = new Promise<string>((resolve) => {
+        releaseFirstHash = resolve;
+      });
+      let signalFirstHashStarted!: () => void;
+      const firstHashStarted = new Promise<void>((resolve) => {
+        signalFirstHashStarted = resolve;
+      });
+      let hashCallCount = 0;
+      const mockPasswordService = {
+        hashPassword: vi.fn(async () => {
+          hashCallCount += 1;
+          if (hashCallCount === 1) {
+            signalFirstHashStarted();
+            return firstHashGate;
+          }
+          return '$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+        }),
+      };
+
       const regService = new PendingRegistrationService({
         pendingRegistrationModel: pendingModel as never,
         rateLimitService,
-        passwordService,
+        passwordService: mockPasswordService as never,
         emailSender,
         hmacSecret: TEST_HMAC_SECRET,
         now: () => currentTime,
       });
 
-      await regService.startOrReplaceRegistration({
+      // Start R1 at t=0; it passes durable cooldown then suspends in hashPassword
+      const r1Promise = regService.startOrReplaceRegistration({
         emailNormalized: 'order@example.com',
         password: 'Valid-Password-2026!',
         consentVersion: 'v1.0',
         trustedIp: '203.0.113.30',
       });
+      await firstHashStarted;
 
-      // Simulate newer accepted registration at t+61s
+      // Advance 61s and complete R2
       currentTime = new Date(currentTime.getTime() + 61_000);
-      const doc = pendingModel.byEmail.get('order@example.com')!;
-      doc.updatedAt = new Date(currentTime.getTime() + 5_000);
+      const r2 = await regService.startOrReplaceRegistration({
+        emailNormalized: 'order@example.com',
+        password: 'Valid-Password-2026!',
+        consentVersion: 'v1.0',
+        trustedIp: '203.0.113.30',
+      });
+      // Stamp updatedAt as Mongoose timestamps:true would
+      pendingModel.byEmail.get('order@example.com')!.updatedAt = currentTime;
 
-      await expect(
-        regService.startOrReplaceRegistration({
-          emailNormalized: 'order@example.com',
-          password: 'Valid-Password-2026!',
-          consentVersion: 'v1.0',
-          trustedIp: '203.0.113.30',
-        })
-      ).rejects.toMatchObject({ statusCode: 409, code: 'CONFLICT' });
+      // Resume R1: must be rejected with 409 CONFLICT and leave R2 intact
+      releaseFirstHash('$argon2id$v=19$m=19456,t=2,p=1$BBBBBBBBBBBBBBBBBBBBBB$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB');
+      await expect(r1Promise).rejects.toMatchObject({ statusCode: 409, code: 'CONFLICT' });
+      expect(pendingModel.byEmail.get('order@example.com')!.registrationId).toBe(r2.registrationId);
     });
   });
 });

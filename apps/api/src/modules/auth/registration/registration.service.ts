@@ -11,6 +11,7 @@ import {
 import { OTP_POLICY, OtpInvalidError } from '../otp/types.js';
 import type { PasswordService } from '../password/password.service.js';
 import type { AuthRateLimitService } from '../rate-limit/rate-limit.service.js';
+import { RATE_LIMIT_POLICIES } from '../rate-limit/types.js';
 
 export const PENDING_REGISTRATION_POLICY = {
   ttlMs: 15 * 60_000,
@@ -109,7 +110,7 @@ export class PendingRegistrationService {
     input: StartRegistrationInput
   ): Promise<StartRegistrationResult> {
     await this.rateLimitService.consumeOrThrow('REGISTER_RESEND_IP', input.trustedIp);
-    await this.rateLimitService.consumeOrThrow(
+    const cooldownResult = await this.rateLimitService.consumeOrThrow(
       'REGISTER_REPLACE_COOLDOWN',
       input.emailNormalized
     );
@@ -118,7 +119,10 @@ export class PendingRegistrationService {
       input.emailNormalized
     );
 
-    const admissionTime = this.now();
+    // Bind ordering to the durable cooldown admission timestamp, not a post-limiter clock read
+    const admissionTime = new Date(
+      cooldownResult.windowEnd.getTime() - RATE_LIMIT_POLICIES.REGISTER_REPLACE_COOLDOWN.windowMs
+    );
     const passwordHash = await this.passwordService.hashPassword(input.password);
 
     const registrationId = crypto
