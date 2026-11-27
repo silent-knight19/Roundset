@@ -312,6 +312,173 @@ describe('AuthProvider, SessionCoordinator & Multi-Tab Sync (P2-FE-02)', () => {
     expect(screen.getByTestId('auth-token').textContent).toBe('null');
   });
 
+  it('prevents caller B joining invalidated refresh A from restoring credentials and does not dispatch replacement', async () => {
+    let resolveRefreshA!: (val: Response) => void;
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/v1/auth/refresh') {
+        return new Promise<Response>((resolve) => {
+          resolveRefreshA = resolve;
+        });
+      }
+      return Promise.resolve({ status: 204 } as unknown as Response);
+    });
+    globalThis.fetch = fetchMock;
+
+    const coordinator = new SessionCoordinator();
+
+    // 1. Refresh A begins (generation 0)
+    const promiseA = coordinator.refresh();
+
+    // 2. Logout advances generation to 1 while A remains pending
+    await coordinator.logout({ accessToken: 'ey.old' });
+    expect(coordinator.getGeneration()).toBe(1);
+
+    // 3. Refresh B attempts to join while A remains pending
+    const promiseB = coordinator.refresh();
+
+    // 4. Refresh A resolves with 200 authenticated
+    resolveRefreshA({
+      status: 200,
+      json: async () => makeSessionPayload('ey.invalidated.a'),
+    } as unknown as Response);
+
+    const [resA, resB] = await Promise.all([promiseA, promiseB]);
+
+    // 5. Neither caller accepts invalidated credentials, and no replacement refresh was dispatched
+    expect(resA.stale).toBe(true);
+    expect(resB.stale).toBe(true);
+    expect(resB.result.kind).toBe('aborted');
+    const refreshCalls = fetchMock.mock.calls.filter(
+      ([u]) => u === '/api/v1/auth/refresh',
+    );
+    expect(refreshCalls).toHaveLength(1);
+    coordinator.dispose();
+  });
+
+  it('propagates uncertainty synchronously across Web Lock waiters even when BroadcastChannel is unavailable', async () => {
+    // Disable BroadcastChannel to prove synchronous cross-tab uncertainty propagation inside Web Locks
+    globalThis.BroadcastChannel = undefined as unknown as typeof BroadcastChannel;
+
+    let lockChain = Promise.resolve();
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn((_name: string, cb: () => Promise<unknown>) => {
+          const next = lockChain.then(() => cb());
+          lockChain = next.then(
+            () => undefined,
+            () => undefined,
+          );
+          return next;
+        }),
+      },
+    });
+
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('Network drop'));
+    globalThis.fetch = fetchMock;
+
+    const tabA = new SessionCoordinator();
+    const tabB = new SessionCoordinator();
+
+    const [resA, resB] = await Promise.all([tabA.refresh(), tabB.refresh()]);
+
+    expect(resA.result.kind).toBe('uncertain');
+    expect(resB.result.kind).toBe('uncertain');
+    // Tab B observed Tab A's uncertainty inside the lock and did NOT dispatch a second refresh
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Verify marker in localStorage contains zero credentials
+    const rawMarker = localStorage.getItem('roundset:auth:sync_marker') ?? '';
+    expect(rawMarker).toContain('"kind":"uncertain"');
+    expect(rawMarker).not.toContain('ey.');
+    expect(rawMarker).not.toContain('c1.');
+
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('bounds Web Lock acquisition time and prevents timed-out waiters from dispatching later', async () => {
+    vi.useFakeTimers();
+
+    let releaseHungLock!: () => void;
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn(
+          (_name: string, cb: () => Promise<unknown>) =>
+            new Promise((resolve) => {
+              releaseHungLock = () => {
+                void Promise.resolve(cb()).then(resolve);
+              };
+            }),
+        ),
+      },
+    });
+
+    const coordinator = new SessionCoordinator();
+    const refreshPromise = coordinator.refresh({ lockTimeoutMs: 100 });
+
+    await vi.advanceTimersByTimeAsync(110);
+    const outcome = await refreshPromise;
+
+    expect(outcome.stale).toBe(false);
+    expect(outcome.result.kind).toBe('uncertain');
+    if (outcome.result.kind === 'uncertain') {
+      expect(outcome.result.reason).toBe('lock_timeout');
+    }
+
+    // Even when the hung lock is eventually granted, the timed-out waiter must NOT dispatch fetch
+    releaseHungLock();
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+    coordinator.dispose();
+  });
+
+  it('does not leave AuthContext stuck in loading on pre-dispatch cancellation', async () => {
+    globalThis.fetch = vi.fn();
+
+    function AbortingRefreshProbe() {
+      const auth = useAuth();
+      return (
+        <div>
+          <span data-testid="abort-status">{auth.status}</span>
+          <button
+            type="button"
+            onClick={() => {
+              const ac = new AbortController();
+              ac.abort();
+              void auth.refresh({ signal: ac.signal });
+            }}
+          >
+            TriggerAbortedRefresh
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <AuthProvider skipInitialBootstrap>
+        <AbortingRefreshProbe />
+      </AuthProvider>,
+    );
+
+    expect(screen.getByTestId('abort-status').textContent).toBe('unauthenticated');
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'TriggerAbortedRefresh' }).click();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('abort-status').textContent).toBe('unauthenticated');
+    });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it('restores session cleanly under React StrictMode with single-flight refresh', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       status: 200,

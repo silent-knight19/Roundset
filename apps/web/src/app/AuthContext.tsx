@@ -13,7 +13,10 @@ import type {
   LogoutAllResult,
   LogoutResult,
 } from '../lib/auth/authClient';
-import { SessionCoordinator } from '../lib/auth/sessionCoordinator';
+import {
+  SessionCoordinator,
+  type CoordinatorRefreshOptions,
+} from '../lib/auth/sessionCoordinator';
 
 export type AuthStatus =
   | 'loading'
@@ -40,7 +43,7 @@ export interface AuthState {
 
 export interface AuthContextValue extends AuthState {
   getAccessToken: () => string | null;
-  refresh: (options?: AuthRequestOptions) => Promise<void>;
+  refresh: (options?: CoordinatorRefreshOptions) => Promise<void>;
   logout: (options?: AuthRequestOptions) => Promise<LogoutResult>;
   logoutAll: (options?: AuthRequestOptions) => Promise<LogoutAllResult>;
 }
@@ -110,13 +113,19 @@ export function AuthProvider({
         clearInMemorySession('unauthenticated', null, null);
       },
       onExternalInvalidation: (reason) => {
-        clearInMemorySession(
-          'relogin_required',
-          reason === 'replay_detected' ? 'replay_detected' : 'forbidden',
+        const mappedReason: ReloginReason =
+          reason === 'replay_detected'
+            ? 'replay_detected'
+            : reason === 'uncertain_refresh'
+              ? 'uncertain_refresh'
+              : 'forbidden';
+        const message =
           reason === 'replay_detected'
             ? 'Session invalidated due to replay detection. Please sign in again.'
-            : 'Session requires reauthentication. Please sign in again.',
-        );
+            : reason === 'uncertain_refresh'
+              ? 'Session refresh state is uncertain in another tab. Please sign in again.'
+              : 'Session requires reauthentication. Please sign in again.';
+        clearInMemorySession('relogin_required', mappedReason, message);
       },
     });
 
@@ -129,7 +138,7 @@ export function AuthProvider({
   }, [clearInMemorySession, externalCoordinator]);
 
   const applyRefreshOutcome = useCallback(
-    async (options?: AuthRequestOptions): Promise<void> => {
+    async (options?: CoordinatorRefreshOptions): Promise<void> => {
       const coordinator = coordinatorRef.current;
       if (!coordinator) {
         return;
@@ -137,8 +146,21 @@ export function AuthProvider({
 
       const { result, stale } = await coordinator.refresh(options);
 
+      if (!mountedRef.current) {
+        return;
+      }
+
       // Stale async responses (e.g., completed after logout/logout-all) must never restore a session.
-      if (stale || !mountedRef.current) {
+      if (stale) {
+        setState((prev) => {
+          if (prev.status !== 'loading') {
+            return prev;
+          }
+          return {
+            ...prev,
+            status: accessTokenRef.current ? 'authenticated' : 'unauthenticated',
+          };
+        });
         return;
       }
 
@@ -180,6 +202,16 @@ export function AuthProvider({
           break;
         }
         case 'aborted': {
+          // Never leave AuthContext stuck in 'loading' on pre-dispatch cancellation.
+          setState((prev) => {
+            if (prev.status !== 'loading') {
+              return prev;
+            }
+            return {
+              ...prev,
+              status: accessTokenRef.current ? 'authenticated' : 'unauthenticated',
+            };
+          });
           break;
         }
       }
@@ -197,7 +229,7 @@ export function AuthProvider({
   }, [applyRefreshOutcome, skipInitialBootstrap]);
 
   const refresh = useCallback(
-    async (options?: AuthRequestOptions): Promise<void> => {
+    async (options?: CoordinatorRefreshOptions): Promise<void> => {
       if (mountedRef.current) {
         setState((prev) => ({
           ...prev,

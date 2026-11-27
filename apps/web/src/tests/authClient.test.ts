@@ -196,8 +196,19 @@ describe('Auth Client & CSRF Cookie Helpers (P2-FE-02)', () => {
       }
     });
 
-    it('returns aborted when external AbortSignal aborts', async () => {
-      const ac = new AbortController();
+    it('distinguishes pre-dispatch abort from after-dispatch abort (uncertain)', async () => {
+      // 1. Pre-dispatch abort: signal already aborted -> aborted, fetch never called
+      const preAc = new AbortController();
+      preAc.abort();
+      const preFetch = vi.fn();
+      globalThis.fetch = preFetch;
+
+      const preRes = await refreshSession({ signal: preAc.signal });
+      expect(preRes.kind).toBe('aborted');
+      expect(preFetch).not.toHaveBeenCalled();
+
+      // 2. After-dispatch abort: fetch already in flight -> uncertain (aborted_after_dispatch)
+      const postAc = new AbortController();
       globalThis.fetch = vi.fn().mockImplementation(
         (_url: string, init?: RequestInit) =>
           new Promise((_resolve, reject) => {
@@ -207,10 +218,13 @@ describe('Auth Client & CSRF Cookie Helpers (P2-FE-02)', () => {
           }),
       );
 
-      const promise = refreshSession({ signal: ac.signal });
-      ac.abort();
-      const res = await promise;
-      expect(res.kind).toBe('aborted');
+      const postPromise = refreshSession({ signal: postAc.signal });
+      postAc.abort();
+      const postRes = await postPromise;
+      expect(postRes.kind).toBe('uncertain');
+      if (postRes.kind === 'uncertain') {
+        expect(postRes.reason).toBe('aborted_after_dispatch');
+      }
     });
   });
 

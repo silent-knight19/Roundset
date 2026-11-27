@@ -30,7 +30,12 @@ export type RefreshSessionResult =
   | { kind: 'relogin_required'; status: number; code?: string; error: string }
   | {
       kind: 'uncertain';
-      reason: 'timeout' | 'network' | 'malformed';
+      reason:
+        | 'timeout'
+        | 'network'
+        | 'malformed'
+        | 'aborted_after_dispatch'
+        | 'lock_timeout';
       error: string;
     }
   | { kind: 'unavailable'; status: number; error: string }
@@ -52,6 +57,7 @@ export type LogoutAllResult =
 
 interface DeadlineFetchResult {
   kind: 'response' | 'offline' | 'timeout' | 'aborted';
+  afterDispatch: boolean;
   status?: number;
   json?: unknown;
   jsonParseError?: boolean;
@@ -66,6 +72,7 @@ async function fetchAuthWithDeadline(
   const timeoutMs = options?.timeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
   const controller = new AbortController();
   let timedOut = false;
+  let dispatched = false;
 
   const timer = setTimeout(() => {
     timedOut = true;
@@ -79,12 +86,13 @@ async function fetchAuthWithDeadline(
   if (options?.signal) {
     if (options.signal.aborted) {
       clearTimeout(timer);
-      return { kind: 'aborted' };
+      return { kind: 'aborted', afterDispatch: false };
     }
     options.signal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
   try {
+    dispatched = true;
     const response = await fetch(url, {
       ...init,
       credentials: 'same-origin',
@@ -95,6 +103,7 @@ async function fetchAuthWithDeadline(
     if (response.status === 204) {
       return {
         kind: 'response',
+        afterDispatch: true,
         status: 204,
       };
     }
@@ -108,6 +117,7 @@ async function fetchAuthWithDeadline(
       }
       return {
         kind: 'response',
+        afterDispatch: true,
         status: response.status,
         jsonParseError: true,
         error: 'Failed to parse JSON response body',
@@ -116,6 +126,7 @@ async function fetchAuthWithDeadline(
 
     return {
       kind: 'response',
+      afterDispatch: true,
       status: response.status,
       json: rawJson,
     };
@@ -123,14 +134,16 @@ async function fetchAuthWithDeadline(
     if (timedOut) {
       return {
         kind: 'timeout',
+        afterDispatch: dispatched,
         error: `Auth request timed out after ${timeoutMs}ms`,
       };
     }
     if (options?.signal?.aborted) {
-      return { kind: 'aborted' };
+      return { kind: 'aborted', afterDispatch: dispatched };
     }
     return {
       kind: 'offline',
+      afterDispatch: dispatched,
       error: err instanceof Error ? err.message : 'Network error or backend unreachable',
     };
   } finally {
@@ -240,6 +253,13 @@ export async function refreshSession(
   );
 
   if (result.kind === 'aborted') {
+    if (result.afterDispatch) {
+      return {
+        kind: 'uncertain',
+        reason: 'aborted_after_dispatch',
+        error: 'Refresh request was cancelled after dispatch; session state uncertain',
+      };
+    }
     return { kind: 'aborted' };
   }
   if (result.kind === 'timeout') {
