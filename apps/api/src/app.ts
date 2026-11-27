@@ -14,6 +14,7 @@ import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.
 import { createIngressMiddleware } from './core/ingress.js';
 import { SessionKeyring, SessionService } from './modules/auth/session/index.js';
 import { createV1Router } from './routes/index.js';
+import type { PasswordAuthRouteServices } from './routes/password-auth.js';
 
 export interface CreateAppOptions {
   env?: AppConfig;
@@ -21,6 +22,7 @@ export interface CreateAppOptions {
   logger?: Logger;
   extraRouter?: Router;
   sessionService?: SessionService;
+  passwordAuth?: PasswordAuthRouteServices;
 }
 
 /**
@@ -76,6 +78,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
       sessionService,
       allowedOrigin: config.WEB_ORIGIN,
       isProduction: config.NODE_ENV === 'production',
+      passwordAuth: options.passwordAuth,
     })
   );
 

@@ -18,8 +18,7 @@ function request(purpose: EmailSendRequest['purpose']): EmailSendRequest {
   return { purpose, toEmail: 'candidate@example.test', otpCode: '123456', correlationId: 'synthetic', generation: 1 };
 }
 describe('P2-AUTH-03b durable email budget', () => {
-  it.each([['REGISTER_VERIFY', 'generalUsed', 180], ['LINK_PASSWORD', 'generalUsed', 180], ['RESET_PASSWORD', 'recoveryUsed', 60]] as const)
-  ('reserves %s before the provider call', async (purpose, key, cap) => {
+  it.each([['REGISTER_VERIFY', 'generalUsed', 180], ['LINK_PASSWORD', 'generalUsed', 180], ['RESET_PASSWORD', 'recoveryUsed', 60]] as const)('reserves %s before the provider call', async (purpose, key, cap) => {
     const f = fixture();
     expect(await f.sender.sendOtpEmail(request(purpose))).toMatchObject({ accepted: true });
     expect(f.findOneAndUpdate).toHaveBeenCalledWith({ dateKey: '2026-11-27', [key]: { $lt: cap } }, { $inc: { [key]: 1 } }, { new: true });

@@ -117,6 +117,11 @@ export const EnvSchema = z
     POLICY_CONSENT_VERSION: z.string().min(1).default('2026-11-22'),
     REGISTRATION_MODE: z.enum(['PUBLIC', 'INVITE_ONLY']).default('PUBLIC'),
 
+    // Local password-auth integration remains opt-in. Never enable mock email in production.
+    AUTH_DEV_MOCK_EMAIL: z.union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+      .default(false).transform(value => value === true || value === 'true' || value === '1'),
+    AUTH_CHALLENGE_HMAC_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/, 'Expected a 32-byte hex key').optional(),
+
     // Cryptographic keys
     JWT_ISSUER: z.string().min(1).default('roundset-auth'),
     JWT_AUDIENCE: z.string().min(1).default('roundset-api'),
@@ -207,6 +212,9 @@ export const EnvSchema = z
     }
 
     if (data.NODE_ENV === 'production') {
+      if (data.AUTH_DEV_MOCK_EMAIL) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Mock email is forbidden in production', path: ['AUTH_DEV_MOCK_EMAIL'] });
+      }
       if (data.MOCK_DATABASE) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

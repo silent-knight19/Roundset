@@ -38,7 +38,7 @@ export class PasswordRecoveryService {
     const { connection, rateLimits, otp, emailSender, emailAvailable } = this.options;
     this.assertDatabaseReady();
     let available = false;
-    try { available = await emailAvailable(); } catch { /* global failure */ }
+    try { available = await emailAvailable(); } catch { available = false; }
     if (!available) throw new HttpError(503, 'AUTH_PROVIDER_UNAVAILABLE', 'Email verification is unavailable');
 
     await rateLimits.consumeOrThrow('PASSWORD_FORGOT_IP', trustedIp);
@@ -118,7 +118,7 @@ export class PasswordRecoveryService {
         const user = await users.updateOne({
           _id: binding.userId, accountStatus: 'ACTIVE', emailNormalized: input.email,
           identityVersion: binding.identityVersionAtIssue,
-          emailVerifiedAt: { $type: 'date' },
+          emailVerifiedAt: { $type: 'date' as const },
         }, { $inc: { identityVersion: 1, sessionEpoch: 1 } }, { session }).exec();
         if (user.modifiedCount !== 1) throw new OtpInvalidError();
 
