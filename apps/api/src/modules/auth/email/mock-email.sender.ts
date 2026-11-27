@@ -58,6 +58,8 @@ export class MockEmailSender implements EmailSender {
     }
 
     const accepted = this.shouldAccept;
+    // Retain only bounded recent diagnostics; never keep an unbounded history.
+    if (this.sentRecords.length >= 100) this.sentRecords.shift();
     this.sentRecords.push({
       purpose: request.purpose,
       correlationId: request.correlationId,

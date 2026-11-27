@@ -14,6 +14,7 @@ import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.
 import { createIngressMiddleware } from './core/ingress.js';
 import { SessionKeyring, SessionService } from './modules/auth/session/index.js';
 import { createV1Router } from './routes/index.js';
+import { createPasswordAuthRouter, type PasswordAuthRouteServices } from './routes/password-auth.js';
 
 export interface CreateAppOptions {
   env?: AppConfig;
@@ -21,6 +22,7 @@ export interface CreateAppOptions {
   logger?: Logger;
   extraRouter?: Router;
   sessionService?: SessionService;
+  passwordAuth?: PasswordAuthRouteServices;
 }
 
 /**
@@ -60,15 +62,24 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // 6. Structured HTTP logging
   app.use(createHttpLogger(logger));
 
-  // 7. JSON body parsing bounded at 64 KiB
+  // 7. Password authentication admits requests before parsing their bodies.
+  // The router owns its parser and is mounted exactly once; other routes retain
+  // the original application parser and middleware ordering.
+  app.use('/api/v1/auth', createPasswordAuthRouter({
+    allowedOrigin: config.WEB_ORIGIN,
+    isProduction: config.NODE_ENV === 'production',
+    services: options.passwordAuth,
+  }));
+
+  // 8. JSON body parsing bounded at 64 KiB for all remaining routes
   app.use(express.json({ limit: JSON_BODY_LIMIT_BYTES }));
 
-  // 8. Mount extra test router if injected (only during tests)
+  // 9. Mount extra test router if injected (only during tests)
   if (options.extraRouter) {
     app.use('/api/v1', options.extraRouter);
   }
 
-  // 9. Core API v1 routes (health and auth)
+  // 10. Core API v1 routes (health and auth)
   app.use(
     '/api/v1',
     createV1Router({
@@ -79,10 +90,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
     })
   );
 
-  // 10. Centralized 404 handler for unknown routes
+  // 11. Centralized 404 handler for unknown routes
   app.use(notFoundHandler);
 
-  // 11. Centralized Express 5 error handler
+  // 12. Centralized Express 5 error handler
   app.use(createErrorHandler(logger));
 
   return app;

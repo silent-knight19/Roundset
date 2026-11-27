@@ -658,6 +658,7 @@ describe('Phase 2 Auth Identity & Persistence Models (P2-AUTH-01)', () => {
       expect(matchesKey({ a: 1, b: -1 }, { a: 1, b: -1 })).toBe(true);
       expect(matchesKey({ a: 1 }, { a: 1, b: 1 })).toBe(false);
       expect(matchesKey({ a: 1, b: 1 }, { a: 1, b: -1 })).toBe(false);
+      expect(matchesKey({ b: -1, a: 1 }, { a: 1, b: -1 })).toBe(false);
     });
 
     it('verifyIdentityIndexes utility detects missing indexes accurately', async () => {

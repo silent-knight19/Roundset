@@ -6,7 +6,7 @@ import {
   getPendingRegistrationModel,
   getUserModel,
   getVerificationChallengeModel,
-  syncIdentityIndexes,
+  ensureIdentityIndexes,
 } from '../src/modules/identity/models/index.js';
 import {
   OtpChallengeService,
@@ -31,7 +31,7 @@ describe.skipIf(!RUN_LIVE)(
     beforeAll(async () => {
       validateIntegrationDatabaseName(MONGODB_TEST_URI);
       conn = await mongoose.createConnection(MONGODB_TEST_URI).asPromise();
-      await syncIdentityIndexes(conn);
+      await ensureIdentityIndexes(conn);
     });
 
     afterAll(async () => {
@@ -60,7 +60,7 @@ describe.skipIf(!RUN_LIVE)(
 
       const results = await Promise.allSettled(
         Array.from({ length: 20 }, () =>
-          otpService.claimAndVerifyAttempt(subject, issued.challengeId, issued.generation, '000000')
+          otpService.claimAndVerifyAttempt(subject, issued.challengeId, issued.generation, issued.otpCode === '000000' ? '000001' : '000000')
         )
       );
 

@@ -1,13 +1,16 @@
 import type { Server } from 'node:http';
 import fs from 'node:fs';
+import mongoose from 'mongoose';
 import { fileURLToPath } from 'node:url';
 import type { Logger } from 'pino';
 import { createApp } from './app.js';
-import { loadEnv, type AppConfig } from './config/env.js';
+import { loadEnv, isIsolatedMockAuthConfig, type AppConfig } from './config/env.js';
 import { createLogger } from './core/logging.js';
 import { MongoManager } from './integrations/mongodb.js';
 import { MockReadinessProvider, type ReadinessProvider } from './core/readiness.js';
 import { SessionKeyring, SessionService } from './modules/auth/session/index.js';
+import { createPasswordAuthRuntime } from './modules/auth/password/runtime.js';
+import { MockEmailSender } from './modules/auth/email/mock-email.sender.js';
 
 export const ALLOWLISTED_ERROR_CODES = new Set([
   'EADDRINUSE',
@@ -67,6 +70,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
   // 1. Load and validate configuration
   const config = options.env ?? loadEnv();
   const logger = options.logger ?? createLogger();
+  if (config.AUTH_DEV_MOCK_EMAIL && !isIsolatedMockAuthConfig(config)) {
+    throw new Error('Unsafe mock authentication configuration');
+  }
 
   let mongoManager = options.mongoManager ?? null;
   let readinessProvider: ReadinessProvider;
@@ -89,6 +95,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
   const keyring = new SessionKeyring(config);
   await keyring.initialize();
   const sessionService = new SessionService(config, keyring);
+  const passwordAuth = config.AUTH_DEV_MOCK_EMAIL && config.NODE_ENV !== 'production' &&
+    config.INGRESS_MODE === 'LOCAL' && !config.MOCK_DATABASE && config.AUTH_CHALLENGE_HMAC_KEY
+    ? createPasswordAuthRuntime({ config, keyring, connection: mongoose.connection,
+        emailSender: new MockEmailSender({ nodeEnv: config.NODE_ENV }) }) : undefined;
+  if (passwordAuth) {
+    try { await passwordAuth.initialize(); }
+    catch (error) { passwordAuth.dispose(); throw error; }
+  }
 
   // 4. Create Express application
   const app = createApp({
@@ -96,16 +110,18 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     logger,
     readinessProvider,
     sessionService,
+    passwordAuth,
   });
 
   const listenPort = options.port ?? config.PORT;
 
   // 4. Start HTTP listener with controlled error handling
   const server: Server = await new Promise((resolve, reject) => {
-    const s = app.listen(listenPort);
+    const s = config.INGRESS_MODE === 'LOCAL' ? app.listen(listenPort, '127.0.0.1') : app.listen(listenPort);
 
     const onError = (err: Error) => {
       s.removeListener('listening', onListening);
+      passwordAuth?.dispose();
 
       // R3-02: Release manager-owned connection listeners when HTTP startup fails
       if (
@@ -187,6 +203,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
           resolve();
         }
       });
+
+      passwordAuth?.dispose();
 
       // Disconnect database dependencies
       if (mongoManager) {

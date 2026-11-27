@@ -86,6 +86,11 @@ export class MongoManager {
       await mongoose.connect(uri, {
         serverSelectionTimeoutMS: 5000,
         connectTimeoutMS: 5000,
+        // Driver 7.x client-side operation timeout covers selection, checkout and execution.
+        // Keep stage-specific limits as fallback; never race detached mutations.
+        timeoutMS: 5000,
+        socketTimeoutMS: 5000,
+        waitQueueTimeoutMS: 5000,
       });
 
       this.logger?.info(
