@@ -210,6 +210,7 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
         usedSlotIds: ['slot-1'],
         usedTopicIds: ['api_design'],
         usedCompetencyIds: ['api_contracts'],
+        assignedSlot: SLOT_1,
         difficultyHint: 'MAINTAIN',
       },
       resolver,
@@ -1087,6 +1088,7 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
         usedSlotIds: ['slot-1'],
         usedTopicIds: ['api_design'],
         usedCompetencyIds: ['api_contracts'],
+        assignedSlot: SLOT_1,
         difficultyHint: 'MAINTAIN',
       },
       resolver,
@@ -1115,5 +1117,279 @@ describe('P4-AI-03a: Structured Prompt and Rubric Foundation', () => {
       SYNTHETIC_ASSESSMENT_POLICY_V1.approvedTopics,
     );
     expect(summary.coveredTurns).toBe(2);
+  });
+
+  // --- P4-AI-03a-R2 Mandatory Regressions ---
+
+  it('R12. Changing the assigned slot changes the authorized prompt requestIdentity', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-q',
+      templateVersion: 'v1',
+      content: 'Author main question.',
+    });
+
+    const baseInput = {
+      authenticatedUserId: 'user-a',
+      interviewId: 'int-1',
+      operationId: 'op-r12',
+      generationEpoch: 1,
+      attemptId: 'att-r12',
+      attemptNo: 1,
+      provider: 'MOCK' as const,
+      purpose: 'QUESTION' as const,
+      promptVersion: '1.0.0',
+      outputSchemaVersion: 'QuestionProposal.v1',
+      maxOutputTokens: 512,
+      estimatedInputTokens: 32,
+      reasoningProfile: 'NO_REASONING' as const,
+      absoluteDeadlineAt: NOW_ISO,
+      templateDescriptor: {
+        ref: 'tpl-q',
+        kind: 'TRUSTED_TEMPLATE' as const,
+        inheritedClasses: [],
+        ancestorRefs: [],
+        scope: { type: 'SERVER_TEMPLATE' as const, templateId: 'tpl-q', templateVersion: 'v1' },
+      },
+      templateText: 'Author main question.',
+      candidateConfigDescriptor: {
+        ref: 'cfg-1',
+        kind: 'CANDIDATE_CONFIGURATION' as const,
+        inheritedClasses: ['USER_TRANSCRIPT' as const],
+        ancestorRefs: [],
+        scope: {
+          type: 'USER_INTERVIEW' as const,
+          userId: 'user-a',
+          interviewId: 'int-1',
+          recordId: 'cfg-1',
+          recordVersion: 'v1',
+        },
+      },
+      candidateConfig: {
+        role: 'backend_engineer',
+        track: 'node_ts',
+        difficulty: 'MEDIUM' as const,
+        topic: 'api_design',
+        competency: 'api_contracts',
+      },
+      usedSlotIds: [],
+      usedTopicIds: [],
+      usedCompetencyIds: [],
+      difficultyHint: 'MAINTAIN' as const,
+    };
+
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-1',
+      recordId: 'cfg-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_CONFIGURATION',
+      ancestorRefs: [],
+      content: 'role=backend_engineer;track=node_ts;difficulty=MEDIUM;topic=api_design;competency=api_contracts',
+    });
+
+    const res1 = buildRubricAuthoringPrompt({ ...baseInput, assignedSlot: SLOT_1 }, resolver);
+    const res2 = buildRubricAuthoringPrompt({ ...baseInput, assignedSlot: SLOT_2 }, resolver);
+
+    expect(res1.requestIdentity).not.toBe(res2.requestIdentity);
+  });
+
+  it('R13. Changing used-slot metadata changes prompt requestIdentity', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-q',
+      templateVersion: 'v1',
+      content: 'Author main question.',
+    });
+    resolver.registerUserInterviewSource({
+      userId: 'user-a',
+      interviewId: 'int-1',
+      recordId: 'cfg-1',
+      recordVersion: 'v1',
+      kind: 'CANDIDATE_CONFIGURATION',
+      ancestorRefs: [],
+      content: 'role=backend_engineer;track=node_ts;difficulty=MEDIUM;topic=api_design;competency=api_contracts',
+    });
+
+    const baseInput = {
+      authenticatedUserId: 'user-a',
+      interviewId: 'int-1',
+      operationId: 'op-r13',
+      generationEpoch: 1,
+      attemptId: 'att-r13',
+      attemptNo: 1,
+      provider: 'MOCK' as const,
+      purpose: 'QUESTION' as const,
+      promptVersion: '1.0.0',
+      outputSchemaVersion: 'QuestionProposal.v1',
+      maxOutputTokens: 512,
+      estimatedInputTokens: 32,
+      reasoningProfile: 'NO_REASONING' as const,
+      absoluteDeadlineAt: NOW_ISO,
+      templateDescriptor: {
+        ref: 'tpl-q',
+        kind: 'TRUSTED_TEMPLATE' as const,
+        inheritedClasses: [],
+        ancestorRefs: [],
+        scope: { type: 'SERVER_TEMPLATE' as const, templateId: 'tpl-q', templateVersion: 'v1' },
+      },
+      templateText: 'Author main question.',
+      candidateConfigDescriptor: {
+        ref: 'cfg-1',
+        kind: 'CANDIDATE_CONFIGURATION' as const,
+        inheritedClasses: ['USER_TRANSCRIPT' as const],
+        ancestorRefs: [],
+        scope: {
+          type: 'USER_INTERVIEW' as const,
+          userId: 'user-a',
+          interviewId: 'int-1',
+          recordId: 'cfg-1',
+          recordVersion: 'v1',
+        },
+      },
+      candidateConfig: {
+        role: 'backend_engineer',
+        track: 'node_ts',
+        difficulty: 'MEDIUM' as const,
+        topic: 'api_design',
+        competency: 'api_contracts',
+      },
+      assignedSlot: SLOT_1,
+      usedTopicIds: ['api_design'],
+      usedCompetencyIds: ['api_contracts'],
+      difficultyHint: 'MAINTAIN' as const,
+    };
+
+    const res1 = buildRubricAuthoringPrompt({ ...baseInput, usedSlotIds: ['slot-1'] }, resolver);
+    const res2 = buildRubricAuthoringPrompt(
+      { ...baseInput, usedSlotIds: ['slot-1', 'slot-2'] },
+      resolver,
+    );
+
+    expect(res1.requestIdentity).not.toBe(res2.requestIdentity);
+  });
+
+  it('R14. Invalid role/track/topic/competency combinations reject', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-q',
+      templateVersion: 'v1',
+      content: 'Author main question.',
+    });
+
+    expect(() =>
+      buildRubricAuthoringPrompt(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-1',
+          operationId: 'op-r14',
+          generationEpoch: 1,
+          attemptId: 'att-r14',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'PLAN',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: 'PlanProposal.v1',
+          maxOutputTokens: 512,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: NOW_ISO,
+          templateDescriptor: {
+            ref: 'tpl-q',
+            kind: 'TRUSTED_TEMPLATE',
+            inheritedClasses: [],
+            ancestorRefs: [],
+            scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-q', templateVersion: 'v1' },
+          },
+          templateText: 'Author main question.',
+          candidateConfigDescriptor: {
+            ref: 'cfg-1',
+            kind: 'CANDIDATE_CONFIGURATION',
+            inheritedClasses: ['USER_TRANSCRIPT'],
+            ancestorRefs: [],
+            scope: {
+              type: 'USER_INTERVIEW',
+              userId: 'user-a',
+              interviewId: 'int-1',
+              recordId: 'cfg-1',
+              recordVersion: 'v1',
+            },
+          },
+          candidateConfig: {
+            role: 'backend_engineer',
+            track: 'react_ts', // Invalid track for backend_engineer
+            difficulty: 'MEDIUM',
+            topic: 'api_design',
+            competency: 'api_contracts',
+          },
+          usedSlotIds: [],
+          usedTopicIds: [],
+          usedCompetencyIds: [],
+          difficultyHint: 'MAINTAIN',
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R15. Unauthorized slot/topic/competency metadata cannot enter a privileged prompt', () => {
+    const resolver = new DeterministicFakeSourceResolver();
+    resolver.registerServerTemplate({
+      templateId: 'tpl-q',
+      templateVersion: 'v1',
+      content: 'Author main question.',
+    });
+
+    expect(() =>
+      buildRubricAuthoringPrompt(
+        {
+          authenticatedUserId: 'user-a',
+          interviewId: 'int-1',
+          operationId: 'op-r15',
+          generationEpoch: 1,
+          attemptId: 'att-r15',
+          attemptNo: 1,
+          provider: 'MOCK',
+          purpose: 'QUESTION',
+          promptVersion: '1.0.0',
+          outputSchemaVersion: 'QuestionProposal.v1',
+          maxOutputTokens: 512,
+          estimatedInputTokens: 32,
+          reasoningProfile: 'NO_REASONING',
+          absoluteDeadlineAt: NOW_ISO,
+          templateDescriptor: {
+            ref: 'tpl-q',
+            kind: 'TRUSTED_TEMPLATE',
+            inheritedClasses: [],
+            ancestorRefs: [],
+            scope: { type: 'SERVER_TEMPLATE', templateId: 'tpl-q', templateVersion: 'v1' },
+          },
+          templateText: 'Author main question.',
+          assignedSlot: SLOT_1,
+          usedSlotIds: ['slot-1'],
+          usedTopicIds: ['unauthorized_topic'],
+          usedCompetencyIds: ['api_contracts'],
+          difficultyHint: 'MAINTAIN',
+        },
+        resolver,
+      ),
+    ).toThrowError(SanitizedAiError);
+  });
+
+  it('R16. Rubric weight manipulation (9 + 1 = 10) rejects according to versioned fixture policy', () => {
+    const manipulatedWeights = {
+      ...VALID_QUESTION,
+      scoringRubric: [
+        { criterion: 'correctness', maxPoints: 9, description: 'Explains idempotency key storage.' },
+        {
+          criterion: 'edge_cases',
+          maxPoints: 1,
+          description: 'Handles concurrent duplicate deliveries.',
+        },
+      ],
+    };
+    expect(() => validateQuestionProposalPolicy(manipulatedWeights, SLOT_1)).toThrowError(
+      SanitizedAiError,
+    );
   });
 });

@@ -21,6 +21,9 @@ export interface AssessmentPolicyFixture {
   readonly topicToCompetencies: Readonly<Record<string, ReadonlySet<string>>>;
   readonly competencyToConcepts: Readonly<Record<string, ReadonlySet<string>>>;
   readonly competencyToCriteria: Readonly<Record<string, ReadonlySet<string>>>;
+  readonly competencyRubricTemplates: Readonly<
+    Record<string, ReadonlyArray<Readonly<Record<string, number>>>>
+  >;
   readonly criterionApprovedDescriptions: Readonly<Record<string, string>>;
   readonly followUpApprovedTexts: Readonly<Record<string, ReadonlySet<string>>>;
 }
@@ -83,6 +86,24 @@ export const SYNTHETIC_ASSESSMENT_POLICY_V1: AssessmentPolicyFixture = {
     async_control: new Set(['correctness', 'edge_cases', 'scalability', 'tradeoffs']),
     system_reliability: new Set(['correctness', 'scalability', 'edge_cases', 'tradeoffs']),
     state_management: new Set(['correctness', 'clarity', 'tradeoffs']),
+  },
+  competencyRubricTemplates: {
+    api_contracts: [
+      { correctness: 5, edge_cases: 5 },
+      { correctness: 4, edge_cases: 4, clarity: 2 },
+    ],
+    async_control: [
+      { correctness: 5, scalability: 5 },
+      { correctness: 4, edge_cases: 3, scalability: 3 },
+    ],
+    system_reliability: [
+      { correctness: 5, scalability: 5 },
+      { correctness: 4, edge_cases: 3, tradeoffs: 3 },
+    ],
+    state_management: [
+      { correctness: 5, clarity: 5 },
+      { correctness: 4, clarity: 3, tradeoffs: 3 },
+    ],
   },
   criterionApprovedDescriptions: {
     correctness: 'Explains idempotency key storage.',
@@ -281,6 +302,32 @@ export function validateQuestionProposalPolicy(
     throw new SanitizedAiError(
       'AI_SCHEMA_INVALID',
       'Question scoringRubric maxPoints must sum to exactly 10',
+    );
+  }
+
+  const allowedTemplates = policy.competencyRubricTemplates[slot.competency];
+  if (!allowedTemplates || allowedTemplates.length === 0) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'No approved rubric weighting template for slot competency',
+    );
+  }
+
+  const actualWeights = new Map<string, number>();
+  for (const item of proposal.scoringRubric) {
+    actualWeights.set(item.criterion, item.maxPoints);
+  }
+
+  const matchesTemplate = allowedTemplates.some((tpl) => {
+    const entries = Object.entries(tpl);
+    if (entries.length !== actualWeights.size) return false;
+    return entries.every(([criterion, pts]) => actualWeights.get(criterion) === pts);
+  });
+
+  if (!matchesTemplate) {
+    throw new SanitizedAiError(
+      'AI_SCHEMA_INVALID',
+      'Question scoringRubric weights do not match an approved policy template',
     );
   }
 

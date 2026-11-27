@@ -82,6 +82,7 @@ export interface RequestBindingMetadata {
   estimatedInputTokens: number;
   reasoningProfile: 'NO_REASONING' | 'LOW';
   absoluteDeadlineAt: string;
+  promptContext?: Record<string, unknown>;
 }
 
 export interface ResolveManifestInput {

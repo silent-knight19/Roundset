@@ -10,7 +10,7 @@ import {
   resolveAndAuthorizeSourceManifest,
   ResolvedManifestResult,
 } from '../provenance.js';
-import { SYNTHETIC_ASSESSMENT_POLICY_V1 } from '../rubrics/policy.js';
+import { PlanSlot, SYNTHETIC_ASSESSMENT_POLICY_V1 } from '../rubrics/policy.js';
 
 export type AdaptiveDifficultyHint = 'MAINTAIN' | 'STEP_UP' | 'STEP_DOWN';
 
@@ -47,6 +47,24 @@ export function serializeCanonicalCandidateConfig(config: StructuredCandidateCon
     throw new SanitizedAiError(
       'AI_CONFIGURATION_INVALID',
       'Unapproved candidate configuration competency',
+    );
+  }
+  if (!SYNTHETIC_ASSESSMENT_POLICY_V1.roleToTracks[config.role]?.has(config.track)) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Candidate configuration track is not approved for role',
+    );
+  }
+  if (!SYNTHETIC_ASSESSMENT_POLICY_V1.trackToTopics[config.track]?.has(config.topic)) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Candidate configuration topic is not approved for track',
+    );
+  }
+  if (!SYNTHETIC_ASSESSMENT_POLICY_V1.topicToCompetencies[config.topic]?.has(config.competency)) {
+    throw new SanitizedAiError(
+      'AI_CONFIGURATION_INVALID',
+      'Candidate configuration competency is not approved for topic',
     );
   }
   return `role=${config.role};track=${config.track};difficulty=${config.difficulty};topic=${config.topic};competency=${config.competency}`;
@@ -88,6 +106,7 @@ export interface RubricAuthoringPromptInput {
   candidateConfigDescriptor?: SourceDescriptor;
   candidateConfig?: StructuredCandidateConfig;
   /** Server-approved structured metadata only. */
+  assignedSlot?: PlanSlot;
   usedSlotIds: ReadonlyArray<string>;
   usedTopicIds: ReadonlyArray<string>;
   usedCompetencyIds: ReadonlyArray<string>;
@@ -115,6 +134,42 @@ export function buildRubricAuthoringPrompt(
     !Array.isArray(input.usedCompetencyIds)
   ) {
     throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid used-slot/topic/competency IDs');
+  }
+  for (const slotId of input.usedSlotIds) {
+    if (typeof slotId !== 'string' || slotId.length === 0) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Invalid usedSlotId');
+    }
+  }
+  for (const topicId of input.usedTopicIds) {
+    if (!SYNTHETIC_ASSESSMENT_POLICY_V1.approvedTopics.has(topicId)) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Unapproved usedTopicId');
+    }
+  }
+  for (const compId of input.usedCompetencyIds) {
+    if (!SYNTHETIC_ASSESSMENT_POLICY_V1.approvedCompetencies.has(compId)) {
+      throw new SanitizedAiError('AI_CONFIGURATION_INVALID', 'Unapproved usedCompetencyId');
+    }
+  }
+
+  if (input.purpose === 'QUESTION') {
+    if (!input.assignedSlot || typeof input.assignedSlot !== 'object') {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'QUESTION prompt requires an assigned server-authorized PlanSlot',
+      );
+    }
+    if (
+      !SYNTHETIC_ASSESSMENT_POLICY_V1.approvedTopics.has(input.assignedSlot.topic) ||
+      !SYNTHETIC_ASSESSMENT_POLICY_V1.approvedCompetencies.has(input.assignedSlot.competency) ||
+      !SYNTHETIC_ASSESSMENT_POLICY_V1.topicToCompetencies[input.assignedSlot.topic]?.has(
+        input.assignedSlot.competency,
+      )
+    ) {
+      throw new SanitizedAiError(
+        'AI_CONFIGURATION_INVALID',
+        'Assigned PlanSlot violates synthetic assessment policy',
+      );
+    }
   }
 
   assertTrustedTemplateDescriptor(input.templateDescriptor);
@@ -172,6 +227,13 @@ export function buildRubricAuthoringPrompt(
         estimatedInputTokens: input.estimatedInputTokens,
         reasoningProfile: input.reasoningProfile,
         absoluteDeadlineAt: input.absoluteDeadlineAt,
+        promptContext: {
+          assignedSlot: input.assignedSlot ?? null,
+          usedSlotIds: input.usedSlotIds,
+          usedTopicIds: input.usedTopicIds,
+          usedCompetencyIds: input.usedCompetencyIds,
+          difficultyHint: input.difficultyHint,
+        },
       },
     },
     resolver,
