@@ -35,7 +35,9 @@ export type RefreshSessionResult =
         | 'network'
         | 'malformed'
         | 'aborted_after_dispatch'
-        | 'lock_timeout';
+        | 'lock_timeout'
+        | 'interrupted_rotation'
+        | 'coordination_storage_unavailable';
       error: string;
     }
   | { kind: 'unavailable'; status: number; error: string }

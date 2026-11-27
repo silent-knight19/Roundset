@@ -28,10 +28,15 @@ export type AuthBroadcastEvent =
       reason: 'replay_detected' | 'relogin_required' | 'uncertain_refresh';
     };
 
+export type CrossTabSyncStatus =
+  | 'in_progress'
+  | 'uncertain'
+  | 'replay_detected'
+  | 'relogin_required';
+
 interface CrossTabSyncMarker {
-  kind: 'uncertain' | 'replay_detected' | 'relogin_required';
+  status: CrossTabSyncStatus;
   at: number;
-  senderId: string;
 }
 
 export interface SessionCoordinatorCallbacks {
@@ -64,58 +69,103 @@ export function isBroadcastChannelSupported(): boolean {
   return typeof BroadcastChannel !== 'undefined';
 }
 
-function writeCrossTabSyncMarker(marker: CrossTabSyncMarker): void {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(AUTH_SYNC_MARKER_KEY, JSON.stringify(marker));
-    }
-  } catch {
-    // Ignore storage quota/access errors
-  }
-}
-
-function clearCrossTabSyncMarker(): void {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.removeItem(AUTH_SYNC_MARKER_KEY);
-    }
-  } catch {
-    // Ignore storage access errors
-  }
-}
-
-function readCrossTabSyncMarker(): CrossTabSyncMarker | null {
+function writeCrossTabSyncMarker(marker: CrossTabSyncMarker): boolean {
   try {
     if (typeof localStorage === 'undefined') {
-      return null;
+      return false;
+    }
+    localStorage.setItem(AUTH_SYNC_MARKER_KEY, JSON.stringify(marker));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearCrossTabSyncMarker(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') {
+      return false;
+    }
+    localStorage.removeItem(AUTH_SYNC_MARKER_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCrossTabSyncMarker(): {
+  ok: true;
+  marker: CrossTabSyncMarker | null;
+} | {
+  ok: false;
+} {
+  try {
+    if (typeof localStorage === 'undefined') {
+      return { ok: false };
     }
     const raw = localStorage.getItem(AUTH_SYNC_MARKER_KEY);
     if (!raw) {
-      return null;
+      return { ok: true, marker: null };
     }
     const parsed = JSON.parse(raw) as Partial<CrossTabSyncMarker> | null;
     if (
       !parsed ||
       typeof parsed !== 'object' ||
       typeof parsed.at !== 'number' ||
-      typeof parsed.senderId !== 'string' ||
-      (parsed.kind !== 'uncertain' &&
-        parsed.kind !== 'replay_detected' &&
-        parsed.kind !== 'relogin_required')
+      (parsed.status !== 'in_progress' &&
+        parsed.status !== 'uncertain' &&
+        parsed.status !== 'replay_detected' &&
+        parsed.status !== 'relogin_required')
     ) {
-      return null;
+      // Corrupt marker is treated conservatively as unresolved uncertainty.
+      return { ok: true, marker: { status: 'uncertain', at: Date.now() } };
     }
-    return parsed as CrossTabSyncMarker;
+    return { ok: true, marker: parsed as CrossTabSyncMarker };
   } catch {
-    return null;
+    return { ok: false };
   }
+}
+
+function markerToBlockedResult(status: CrossTabSyncStatus): RefreshSessionResult {
+  if (status === 'replay_detected') {
+    return {
+      kind: 'replay_detected',
+      status: 401,
+      error: 'Session replay detected; please sign in again.',
+    };
+  }
+  if (status === 'relogin_required') {
+    return {
+      kind: 'relogin_required',
+      status: 403,
+      error: 'Session requires reauthentication; please sign in again.',
+    };
+  }
+  if (status === 'in_progress') {
+    return {
+      kind: 'uncertain',
+      reason: 'interrupted_rotation',
+      error: 'Previous session rotation was interrupted or unresolved; please sign in again.',
+    };
+  }
+  return {
+    kind: 'uncertain',
+    reason: 'network',
+    error: 'Previous session refresh outcome is unresolved; please sign in again.',
+  };
 }
 
 /**
  * Coordinates single-flight refresh within the tab, bounded cross-tab Web Locks
- * serialization when supported, credential-free cross-tab uncertainty markers
- * + BroadcastChannel invalidation notifications, and operation-bound monotonic
- * generation fencing so stale async responses cannot restore a logged-out session.
+ * serialization when supported, credential-free persistent rotation/uncertainty
+ * markers + BroadcastChannel invalidation notifications, and operation-bound
+ * monotonic generation fencing so stale async responses cannot restore a
+ * logged-out session.
+ *
+ * Integration requirement for future explicit-login tickets (P2-FE-03 / P2-AUTH-02 / P2-AUTH-03b):
+ * Call `acknowledgeExplicitAuthentication()` ONLY after a verified `200 SessionResponse`
+ * from an explicit fresh login or Google exchange so any unresolved refresh-uncertainty
+ * marker from an earlier session is safely cleared.
  */
 export class SessionCoordinator {
   private readonly tabId = createTabId();
@@ -124,6 +174,7 @@ export class SessionCoordinator {
     promise: Promise<RefreshSessionResult>;
   } | null = null;
   private generation = 0;
+  private inMemoryUnresolvedState: CrossTabSyncStatus | null = null;
   private channel: BroadcastChannel | null = null;
   private callbacks: SessionCoordinatorCallbacks | null = null;
 
@@ -147,9 +198,11 @@ export class SessionCoordinator {
         }
 
         if (msg.type === 'LOGOUT') {
+          this.inMemoryUnresolvedState = null;
           this.bumpGeneration();
           this.callbacks?.onExternalLogout('logout');
         } else if (msg.type === 'LOGOUT_ALL') {
+          this.inMemoryUnresolvedState = null;
           this.bumpGeneration();
           this.callbacks?.onExternalLogout('logout_all');
         } else if (
@@ -158,6 +211,8 @@ export class SessionCoordinator {
             msg.reason === 'relogin_required' ||
             msg.reason === 'uncertain_refresh')
         ) {
+          this.inMemoryUnresolvedState =
+            msg.reason === 'uncertain_refresh' ? 'uncertain' : msg.reason;
           this.bumpGeneration();
           this.callbacks?.onExternalInvalidation(msg.reason);
         }
@@ -187,6 +242,17 @@ export class SessionCoordinator {
     return this.generation;
   }
 
+  /**
+   * Clears unresolved uncertainty only after an explicit fresh authentication
+   * succeeds (reserved for future login/Google-exchange tickets).
+   */
+  public acknowledgeExplicitAuthentication(): void {
+    this.inMemoryUnresolvedState = null;
+    if (isWebLocksSupported()) {
+      clearCrossTabSyncMarker();
+    }
+  }
+
   private broadcast(event: AuthBroadcastEvent): void {
     if (!this.channel) {
       return;
@@ -198,52 +264,55 @@ export class SessionCoordinator {
     }
   }
 
-  private propagateFailureOutcome(result: RefreshSessionResult): void {
-    const useSyncMarker = isWebLocksSupported();
+  private resolveRotationMarker(
+    result: RefreshSessionResult,
+    usePersistentMarker: boolean,
+  ): void {
+    if (result.kind === 'authenticated' || result.kind === 'unauthenticated') {
+      // Definitive server outcome: active session restored or server confirmed no session.
+      this.inMemoryUnresolvedState = null;
+      if (usePersistentMarker) {
+        clearCrossTabSyncMarker();
+      }
+      return;
+    }
 
     if (result.kind === 'replay_detected') {
-      if (useSyncMarker) {
-        writeCrossTabSyncMarker({
-          kind: 'replay_detected',
-          at: Date.now(),
-          senderId: this.tabId,
-        });
+      this.inMemoryUnresolvedState = 'replay_detected';
+      if (usePersistentMarker) {
+        writeCrossTabSyncMarker({ status: 'replay_detected', at: Date.now() });
       }
       this.broadcast({
         type: 'SESSION_INVALIDATED',
         senderId: this.tabId,
         reason: 'replay_detected',
       });
-    } else if (result.kind === 'relogin_required') {
-      if (useSyncMarker) {
-        writeCrossTabSyncMarker({
-          kind: 'relogin_required',
-          at: Date.now(),
-          senderId: this.tabId,
-        });
+      return;
+    }
+
+    if (result.kind === 'relogin_required') {
+      this.inMemoryUnresolvedState = 'relogin_required';
+      if (usePersistentMarker) {
+        writeCrossTabSyncMarker({ status: 'relogin_required', at: Date.now() });
       }
       this.broadcast({
         type: 'SESSION_INVALIDATED',
         senderId: this.tabId,
         reason: 'relogin_required',
       });
-    } else if (result.kind === 'uncertain' || result.kind === 'invalid') {
-      if (useSyncMarker) {
-        writeCrossTabSyncMarker({
-          kind: 'uncertain',
-          at: Date.now(),
-          senderId: this.tabId,
-        });
+      return;
+    }
+
+    if (result.kind === 'uncertain' || result.kind === 'invalid') {
+      this.inMemoryUnresolvedState = 'uncertain';
+      if (usePersistentMarker) {
+        writeCrossTabSyncMarker({ status: 'uncertain', at: Date.now() });
       }
       this.broadcast({
         type: 'SESSION_INVALIDATED',
         senderId: this.tabId,
         reason: 'uncertain_refresh',
       });
-    } else if (result.kind === 'authenticated') {
-      if (useSyncMarker) {
-        clearCrossTabSyncMarker();
-      }
     }
   }
 
@@ -255,6 +324,10 @@ export class SessionCoordinator {
       return Promise.resolve({ kind: 'aborted' });
     }
 
+    if (this.inMemoryUnresolvedState) {
+      return Promise.resolve(markerToBlockedResult(this.inMemoryUnresolvedState));
+    }
+
     if (!isWebLocksSupported()) {
       if (this.generation !== opGeneration) {
         return Promise.resolve({ kind: 'aborted' });
@@ -262,7 +335,6 @@ export class SessionCoordinator {
       return refreshSession(options);
     }
 
-    const waitStartMs = Date.now();
     const lockTimeoutMs = options?.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
 
     return new Promise<RefreshSessionResult>((resolve) => {
@@ -302,38 +374,47 @@ export class SessionCoordinator {
             return { kind: 'aborted' } satisfies RefreshSessionResult;
           }
 
-          // Lock acquired: pre-lock abort no longer applies; subsequent abort is handled by fetch.
           clearTimeout(lockTimer);
           options?.signal?.removeEventListener('abort', onPreLockAbort);
 
-          // Synchronously check credential-free cross-tab marker inside the lock
-          // so delayed BroadcastChannel delivery cannot cause a racing refresh.
-          const marker = readCrossTabSyncMarker();
-          if (marker && marker.senderId !== this.tabId && marker.at >= waitStartMs) {
-            if (marker.kind === 'replay_detected') {
-              return {
-                kind: 'replay_detected',
-                status: 401,
-                error: 'Session replay detected in another tab; please sign in again',
-              } satisfies RefreshSessionResult;
-            }
-            if (marker.kind === 'relogin_required') {
-              return {
-                kind: 'relogin_required',
-                status: 403,
-                error: 'Session invalidated in another tab; please sign in again',
-              } satisfies RefreshSessionResult;
-            }
+          if (this.inMemoryUnresolvedState) {
+            return markerToBlockedResult(this.inMemoryUnresolvedState);
+          }
+
+          // Synchronously read persistent coordination marker inside the lock.
+          // Unresolved markers block originating tab, newly opened tabs, and reloads.
+          const readResult = readCrossTabSyncMarker();
+          if (!readResult.ok) {
             return {
               kind: 'uncertain',
-              reason: 'network',
-              error: 'Session refresh outcome uncertain in another tab; please sign in again',
+              reason: 'coordination_storage_unavailable',
+              error:
+                'Cross-tab coordination storage is unavailable; please sign in again.',
+            } satisfies RefreshSessionResult;
+          }
+
+          if (readResult.marker) {
+            this.inMemoryUnresolvedState = readResult.marker.status;
+            return markerToBlockedResult(readResult.marker.status);
+          }
+
+          // Persist credential-free in-progress rotation marker before dispatch.
+          const wroteInProgress = writeCrossTabSyncMarker({
+            status: 'in_progress',
+            at: Date.now(),
+          });
+          if (!wroteInProgress) {
+            return {
+              kind: 'uncertain',
+              reason: 'coordination_storage_unavailable',
+              error:
+                'Failed to persist rotation coordination marker; please sign in again.',
             } satisfies RefreshSessionResult;
           }
 
           const res = await refreshSession(options);
           if (this.generation === opGeneration) {
-            this.propagateFailureOutcome(res);
+            this.resolveRotationMarker(res, true);
           }
           return res;
         }),
@@ -380,7 +461,7 @@ export class SessionCoordinator {
     const promise = this.executeWithBoundedLock(opGeneration, options)
       .then((result) => {
         if (!isWebLocksSupported() && this.generation === opGeneration) {
-          this.propagateFailureOutcome(result);
+          this.resolveRotationMarker(result, false);
         }
         return result;
       })
@@ -412,17 +493,20 @@ export class SessionCoordinator {
     }
 
     if (result.kind === 'logged_out' || result.kind === 'already_logged_out') {
-      clearCrossTabSyncMarker();
+      // Confirmed safe session reset clears unresolved uncertainty.
+      this.inMemoryUnresolvedState = null;
+      if (isWebLocksSupported()) {
+        clearCrossTabSyncMarker();
+      }
       this.broadcast({
         type: 'LOGOUT',
         senderId: this.tabId,
       });
     } else if (result.kind === 'mismatch') {
-      writeCrossTabSyncMarker({
-        kind: 'relogin_required',
-        at: Date.now(),
-        senderId: this.tabId,
-      });
+      this.inMemoryUnresolvedState = 'relogin_required';
+      if (isWebLocksSupported()) {
+        writeCrossTabSyncMarker({ status: 'relogin_required', at: Date.now() });
+      }
       this.broadcast({
         type: 'SESSION_INVALIDATED',
         senderId: this.tabId,
@@ -440,7 +524,11 @@ export class SessionCoordinator {
 
     if (result.kind === 'logged_out_all' || result.kind === 'unauthenticated') {
       this.bumpGeneration();
-      clearCrossTabSyncMarker();
+      // Confirmed safe session reset clears unresolved uncertainty.
+      this.inMemoryUnresolvedState = null;
+      if (isWebLocksSupported()) {
+        clearCrossTabSyncMarker();
+      }
       this.broadcast({
         type: 'LOGOUT_ALL',
         senderId: this.tabId,

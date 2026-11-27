@@ -389,12 +389,183 @@ describe('AuthProvider, SessionCoordinator & Multi-Tab Sync (P2-FE-02)', () => {
 
     // Verify marker in localStorage contains zero credentials
     const rawMarker = localStorage.getItem('roundset:auth:sync_marker') ?? '';
-    expect(rawMarker).toContain('"kind":"uncertain"');
+    expect(rawMarker).toContain('"status":"uncertain"');
     expect(rawMarker).not.toContain('ey.');
     expect(rawMarker).not.toContain('c1.');
 
     tabA.dispose();
     tabB.dispose();
+  });
+
+  it('blocks newly opened tabs and the originating tab after an uncertain refresh', async () => {
+    let lockChain = Promise.resolve();
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn((_name: string, cb: () => Promise<unknown>) => {
+          const next = lockChain.then(() => cb());
+          lockChain = next.then(
+            () => undefined,
+            () => undefined,
+          );
+          return next;
+        }),
+      },
+    });
+
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('Network drop'));
+    globalThis.fetch = fetchMock;
+
+    const tabA = new SessionCoordinator();
+    const resA1 = await tabA.refresh();
+    expect(resA1.result.kind).toBe('uncertain');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Originating tab attempts another refresh -> blocked
+    const resA2 = await tabA.refresh();
+    expect(resA2.result.kind).toBe('uncertain');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Newly opened tab (created after Tab A's uncertain refresh) -> blocked
+    const tabB = new SessionCoordinator();
+    const resB = await tabB.refresh();
+    expect(resB.result.kind).toBe('uncertain');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Confirmed safe logout clears the marker
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 204 } as unknown as Response);
+    await tabA.logout();
+    expect(localStorage.getItem('roundset:auth:sync_marker')).toBeNull();
+
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('blocks automatic refresh on reload when an unresolved in_progress marker exists', async () => {
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn((_name: string, cb: () => Promise<unknown>) => cb()),
+      },
+    });
+
+    // Simulate an interrupted rotation from before page reload
+    localStorage.setItem(
+      'roundset:auth:sync_marker',
+      JSON.stringify({ status: 'in_progress', at: Date.now() - 120_000 }),
+    );
+
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('auth-status').textContent).toBe('relogin_required');
+    });
+    expect(screen.getByTestId('auth-reason').textContent).toBe('uncertain_refresh');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks waiting tab even when BroadcastChannel delivery is delayed', async () => {
+    let lockChain = Promise.resolve();
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn((_name: string, cb: () => Promise<unknown>) => {
+          const next = lockChain.then(() => cb());
+          lockChain = next.then(
+            () => undefined,
+            () => undefined,
+          );
+          return next;
+        }),
+      },
+    });
+
+    const delayedQueue: Array<() => void> = [];
+    const listeners = new Set<(ev: MessageEvent) => void>();
+    class DelayedBroadcastChannel {
+      public onmessage: ((ev: MessageEvent) => void) | null = null;
+      private readonly handler = (ev: MessageEvent) => {
+        this.onmessage?.(ev);
+      };
+      constructor(_name: string) {
+        listeners.add(this.handler);
+      }
+      postMessage(data: unknown) {
+        delayedQueue.push(() => {
+          for (const fn of listeners) {
+            fn({ data } as MessageEvent);
+          }
+        });
+      }
+      close() {
+        listeners.delete(this.handler);
+      }
+    }
+    globalThis.BroadcastChannel =
+      DelayedBroadcastChannel as unknown as typeof BroadcastChannel;
+
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('Network drop'));
+    globalThis.fetch = fetchMock;
+
+    const tabA = new SessionCoordinator();
+    const tabB = new SessionCoordinator();
+
+    const [resA, resB] = await Promise.all([tabA.refresh(), tabB.refresh()]);
+    // BroadcastChannel has NOT been flushed yet, but Tab B is still blocked synchronously
+    expect(delayedQueue.length).toBeGreaterThan(0);
+    expect(resA.result.kind).toBe('uncertain');
+    expect(resB.result.kind).toBe('uncertain');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    tabA.dispose();
+    tabB.dispose();
+  });
+
+  it('fails conservatively without dispatching when coordination storage read or write throws', async () => {
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: vi.fn((_name: string, cb: () => Promise<unknown>) => cb()),
+      },
+    });
+
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+
+    // 1. Storage read failure
+    const getSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('SecurityError');
+    });
+    const coord1 = new SessionCoordinator();
+    const readFailRes = await coord1.refresh();
+    expect(readFailRes.result.kind).toBe('uncertain');
+    if (readFailRes.result.kind === 'uncertain') {
+      expect(readFailRes.result.reason).toBe('coordination_storage_unavailable');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    getSpy.mockRestore();
+    coord1.dispose();
+
+    // 2. Storage write failure
+    const setSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+    const coord2 = new SessionCoordinator();
+    const writeFailRes = await coord2.refresh();
+    expect(writeFailRes.result.kind).toBe('uncertain');
+    if (writeFailRes.result.kind === 'uncertain') {
+      expect(writeFailRes.result.reason).toBe('coordination_storage_unavailable');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    setSpy.mockRestore();
+    coord2.dispose();
   });
 
   it('bounds Web Lock acquisition time and prevents timed-out waiters from dispatching later', async () => {
